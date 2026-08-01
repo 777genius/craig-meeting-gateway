@@ -8,7 +8,6 @@ import { DexareClient } from 'dexare';
 import Eris from 'eris';
 import { access, writeFile } from 'fs/promises';
 import { customAlphabet, nanoid } from 'nanoid';
-import fetch from 'node-fetch';
 import path from 'path';
 import { ButtonStyle, ComponentType, EditMessageOptions, MessageFlags, SeparatorSpacingSize } from 'slash-create';
 
@@ -18,6 +17,7 @@ import { prisma } from '../../prisma';
 import { getSelfMember, ParsedRewards, wait } from '../../util';
 import type SlashModule from '../slash';
 import type RecorderModule from '.';
+import { MeetingTerminalLifecycle } from './meetingIntegration';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
 import { WebappClient } from './webapp';
 import RecordingWriter from './writer';
@@ -134,6 +134,12 @@ export default class Recording {
   zeroPacketWarned = false;
   encryptionRecoveryAttempts = 0;
   encryptionStopIssued = false;
+  integrationPacketDropWarned = false;
+  private lifecycleSequence = 0;
+  private readonly knownParticipantIds = new Set<string>();
+  private stopPromise: Promise<void> | null = null;
+  private connectionLossOpen = false;
+  private readonly terminalMeetingLifecycle = new MeetingTerminalLifecycle();
 
   constructor(recorder: RecorderModule<DexareClient<CraigBotConfig>>, channel: Eris.StageChannel | Eris.VoiceChannel, user: Eris.User, auto = false) {
     this.recorder = recorder;
@@ -246,6 +252,10 @@ export default class Recording {
     this.writer = new RecordingWriter(this, fileBase);
     this.writeToLog(`Connected to channel ${this.connection?.channelID} at ${this.connection?.endpoint}`);
 
+    const participantIds = [...this.channel.voiceMembers.keys()].map(String).filter((id) => id !== this.recorder.client.bot.user.id);
+    participantIds.forEach((id) => this.knownParticipantIds.add(id));
+    this.publishMeetingLifecycle('meeting.started', { participantIds });
+
     this.timeout = setTimeout(async () => {
       if (this.state !== RecordingState.RECORDING) return;
       this.writeToLog('Timeout reached, stopping recording');
@@ -306,7 +316,12 @@ export default class Recording {
     onRecordingStart(this.user.id, this.channel.guild.id, this.autorecorded);
   }
 
-  async stop(internal = false, userID?: string) {
+  stop(internal = false, userID?: string): Promise<void> {
+    if (!this.stopPromise) this.stopPromise = this.stopOnce(internal, userID);
+    return this.stopPromise;
+  }
+
+  private async stopOnce(internal = false, userID?: string) {
     try {
       clearTimeout(this.timeout);
       clearInterval(this.usageInterval);
@@ -330,8 +345,16 @@ export default class Recording {
       // Close the output files and connection
       this.closing = true;
       this.webapp?.close(WebappOpCloseReason.RECORDING_ENDED);
-      await wait(200);
-      await this.writer?.end();
+      await this.terminalMeetingLifecycle.complete(
+        internal ? 'meeting.aborted' : 'meeting.ended',
+        async () => {
+          await wait(200);
+          await this.writer?.end();
+        },
+        (type) => this.publishMeetingLifecycle(type, { reason: this.stateDescription ?? null })
+      );
+      if (!(await this.recorder.meetingIntegration.drain(2000)))
+        this.recorder.logger.warn(`Meeting integration did not drain before recording ${this.id} shutdown; delivery remains queued`);
 
       this.recorder.recordings.delete(this.channel.guild.id);
 
@@ -385,6 +408,12 @@ export default class Recording {
     } catch (e) {
       // This is pretty bad, make sure to clean up any reference
       this.recorder.logger.error(`Failed to stop recording ${this.id} by ${this.user.username}#${this.user.discriminator} (${this.user.id})`, e);
+      this.terminalMeetingLifecycle.abort((type) =>
+        this.publishMeetingLifecycle(type, { reason: this.stateDescription ?? 'Craig recording finalization failed.' })
+      );
+      await this.recorder.meetingIntegration
+        .drain(2000)
+        .catch((drainError) => this.recorder.logger.error(`Failed to drain Meeting integration for recording ${this.id}`, drainError));
       this.recorder.recordings.delete(this.channel.guild.id);
     }
   }
@@ -455,7 +484,10 @@ export default class Recording {
 
     const reconnected = this.state === RecordingState.RECONNECTING;
     this.state = RecordingState.RECORDING;
-    if (reconnected) this.pushToActivity('Reconnected.');
+    if (reconnected) {
+      this.markConnectionRecovered();
+      this.pushToActivity('Reconnected.');
+    }
   }
 
   async retryConnect() {
@@ -508,7 +540,15 @@ export default class Recording {
         this.pushToActivity('I was undeafened.');
       }
       this.logWrite(`${new Date().toISOString()}: Bot's voice state updated ${JSON.stringify(member.voiceState)} -> ${JSON.stringify(oldState)}\n`);
+      return;
     }
+
+    const isPresent = member.voiceState.channelID === this.channel.id;
+    if (isPresent && !this.knownParticipantIds.has(member.id)) {
+      this.knownParticipantIds.add(member.id);
+      this.publishMeetingLifecycle('participant.joined', { participantId: member.id });
+    } else if (!isPresent && this.knownParticipantIds.delete(member.id))
+      this.publishMeetingLifecycle('participant.left', { participantId: member.id });
   }
 
   async onConnectionConnect() {
@@ -523,6 +563,7 @@ export default class Recording {
       return await this.stop();
     } else if (this.state === RecordingState.RECONNECTING) {
       this.state = RecordingState.RECORDING;
+      this.markConnectionRecovered();
       this.pushToActivity('Reconnected.');
     }
   }
@@ -559,6 +600,7 @@ export default class Recording {
     if (!this.active) return;
     this.writeToLog(`Got disconnected, ${err}`);
     this.recorder.logger.debug(`Recording ${this.id} disconnected`, err);
+    this.markConnectionLost(err?.message ?? 'voice connection closed');
     if (err) {
       this.state = RecordingState.RECONNECTING;
       if (err.message.startsWith('4006')) this.pushToActivity('Discord requested us to reconnect, reconnecting...');
@@ -762,7 +804,7 @@ export default class Recording {
     return recordingUser;
   }
 
-  async onData(data: Buffer, userID: string, timestamp: number) {
+  async onData(data: Buffer, userID: string, timestamp: number, rtpSequence: number) {
     if (!this.active) return;
     if (!userID) return;
 
@@ -783,6 +825,26 @@ export default class Recording {
 
     const chunkTime = process.hrtime(this.startTime!);
     const time = chunkTime[0] * 48000 + ~~(chunkTime[1] / 20833.333);
+    if (Number.isInteger(rtpSequence)) {
+      const accepted = this.recorder.meetingIntegration.publishPacket(
+        {
+          schemaVersion: 1,
+          recordingId: this.id,
+          guildId: this.channel.guild.id,
+          channelId: this.channel.id,
+          speakerId: userID,
+          rtpTimestamp: timestamp >>> 0,
+          rtpSequence: rtpSequence & 0xffff,
+          receivedAtMs: Date.now(),
+          relativeTimeMs: Math.max(0, Math.trunc(time / 48))
+        },
+        data
+      );
+      if (!accepted && !this.integrationPacketDropWarned) {
+        this.integrationPacketDropWarned = true;
+        this.recorder.logger.error(`Meeting integration queue is full for recording ${this.id}; original Craig recording continues`);
+      }
+    }
     const recordingUser = await this.getOrCreateRecordingUser(userID);
     if (!recordingUser) return;
 
@@ -809,6 +871,35 @@ export default class Recording {
     const chunkTime = process.hrtime(this.startTime!);
     const chunkGranule = chunkTime[0] * 48000 + ~~(chunkTime[1] / 20833.333);
     this.writer?.writeNote(chunkGranule, this.notePacketNo++, Buffer.from('NOTE' + note));
+  }
+
+  private publishMeetingLifecycle(
+    type: import('./meetingIntegration').MeetingLifecycleEvent['type'],
+    details: Pick<import('./meetingIntegration').MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+  ) {
+    const accepted = this.recorder.meetingIntegration.publishLifecycle({
+      schemaVersion: 1,
+      eventId: `${this.id}:${++this.lifecycleSequence}`,
+      recordingId: this.id,
+      guildId: this.channel.guild.id,
+      channelId: this.channel.id,
+      occurredAt: new Date().toISOString(),
+      type,
+      ...details
+    });
+    if (!accepted) this.recorder.logger.error(`Meeting integration lifecycle queue is full for recording ${this.id} (${type})`);
+  }
+
+  private markConnectionLost(reason: string) {
+    if (this.connectionLossOpen) return;
+    this.connectionLossOpen = true;
+    this.publishMeetingLifecycle('meeting.connection_lost', { reason });
+  }
+
+  private markConnectionRecovered() {
+    if (!this.connectionLossOpen) return;
+    this.connectionLossOpen = false;
+    this.publishMeetingLifecycle('meeting.connection_recovered', { reason: null });
   }
 
   // Message handling //

@@ -329,10 +329,21 @@ export default class RecordingWriter {
   async end() {
     this.closed = true;
     if (!this.q.idle()) await this.q.drained();
-    this.dataEncoder.end();
-    this.headerEncoder1.end();
-    this.headerEncoder2.end();
-    this.usersStream.end();
-    this.logStream.end();
+    await Promise.all([
+      this.dataEncoder.end(),
+      this.headerEncoder1.end(),
+      this.headerEncoder2.end(),
+      endWriteStream(this.usersStream),
+      endWriteStream(this.logStream)
+    ]);
   }
+}
+
+async function endWriteStream(stream: WriteStream): Promise<void> {
+  if (stream.closed || stream.destroyed) return;
+  await new Promise<void>((resolve, reject) => {
+    stream.once('finish', resolve);
+    stream.once('error', reject);
+    stream.end();
+  });
 }

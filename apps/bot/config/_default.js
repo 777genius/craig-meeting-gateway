@@ -89,6 +89,25 @@ module.exports = {
       alistair: false,
       // The folder to put recordings in
       recordingFolder: '../../rec',
+      // Optional fault-isolated Meeting Platform integration. Keep disabled for
+      // stock Craig behavior. The bearer token is read from a mounted file.
+      meetingIntegration: {
+        enabled: false,
+        endpoint: 'http://127.0.0.1:4310',
+        tokenFile: '/run/secrets/meeting_integration_token',
+        maxQueuedPackets: 8192,
+        batchSize: 128,
+        requestTimeoutMs: 5000
+      },
+      // Optional private-guild E2E auto-record path. Disabled by default and
+      // restricted to exact channel/user snowflake allowlists when enabled.
+      meetingAutoRecord: {
+        enabled: false,
+        channelIds: [],
+        syntheticBotUserIds: [],
+        startDelayMs: 250,
+        emptyGraceMs: 5000
+      },
       // Webapp settings
       webapp: {
         on: true,

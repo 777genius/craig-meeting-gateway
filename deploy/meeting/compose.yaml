@@ -1,0 +1,209 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  db:
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-craig_meeting}
+      POSTGRES_USER: ${POSTGRES_USER:-craig_meeting}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=trust
+    secrets:
+      - postgres_password
+    networks:
+      - data
+    volumes:
+      - ${CRAIG_DATA_ROOT:?set CRAIG_DATA_ROOT}/postgres:/var/lib/postgresql
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /var/run/postgresql:size=16m,mode=0775
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    stop_grace_period: 30s
+    shm_size: 256m
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+          pids: 192
+        reservations:
+          memory: 256m
+    logging: *default-logging
+
+  redis:
+    image: redis:8.8.1-alpine@sha256:8096655e437712b07503796fb64d81359256cfcff0ab29d95a7da72863786efb
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    networks:
+      - data
+    volumes:
+      - ${CRAIG_DATA_ROOT:?set CRAIG_DATA_ROOT}/redis:/data
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    stop_grace_period: 10s
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+          pids: 128
+        reservations:
+          memory: 64m
+    logging: *default-logging
+
+  migrate:
+    image: ${CRAIG_IMAGE:-craig-meeting-gateway:local}
+    build:
+      context: ../..
+      dockerfile: deploy/meeting/Dockerfile
+    command: ["migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+    secrets:
+      - database_url
+    networks:
+      - data
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+          pids: 128
+    logging: *default-logging
+
+  bot:
+    image: ${CRAIG_IMAGE:-craig-meeting-gateway:local}
+    build:
+      context: ../..
+      dockerfile: deploy/meeting/Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+      redis:
+        condition: service_healthy
+        restart: true
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DISCORD_BOT_TOKEN_FILE: /run/secrets/discord_bot_token
+      DISCORD_APPLICATION_ID: ${DISCORD_APPLICATION_ID:?set DISCORD_APPLICATION_ID in the env file}
+      MEETING_INTEGRATION_TOKEN_FILE: /run/secrets/meeting_integration_token
+      MEETING_INTEGRATION_URL: ${MEETING_INTEGRATION_URL:-http://meeting-api:4310}
+      MEETING_MAX_QUEUED_PACKETS: ${MEETING_MAX_QUEUED_PACKETS:-8192}
+      MEETING_PACKET_BATCH_SIZE: ${MEETING_PACKET_BATCH_SIZE:-128}
+      MEETING_REQUEST_TIMEOUT_MS: ${MEETING_REQUEST_TIMEOUT_MS:-5000}
+      MEETING_AUTO_RECORD_CHANNEL_IDS: ${MEETING_AUTO_RECORD_CHANNEL_IDS:?set allowlisted voice channel IDs}
+      MEETING_AUTO_RECORD_SYNTHETIC_BOT_IDS: ${MEETING_AUTO_RECORD_SYNTHETIC_BOT_IDS:?set synthetic speaker bot IDs}
+      MEETING_AUTO_RECORD_START_DELAY_MS: ${MEETING_AUTO_RECORD_START_DELAY_MS:-500}
+      MEETING_AUTO_RECORD_EMPTY_GRACE_MS: ${MEETING_AUTO_RECORD_EMPTY_GRACE_MS:-5000}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-craig-meeting:}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      CRAIG_LOG_LEVEL: ${CRAIG_LOG_LEVEL:-info}
+    secrets:
+      - database_url
+      - discord_bot_token
+      - meeting_integration_token
+    networks:
+      data:
+        gw_priority: 0
+      discord-egress:
+        gw_priority: 1
+      meeting-platform:
+        gw_priority: 0
+    volumes:
+      - ${CRAIG_DATA_ROOT:?set CRAIG_DATA_ROOT}/recordings:/app/rec
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /run/craig-config:size=2m,mode=0700,uid=10001,gid=10001
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "/app/deploy/meeting/healthcheck.cjs"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 16384
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+          pids: 256
+        reservations:
+          memory: 256m
+    logging: *default-logging
+
+networks:
+  data:
+    internal: true
+  discord-egress: {}
+  meeting-platform:
+    external: true
+    name: ${MEETING_NETWORK_NAME:-discord-meeting-internal}
+
+secrets:
+  database_url:
+    file: ${CRAIG_SECRETS_DIR:-./secrets}/database_url
+  discord_bot_token:
+    file: ${CRAIG_SECRETS_DIR:-./secrets}/discord_bot_token
+  meeting_integration_token:
+    file: ${CRAIG_SECRETS_DIR:-./secrets}/meeting_integration_token
+  postgres_password:
+    file: ${CRAIG_SECRETS_DIR:-./secrets}/postgres_password

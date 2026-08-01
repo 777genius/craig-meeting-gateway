@@ -17,6 +17,7 @@ import { prisma } from '../../prisma';
 import { checkMaintenance } from '../../redis';
 import MetricsModule from '../metrics';
 import type UploadModule from '../upload';
+import { createMeetingIntegrationSink, MeetingIntegrationSink, NoopMeetingIntegrationSink } from './meetingIntegration';
 import Recording, { RecordingState } from './recording';
 import { VoiceTestState } from './voiceTest';
 
@@ -56,6 +57,7 @@ export default class RecorderModule<T extends DexareClient<CraigBotConfig>> exte
   voiceTests = new Map<string, import('./voiceTest').default>();
   recordingPath: string;
   recordingsChecked = false;
+  meetingIntegration: MeetingIntegrationSink = new NoopMeetingIntegrationSink();
   trpc = createTRPCClient<TRPCRouter>({
     fetch: fetch as any,
     links: [httpLink({ url: 'http://localhost:2022' })]
@@ -95,8 +97,13 @@ export default class RecorderModule<T extends DexareClient<CraigBotConfig>> exte
     } catch (e) {
       this.logger.info('Recording folder not found, creating...');
       await mkdir(this.recordingPath);
-      return;
     }
+
+    this.meetingIntegration = await createMeetingIntegrationSink(this.client.config.craig.meetingIntegration, {
+      debug: (message) => this.logger.debug(message),
+      warn: (message) => this.logger.warn(message),
+      error: (message, error) => this.logger.error(message, error)
+    });
   }
 
   async onReady() {

@@ -11,8 +11,10 @@ import AutorecordModule from './modules/autorecord';
 import CacheModule from './modules/cache';
 import EntitlementsModule from './modules/entitlements';
 import LoggerModule from './modules/logger';
+import MeetingAutoRecordModule, { MeetingAutoRecordConfig } from './modules/meetingAutoRecord';
 import MetricsModule from './modules/metrics';
 import RecorderModule from './modules/recorder';
+import type { MeetingIntegrationConfig } from './modules/recorder/meetingIntegration';
 import ShardingModule from './modules/sharding';
 import SlashModule from './modules/slash';
 import UploadModule from './modules/upload';
@@ -45,6 +47,8 @@ export interface CraigBotConfig extends BaseConfig {
     sizeLimitWeb: number;
     sizeLimitWebOpus: number;
     inviteID?: string;
+    meetingIntegration?: MeetingIntegrationConfig;
+    meetingAutoRecord?: MeetingAutoRecordConfig;
     webapp: {
       on: boolean;
       url: string;
@@ -135,6 +139,7 @@ export async function connect() {
     SlashModule,
     ShardingModule,
     RecorderModule,
+    MeetingAutoRecordModule,
     AutorecordModule,
     MetricsModule,
     UploadModule,

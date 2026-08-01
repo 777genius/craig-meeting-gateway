@@ -1,0 +1,17 @@
+.git
+.github
+**/node_modules
+**/dist
+install.config
+install.log
+.env
+*.log
+apps/dashboard/**
+apps/download/**
+apps/tasks/**
+!apps/dashboard/package.json
+!apps/download/package.json
+!apps/tasks/package.json
+deploy/**
+!deploy/meeting/**
+deploy/meeting/secrets/**

@@ -66,7 +66,12 @@ export default class OggEncoder {
     } catch (e) {}
   }
 
-  end() {
-    this.stream.end();
+  async end(): Promise<void> {
+    if (this.stream.closed || this.stream.destroyed) return;
+    await new Promise<void>((resolve, reject) => {
+      this.stream.once('finish', resolve);
+      this.stream.once('error', reject);
+      this.stream.end();
+    });
   }
 }
