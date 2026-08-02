@@ -17,6 +17,7 @@ Craig still pins `config@3.3.8`, which calls two `node:util` predicates removed 
 
 1. Copy `.env.example` to `.env` and set the public Discord application ID.
 2. Create the four files described in `secrets/README.md`, with mode `0600`. The PostgreSQL password in `database_url` must match `postgres_password`.
+   Create the PostgreSQL data directory with owner UID/GID `70:70`, the Redis data directory with owner UID/GID `999:1000`, and the recording directory with owner UID/GID `10001:10001`.
 3. Create the shared network if the parent Meeting Platform stack does not own it:
 
    ```sh

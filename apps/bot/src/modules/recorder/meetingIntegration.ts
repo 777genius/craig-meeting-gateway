@@ -112,6 +112,7 @@ export class NoopMeetingIntegrationSink implements MeetingIntegrationSink {
 export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private readonly queue: QueueItem[] = [];
   private readonly drainWaiters = new Set<() => void>();
+  private readonly openRecordings = new Set<string>();
   private processing = false;
   private retryTimer: NodeJS.Timeout | null = null;
   private queuedPackets = 0;
@@ -121,22 +122,35 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     private readonly transport: MeetingIntegrationTransport,
     private readonly logger: MeetingIntegrationLogger,
     private readonly maxQueuedPackets = 8192,
-    private readonly batchSize = 128
+    private readonly batchSize = 128,
+    private readonly maxQueuedLifecycleEvents = 1024
   ) {
     if (!Number.isSafeInteger(maxQueuedPackets) || maxQueuedPackets < 1) throw new Error('maxQueuedPackets must be a positive integer');
     if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > maxQueuedPackets)
       throw new Error('batchSize must be a positive integer no greater than maxQueuedPackets');
+    if (!Number.isSafeInteger(maxQueuedLifecycleEvents) || maxQueuedLifecycleEvents < 2)
+      throw new Error('maxQueuedLifecycleEvents must reserve room for start and terminal events');
   }
 
   publishLifecycle(event: MeetingLifecycleEvent): boolean {
     // Lifecycle traffic is tiny and must remain ordered with the accepted audio.
-    if (this.queue.length - this.queuedPackets >= 1024) return false;
+    const queuedLifecycleEvents = this.queue.length - this.queuedPackets;
+    const isTerminal = event.type === 'meeting.ended' || event.type === 'meeting.aborted';
+    if (event.type === 'meeting.started') {
+      if (this.openRecordings.has(event.recordingId)) return false;
+      if (queuedLifecycleEvents + this.openRecordings.size + 2 > this.maxQueuedLifecycleEvents) return false;
+      this.openRecordings.add(event.recordingId);
+    } else if (!this.openRecordings.has(event.recordingId)) return false;
+    else if (!isTerminal && queuedLifecycleEvents + this.openRecordings.size + 1 > this.maxQueuedLifecycleEvents) return false;
+
     this.queue.push({ type: 'lifecycle', event });
+    if (isTerminal) this.openRecordings.delete(event.recordingId);
     this.scheduleProcessing();
     return true;
   }
 
   publishPacket(packet: MeetingVoicePacket, opus: Buffer): boolean {
+    if (!this.openRecordings.has(packet.recordingId)) return false;
     if (this.queuedPackets >= this.maxQueuedPackets) return false;
 
     // Clone only after synchronous bounded admission, never before it.
