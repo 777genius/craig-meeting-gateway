@@ -17,7 +17,12 @@ import { prisma } from '../../prisma';
 import { getSelfMember, ParsedRewards, wait } from '../../util';
 import type SlashModule from '../slash';
 import type RecorderModule from '.';
-import { MeetingTerminalLifecycle } from './meetingIntegration';
+import {
+  type MeetingLifecycleEvent,
+  type MeetingStartedLifecycleEvent,
+  type MeetingTerminalLifecycleEvent,
+  MeetingTerminalLifecycle
+} from './meetingIntegration';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
 import { WebappClient } from './webapp';
 import RecordingWriter from './writer';
@@ -140,6 +145,7 @@ export default class Recording {
   private stopPromise: Promise<void> | null = null;
   private connectionLossOpen = false;
   private readonly terminalMeetingLifecycle = new MeetingTerminalLifecycle();
+  private meetingStartedLifecycle?: MeetingStartedLifecycleEvent;
 
   constructor(recorder: RecorderModule<DexareClient<CraigBotConfig>>, channel: Eris.StageChannel | Eris.VoiceChannel, user: Eris.User, auto = false) {
     this.recorder = recorder;
@@ -254,7 +260,9 @@ export default class Recording {
 
     const participantIds = [...this.channel.voiceMembers.keys()].map(String).filter((id) => id !== this.recorder.client.bot.user.id);
     participantIds.forEach((id) => this.knownParticipantIds.add(id));
-    this.publishMeetingLifecycle('meeting.started', { participantIds });
+    const startedEvent = this.createMeetingLifecycleEvent('meeting.started', { participantIds }) as MeetingStartedLifecycleEvent;
+    this.meetingStartedLifecycle = startedEvent;
+    this.publishMeetingLifecycleEvent(startedEvent);
 
     this.timeout = setTimeout(async () => {
       if (this.state !== RecordingState.RECORDING) return;
@@ -345,13 +353,49 @@ export default class Recording {
       // Close the output files and connection
       this.closing = true;
       this.webapp?.close(WebappOpCloseReason.RECORDING_ENDED);
+      let persistedTerminalEvent: MeetingTerminalLifecycleEvent | undefined;
       await this.terminalMeetingLifecycle.complete(
         internal ? 'meeting.aborted' : 'meeting.ended',
         async () => {
           await wait(200);
-          await this.writer?.end();
+          const writer = this.writer;
+          await writer?.end();
+          persistedTerminalEvent = this.createMeetingLifecycleEvent(internal ? 'meeting.aborted' : 'meeting.ended', {
+            reason: this.stateDescription ?? null
+          }) as MeetingTerminalLifecycleEvent;
+          if (writer) {
+            const startedEvent = this.meetingStartedLifecycle;
+            const persisted =
+              startedEvent === undefined
+                ? false
+                : await this.recorder.meetingIntegration
+                    .publishOriginalRecording({
+                      startedEvent,
+                      terminalEvent: persistedTerminalEvent,
+                      sourceFileBase: writer.fileBase
+                    })
+                    .catch((error) => {
+                      this.recorder.logger.error(
+                        `Failed to enqueue original Craig recording ${this.id} for Meeting integration; original files remain available`,
+                        error
+                      );
+                      return false;
+                    });
+            if (!persisted)
+              this.recorder.logger.error(
+                `Original Craig recording ${this.id} was not persisted to the Meeting integration outbox; original files remain available`
+              );
+          }
         },
-        (type) => this.publishMeetingLifecycle(type, { reason: this.stateDescription ?? null })
+        (type) => {
+          const terminalEvent =
+            persistedTerminalEvent?.type === type
+              ? persistedTerminalEvent
+              : (this.createMeetingLifecycleEvent(type, {
+                  reason: this.stateDescription ?? 'Craig recording finalization failed.'
+                }) as MeetingTerminalLifecycleEvent);
+          this.publishMeetingLifecycleEvent(terminalEvent);
+        }
       );
       if (!(await this.recorder.meetingIntegration.drain(2000)))
         this.recorder.logger.warn(`Meeting integration did not drain before recording ${this.id} shutdown; delivery remains queued`);
@@ -874,10 +918,19 @@ export default class Recording {
   }
 
   private publishMeetingLifecycle(
-    type: import('./meetingIntegration').MeetingLifecycleEvent['type'],
-    details: Pick<import('./meetingIntegration').MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
-  ) {
-    const accepted = this.recorder.meetingIntegration.publishLifecycle({
+    type: MeetingLifecycleEvent['type'],
+    details: Pick<MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+  ): MeetingLifecycleEvent {
+    const event = this.createMeetingLifecycleEvent(type, details);
+    this.publishMeetingLifecycleEvent(event);
+    return event;
+  }
+
+  private createMeetingLifecycleEvent(
+    type: MeetingLifecycleEvent['type'],
+    details: Pick<MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+  ): MeetingLifecycleEvent {
+    return {
       schemaVersion: 1,
       eventId: `${this.id}:${++this.lifecycleSequence}`,
       recordingId: this.id,
@@ -886,8 +939,12 @@ export default class Recording {
       occurredAt: new Date().toISOString(),
       type,
       ...details
-    });
-    if (!accepted) this.recorder.logger.error(`Meeting integration lifecycle queue is full for recording ${this.id} (${type})`);
+    };
+  }
+
+  private publishMeetingLifecycleEvent(event: MeetingLifecycleEvent): void {
+    const accepted = this.recorder.meetingIntegration.publishLifecycle(event);
+    if (!accepted) this.recorder.logger.error(`Meeting integration lifecycle queue is full for recording ${this.id} (${event.type})`);
   }
 
   private markConnectionLost(reason: string) {

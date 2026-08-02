@@ -99,11 +99,15 @@ export default class RecorderModule<T extends DexareClient<CraigBotConfig>> exte
       await mkdir(this.recordingPath);
     }
 
-    this.meetingIntegration = await createMeetingIntegrationSink(this.client.config.craig.meetingIntegration, {
-      debug: (message) => this.logger.debug(message),
-      warn: (message) => this.logger.warn(message),
-      error: (message, error) => this.logger.error(message, error)
-    });
+    this.meetingIntegration = await createMeetingIntegrationSink(
+      this.client.config.craig.meetingIntegration,
+      {
+        debug: (message) => this.logger.debug(message),
+        warn: (message) => this.logger.warn(message),
+        error: (message, error) => this.logger.error(message, error)
+      },
+      this.recordingPath
+    );
   }
 
   async onReady() {
