@@ -15,7 +15,7 @@ Craig still pins `config@3.3.8`, which calls two `node:util` predicates removed 
 
 ## Prepare
 
-1. Copy `.env.example` to `.env` and set the public Discord application ID.
+1. Copy `.env.example` to `.env`, set the public Discord application ID, and set `CRAIG_SOURCE_REVISION` to the exact 40 or 64 character lowercase commit used as the build context. The same revision is used as the immutable image tag and OCI `org.opencontainers.image.revision` label.
 2. Create the four files described in `secrets/README.md`, with mode `0600`. The PostgreSQL password in `database_url` must match `postgres_password`.
    Create the PostgreSQL data directory with owner UID/GID `70:70`, the Redis data directory with owner UID/GID `999:1000`, and the recording directory with owner UID/GID `10001:10001`.
 3. Create the shared network if the parent Meeting Platform stack does not own it:
@@ -44,6 +44,7 @@ For Dockerfile static checks and an image build:
 ```sh
 docker build --check -f deploy/meeting/Dockerfile .
 docker compose --env-file deploy/meeting/.env -f deploy/meeting/compose.yaml build
+docker image inspect "${CRAIG_IMAGE_REPOSITORY:-craig-meeting-gateway}:${CRAIG_SOURCE_REVISION}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
 ```
 
 ## Start and stop

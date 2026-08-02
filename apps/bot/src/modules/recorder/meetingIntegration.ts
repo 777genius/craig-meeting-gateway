@@ -77,6 +77,15 @@ export interface OriginalRecordingPublicationInput {
   sourceFileBase: string;
 }
 
+export interface InterruptedOriginalRecordingRecoveryInput {
+  recordingId: string;
+  guildId: string;
+  channelId: string;
+  startedAt: string;
+  recoveredAt: string;
+  sourceFileBase: string;
+}
+
 interface OriginalRecordingSourceFileReference {
   kind: OriginalRecordingSourceFileKind;
   relativePath: string;
@@ -167,6 +176,7 @@ export interface MeetingIntegrationSink {
   publishLifecycle(event: MeetingLifecycleEvent): boolean;
   publishPacket(packet: MeetingVoicePacket, opus: Buffer): boolean;
   publishOriginalRecording(input: OriginalRecordingPublicationInput): Promise<boolean>;
+  recoverInterruptedOriginalRecording(input: InterruptedOriginalRecordingRecoveryInput): Promise<boolean>;
   restoreOriginalRecordingJobs(): Promise<void>;
   drain(timeoutMs: number): Promise<boolean>;
 }
@@ -230,6 +240,10 @@ export class NoopMeetingIntegrationSink implements MeetingIntegrationSink {
   }
 
   async publishOriginalRecording(): Promise<boolean> {
+    return true;
+  }
+
+  async recoverInterruptedOriginalRecording(): Promise<boolean> {
     return true;
   }
 
@@ -402,6 +416,54 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       return true;
     } catch (error) {
       this.logger.error(`Failed to persist original recording outbox job for ${recordingId}; original Craig files remain authoritative`, error);
+      return false;
+    }
+  }
+
+  async recoverInterruptedOriginalRecording(input: InterruptedOriginalRecordingRecoveryInput): Promise<boolean> {
+    if (this.recordingRoot === undefined) {
+      this.logger.warn(`Meeting original recording recovery is not configured for ${input.recordingId}`);
+      return false;
+    }
+
+    try {
+      assertOriginalSourceFileBase(input.recordingId, this.recordingRoot, input.sourceFileBase);
+      const users = await inspectOriginalRecordingUsers(`${input.sourceFileBase}.users`);
+      await inspectOriginalRecordingData(
+        `${input.sourceFileBase}.data`,
+        users.tracks.map(({ trackNumber }) => trackNumber)
+      );
+      await Promise.all(sourceFileKinds.map((kind) => digestFile(`${input.sourceFileBase}.${kind}`)));
+      const recoveryIdentity = createHash('sha256').update(input.recordingId).digest('hex').slice(0, 32);
+
+      return await this.publishOriginalRecording({
+        sourceFileBase: input.sourceFileBase,
+        startedEvent: {
+          schemaVersion: 1,
+          eventId: `recovery:v1:${recoveryIdentity}:started`,
+          recordingId: input.recordingId,
+          guildId: input.guildId,
+          channelId: input.channelId,
+          occurredAt: input.startedAt,
+          type: 'meeting.started',
+          participantIds: users.tracks.map(({ speakerId }) => speakerId)
+        },
+        terminalEvent: {
+          schemaVersion: 1,
+          eventId: `recovery:v1:${recoveryIdentity}:ended`,
+          recordingId: input.recordingId,
+          guildId: input.guildId,
+          channelId: input.channelId,
+          occurredAt: input.recoveredAt,
+          type: 'meeting.ended',
+          reason: 'Craig restarted during an active recording; the authoritative original was recovered from durable files.'
+        }
+      });
+    } catch (error) {
+      this.logger.error(
+        `Failed to recover interrupted original Craig recording ${input.recordingId}; original files and database evidence remain available`,
+        error
+      );
       return false;
     }
   }
@@ -903,10 +965,7 @@ function createOriginalRecordingJob(input: OriginalRecordingPublicationInput, re
   const { recordingId, guildId, channelId } = startedEvent;
   assertRecordingId(recordingId);
 
-  const resolvedRoot = path.resolve(recordingRoot);
-  const resolvedBase = path.resolve(input.sourceFileBase);
-  if (path.dirname(resolvedBase) !== resolvedRoot || path.basename(resolvedBase) !== `${recordingId}.ogg`)
-    throw new Error('sourceFileBase must identify the recording inside recordingRoot');
+  assertOriginalSourceFileBase(recordingId, recordingRoot, input.sourceFileBase);
 
   return {
     schemaVersion: 2,
@@ -921,6 +980,14 @@ function createOriginalRecordingJob(input: OriginalRecordingPublicationInput, re
       relativePath: `${recordingId}.ogg.${kind}`
     }))
   };
+}
+
+function assertOriginalSourceFileBase(recordingId: string, recordingRoot: string, sourceFileBase: string): void {
+  assertRecordingId(recordingId);
+  const resolvedRoot = path.resolve(recordingRoot);
+  const resolvedBase = path.resolve(sourceFileBase);
+  if (path.dirname(resolvedBase) !== resolvedRoot || path.basename(resolvedBase) !== `${recordingId}.ogg`)
+    throw new Error('sourceFileBase must identify the recording inside recordingRoot');
 }
 
 async function writeOriginalRecordingJob(filePath: string, job: OriginalRecordingOutboxJob): Promise<void> {

@@ -368,7 +368,7 @@ test('HTTP original recording contract streams audio metadata and requires ready
   await transport.postAuthoritativeReady(ready);
 });
 
-test('restores exact lifecycle events and one shared cooked-track origin after losing the realtime queue', async (context) => {
+test('recovers the authoritative original after restart loses an incomplete live tee', async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), 'craig-original-outbox-test-'));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const recordingRoot = path.join(root, 'recordings');
@@ -390,25 +390,50 @@ test('restores exact lifecycle events and one shared cooked-track origin after l
   };
   await Promise.all(Object.entries(sources).map(([kind, contents]) => writeFile(`${sourceFileBase}.${kind}`, contents)));
 
-  const first = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, {
+  const liveDelivery: string[] = [];
+  const activeBeforeRestart = new BoundedMeetingIntegrationSink(
+    {
+      async post(requestPath) {
+        liveDelivery.push(requestPath);
+        if (requestPath === '/v1/craig/voice-packets') throw new MeetingIntegrationDeliveryError('live tee permanently unavailable', false, 400);
+      }
+    },
+    logger,
+    1,
+    1
+  );
+  assert.equal(activeBeforeRestart.publishLifecycle(event), true);
+  assert.equal(activeBeforeRestart.publishPacket(packet, Buffer.from([1, 2, 3])), true);
+  assert.equal(await activeBeforeRestart.drain(1000), true);
+  assert.deepEqual(liveDelivery, ['/v1/craig/events', '/v1/craig/voice-packets']);
+
+  const firstAfterRestart = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, {
     recordingRoot,
     outboxRoot
   });
   assert.equal(
-    await first.publishOriginalRecording({
-      startedEvent: event,
-      terminalEvent,
+    await firstAfterRestart.recoverInterruptedOriginalRecording({
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      startedAt: event.occurredAt,
+      recoveredAt: terminalEvent.occurredAt,
       sourceFileBase
     }),
     true
   );
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), ['recording-1.json']);
   const pendingJobPath = path.join(outboxRoot, 'pending', 'recording-1.json');
-  const legacyPreparedJob = JSON.parse(await readFile(pendingJobPath, 'utf8')) as {
+  const recoveredJob = JSON.parse(await readFile(pendingJobPath, 'utf8')) as {
+    startedEvent: MeetingStartedLifecycleEvent;
+    terminalEvent: MeetingTerminalLifecycleEvent;
     sourceFiles: Array<{ kind: string; relativePath: string }>;
     authoritativeTracks?: Array<Pick<AuthoritativeTrackMetadata, 'speakerId' | 'trackNumber' | 'timelineOffsetMs'>>;
   };
-  legacyPreparedJob.sourceFiles = legacyPreparedJob.sourceFiles.map((source) => {
+  assert.deepEqual(recoveredJob.startedEvent.participantIds, ['1533227577286852649', '1533228054724346087']);
+  assert.equal(recoveredJob.terminalEvent.type, 'meeting.ended');
+  assert.match(recoveredJob.terminalEvent.reason ?? '', /restarted during an active recording/);
+  recoveredJob.sourceFiles = recoveredJob.sourceFiles.map((source) => {
     const contents = sources[source.kind]!;
     const bytes = Buffer.isBuffer(contents) ? contents : Buffer.from(contents);
     return {
@@ -417,11 +442,11 @@ test('restores exact lifecycle events and one shared cooked-track origin after l
       sizeBytes: bytes.byteLength
     };
   });
-  legacyPreparedJob.authoritativeTracks = [
+  recoveredJob.authoritativeTracks = [
     { speakerId: '1533227577286852649', trackNumber: 1, timelineOffsetMs: 1200 },
     { speakerId: '1533228054724346087', trackNumber: 2, timelineOffsetMs: 2800 }
   ];
-  await writeFile(pendingJobPath, `${JSON.stringify(legacyPreparedJob)}\n`);
+  await writeFile(pendingJobPath, `${JSON.stringify(recoveredJob)}\n`);
 
   const uploads: AuthoritativeTrackMetadata[] = [];
   const readyEvents: AuthoritativeRecordingReadyEvent[] = [];
@@ -474,7 +499,7 @@ test('restores exact lifecycle events and one shared cooked-track origin after l
 
   assert.equal(await restored.drain(2000), true);
   assert.equal(readyAttempts, 2);
-  assert.deepEqual(lifecycleEvents, [event, terminalEvent, event, terminalEvent]);
+  assert.deepEqual(lifecycleEvents, [recoveredJob.startedEvent, recoveredJob.terminalEvent, recoveredJob.startedEvent, recoveredJob.terminalEvent]);
   assert.deepEqual(deliveryOrder, [
     'event:meeting.started',
     'event:meeting.ended',
@@ -538,6 +563,8 @@ test('restores exact lifecycle events and one shared cooked-track origin after l
   assert.equal(readyEvents[0]?.trackCount, 2);
   assert.match(readyEvents[0]?.sourceFilesChecksumSha256 ?? '', /^[0-9a-f]{64}$/);
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), []);
+  for (const [kind, contents] of Object.entries(sources))
+    assert.deepEqual(await readFile(`${sourceFileBase}.${kind}`), Buffer.isBuffer(contents) ? contents : Buffer.from(contents));
 });
 
 test('rejects legacy outbox jobs without deleting original Craig files', async (context) => {

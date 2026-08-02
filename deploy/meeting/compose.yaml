@@ -82,10 +82,12 @@ services:
     logging: *default-logging
 
   migrate:
-    image: ${CRAIG_IMAGE:-craig-meeting-gateway:local}
+    image: ${CRAIG_IMAGE_REPOSITORY:-craig-meeting-gateway}:${CRAIG_SOURCE_REVISION:?set CRAIG_SOURCE_REVISION to the 40 or 64 character source commit}
     build:
       context: ../..
       dockerfile: deploy/meeting/Dockerfile
+      args:
+        SOURCE_REVISION: ${CRAIG_SOURCE_REVISION:?set CRAIG_SOURCE_REVISION to the 40 or 64 character source commit}
     command: ["migrate"]
     depends_on:
       db:
@@ -113,10 +115,12 @@ services:
     logging: *default-logging
 
   bot:
-    image: ${CRAIG_IMAGE:-craig-meeting-gateway:local}
+    image: ${CRAIG_IMAGE_REPOSITORY:-craig-meeting-gateway}:${CRAIG_SOURCE_REVISION:?set CRAIG_SOURCE_REVISION to the 40 or 64 character source commit}
     build:
       context: ../..
       dockerfile: deploy/meeting/Dockerfile
+      args:
+        SOURCE_REVISION: ${CRAIG_SOURCE_REVISION:?set CRAIG_SOURCE_REVISION to the 40 or 64 character source commit}
     restart: unless-stopped
     init: true
     depends_on:

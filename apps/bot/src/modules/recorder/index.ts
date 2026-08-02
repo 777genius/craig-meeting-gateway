@@ -332,6 +332,18 @@ export default class RecorderModule<T extends DexareClient<CraigBotConfig>> exte
 
     // Delete errored recordings
     for (const recording of badRecordings) {
+      const recovered = await this.meetingIntegration.recoverInterruptedOriginalRecording({
+        recordingId: recording.id,
+        guildId: recording.guildId,
+        channelId: recording.channelId,
+        startedAt: recording.createdAt.toISOString(),
+        recoveredAt: new Date().toISOString(),
+        sourceFileBase: path.join(this.recordingPath, `${recording.id}.ogg`)
+      });
+      if (!recovered) {
+        this.logger.error(`Keeping interrupted recording ${recording.id} in the database because Meeting original recovery was not persisted`);
+        continue;
+      }
       await prisma.recording.delete({ where: { id: recording.id } }).catch(() => {});
       await onRecordingEnd(
         recording.userId,

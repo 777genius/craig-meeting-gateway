@@ -54,6 +54,15 @@ RUN ./node_modules/.bin/prisma generate --schema=/app/prisma/schema.prisma \
 
 FROM node:24.18.1-bookworm-slim@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7 AS runtime
 
+ARG SOURCE_REVISION
+
+RUN case "${SOURCE_REVISION}" in \
+      ''|*[!0-9a-f]*) echo 'SOURCE_REVISION must be a lowercase 40 or 64 character hexadecimal commit' >&2; exit 1 ;; \
+    esac \
+  && { [ "${#SOURCE_REVISION}" -eq 40 ] || [ "${#SOURCE_REVISION}" -eq 64 ]; }
+
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
+
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
     at \
