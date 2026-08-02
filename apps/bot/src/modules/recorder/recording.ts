@@ -23,6 +23,7 @@ import {
   type MeetingTerminalLifecycleEvent,
   MeetingTerminalLifecycle
 } from './meetingIntegration';
+import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
 import { WebappClient } from './webapp';
 import RecordingWriter from './writer';
@@ -141,7 +142,7 @@ export default class Recording {
   encryptionStopIssued = false;
   integrationPacketDropWarned = false;
   private lifecycleSequence = 0;
-  private readonly knownParticipantIds = new Set<string>();
+  private readonly meetingParticipants = new MeetingParticipantLifecycle();
   private stopPromise: Promise<void> | null = null;
   private connectionLossOpen = false;
   private readonly terminalMeetingLifecycle = new MeetingTerminalLifecycle();
@@ -258,8 +259,7 @@ export default class Recording {
     this.writer = new RecordingWriter(this, fileBase);
     this.writeToLog(`Connected to channel ${this.connection?.channelID} at ${this.connection?.endpoint}`);
 
-    const participantIds = [...this.channel.voiceMembers.keys()].map(String).filter((id) => id !== this.recorder.client.bot.user.id);
-    participantIds.forEach((id) => this.knownParticipantIds.add(id));
+    const participantIds = this.meetingParticipants.begin(this.channel.voiceMembers.keys(), this.recorder.client.bot.user.id);
     const startedEvent = this.createMeetingLifecycleEvent('meeting.started', { participantIds }) as MeetingStartedLifecycleEvent;
     this.meetingStartedLifecycle = startedEvent;
     this.publishMeetingLifecycleEvent(startedEvent);
@@ -588,11 +588,8 @@ export default class Recording {
     }
 
     const isPresent = member.voiceState.channelID === this.channel.id;
-    if (isPresent && !this.knownParticipantIds.has(member.id)) {
-      this.knownParticipantIds.add(member.id);
-      this.publishMeetingLifecycle('participant.joined', { participantId: member.id });
-    } else if (!isPresent && this.knownParticipantIds.delete(member.id))
-      this.publishMeetingLifecycle('participant.left', { participantId: member.id });
+    const transition = this.meetingParticipants.observe(member.id, isPresent);
+    if (transition !== null) this.publishMeetingLifecycle(transition, { participantId: member.id });
   }
 
   async onConnectionConnect() {
