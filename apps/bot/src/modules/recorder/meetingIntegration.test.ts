@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
+import crc32 from './crc32';
 import {
   AuthoritativeRecordingReadyEvent,
   AuthoritativeTrackMetadata,
@@ -53,6 +54,26 @@ const terminalEvent: MeetingTerminalLifecycleEvent = {
   reason: null
 };
 
+function rawOggPage(granule: number, trackNumber: number, sequenceNumber: number, packet: Buffer): Buffer {
+  const segments: number[] = [];
+  let remaining = packet.byteLength;
+  while (remaining >= 255) {
+    segments.push(255);
+    remaining -= 255;
+  }
+  segments.push(remaining);
+  const page = Buffer.alloc(27 + segments.length + packet.byteLength);
+  page.write('OggS');
+  page.writeBigUInt64LE(BigInt(granule), 6);
+  page.writeUInt32LE(trackNumber, 14);
+  page.writeUInt32LE(sequenceNumber, 18);
+  page.writeUInt8(segments.length, 26);
+  Buffer.from(segments).copy(page, 27);
+  packet.copy(page, 27 + segments.length);
+  page.writeInt32LE(crc32(page), 22);
+  return page;
+}
+
 const packet: MeetingVoicePacket = {
   schemaVersion: 1,
   recordingId: 'recording-1',
@@ -77,7 +98,15 @@ test('preserves lifecycle and accepted voice ordering while batching packets', a
   assert.equal(sink.publishLifecycle(event), true);
   assert.equal(sink.publishPacket(packet, Buffer.from([1, 2, 3])), true);
   assert.equal(sink.publishPacket({ ...packet, rtpSequence: 13 }, Buffer.from([4, 5])), true);
-  assert.equal(sink.publishLifecycle({ ...event, eventId: 'recording-1:2', type: 'meeting.ended', reason: null }), true);
+  assert.equal(
+    sink.publishLifecycle({
+      ...event,
+      eventId: 'recording-1:2',
+      type: 'meeting.ended',
+      reason: null
+    }),
+    true
+  );
   assert.equal(await sink.drain(1000), true);
 
   assert.deepEqual(
@@ -108,7 +137,15 @@ test('rejects derived traffic outside an open meeting lifecycle', async () => {
   assert.equal(sink.publishLifecycle(participantJoined), false);
   assert.equal(sink.publishLifecycle(event), true);
   assert.equal(sink.publishPacket(packet, Buffer.from([2])), true);
-  assert.equal(sink.publishLifecycle({ ...event, eventId: 'recording-1:3', type: 'meeting.ended', reason: null }), true);
+  assert.equal(
+    sink.publishLifecycle({
+      ...event,
+      eventId: 'recording-1:3',
+      type: 'meeting.ended',
+      reason: null
+    }),
+    true
+  );
   assert.equal(sink.publishPacket({ ...packet, rtpSequence: 13 }, Buffer.from([3])), false);
   assert.equal(sink.publishLifecycle({ ...participantJoined, eventId: 'recording-1:4' }), false);
   assert.equal(await sink.drain(1000), true);
@@ -139,7 +176,14 @@ test('reserves terminal capacity when lifecycle traffic reaches its bound', asyn
   assert.equal(sink.publishLifecycle(event), true);
   assert.equal(sink.publishLifecycle(joined), true);
   assert.equal(sink.publishLifecycle({ ...joined, eventId: 'recording-1:3' }), false);
-  assert.equal(sink.publishLifecycle({ ...event, eventId: 'recording-1:4', type: 'meeting.ended' }), true);
+  assert.equal(
+    sink.publishLifecycle({
+      ...event,
+      eventId: 'recording-1:4',
+      type: 'meeting.ended'
+    }),
+    true
+  );
   release!();
   assert.equal(await sink.drain(1000), true);
   assert.deepEqual(
@@ -149,7 +193,9 @@ test('reserves terminal capacity when lifecycle traffic reaches its bound', asyn
 });
 
 test('tracks interleaved recording lifecycles independently', async () => {
-  const transport: MeetingIntegrationTransport = { post: async () => undefined };
+  const transport: MeetingIntegrationTransport = {
+    post: async () => undefined
+  };
   const sink = new BoundedMeetingIntegrationSink(transport, logger, 8, 2);
   const secondStart: MeetingLifecycleEvent = {
     ...event,
@@ -159,10 +205,24 @@ test('tracks interleaved recording lifecycles independently', async () => {
 
   assert.equal(sink.publishLifecycle(event), true);
   assert.equal(sink.publishLifecycle(secondStart), true);
-  assert.equal(sink.publishLifecycle({ ...event, eventId: 'recording-1:2', type: 'meeting.ended' }), true);
+  assert.equal(
+    sink.publishLifecycle({
+      ...event,
+      eventId: 'recording-1:2',
+      type: 'meeting.ended'
+    }),
+    true
+  );
   assert.equal(sink.publishPacket({ ...packet, recordingId: 'recording-2' }, Buffer.from([1])), true);
   assert.equal(sink.publishPacket(packet, Buffer.from([2])), false);
-  assert.equal(sink.publishLifecycle({ ...secondStart, eventId: 'recording-2:2', type: 'meeting.ended' }), true);
+  assert.equal(
+    sink.publishLifecycle({
+      ...secondStart,
+      eventId: 'recording-2:2',
+      type: 'meeting.ended'
+    }),
+    true
+  );
   assert.equal(await sink.drain(1000), true);
 });
 
@@ -224,7 +284,11 @@ test('permanent delivery rejection advances the realtime FIFO without retrying t
 
   sink.publishLifecycle(event);
   sink.publishPacket(packet, Buffer.from([1]));
-  sink.publishLifecycle({ ...event, eventId: 'recording-1:2', type: 'meeting.ended' });
+  sink.publishLifecycle({
+    ...event,
+    eventId: 'recording-1:2',
+    type: 'meeting.ended'
+  });
 
   assert.equal(await sink.drain(1000), true);
   assert.equal(attempts, 3);
@@ -243,11 +307,19 @@ test('HTTP original recording contract streams audio metadata and requires ready
   const audio = Buffer.from('OggS-authoritative-track');
   await writeFile(audioFilePath, audio);
   let readyStatus = 200;
-  const requests: Array<{ path: string; headers: IncomingHttpHeaders; body: Buffer }> = [];
+  const requests: Array<{
+    path: string;
+    headers: IncomingHttpHeaders;
+    body: Buffer;
+  }> = [];
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
-    requests.push({ path: request.url ?? '', headers: request.headers, body: Buffer.concat(chunks) });
+    requests.push({
+      path: request.url ?? '',
+      headers: request.headers,
+      body: Buffer.concat(chunks)
+    });
     response.writeHead(request.url === '/v1/craig/events' ? readyStatus : 202).end();
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -304,7 +376,12 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
   const sourceFileBase = path.join(recordingRoot, 'recording-1.ogg');
   await mkdir(recordingRoot, { recursive: true });
   const sources: Record<string, string | Buffer> = {
-    data: Buffer.from('original-data'),
+    data: Buffer.concat([
+      rawOggPage(900_000, 2, 1, Buffer.alloc(0)),
+      rawOggPage(57_600, 1, 2, Buffer.from([0xf8, 0xff, 0xfe])),
+      rawOggPage(123_456, 1, 3, Buffer.alloc(0)),
+      rawOggPage(132_024, 2, 2, Buffer.from([0xf8, 0xff, 0xfe]))
+    ]),
     header1: Buffer.from('original-header-1'),
     header2: Buffer.from('original-header-2'),
     users: '"0":{}\n,"1":{"id":"1533227577286852649"}\n,"2":{"id":"1533228054724346087"}\n',
@@ -331,6 +408,9 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
   const readyEvents: AuthoritativeRecordingReadyEvent[] = [];
   const lifecycleEvents: MeetingLifecycleEvent[] = [];
   const deliveryOrder: string[] = [];
+  const preparedJobs: Array<{
+    authoritativeTracks?: Array<Pick<AuthoritativeTrackMetadata, 'speakerId' | 'trackNumber' | 'timelineOffsetMs'>>;
+  }> = [];
   let readyAttempts = 0;
   const cooker: OriginalRecordingCooker = {
     async cook(recordingId, trackNumber): Promise<CookedAuthoritativeTrack> {
@@ -360,6 +440,7 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
     async postAuthoritativeReady(ready) {
       readyAttempts++;
       deliveryOrder.push('ready');
+      preparedJobs.push(JSON.parse(await readFile(path.join(outboxRoot, 'pending', 'recording-1.json'), 'utf8')) as typeof preparedJobs[number]);
       if (readyAttempts === 1) throw new Error('network reset after uploads');
       readyEvents.push(ready);
     }
@@ -387,14 +468,47 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
     'ready'
   ]);
   assert.deepEqual(
-    uploads.map(({ speakerId, trackNumber, timelineOffsetMs }) => ({ speakerId, trackNumber, timelineOffsetMs })),
+    uploads.map(({ speakerId, trackNumber, timelineOffsetMs }) => ({
+      speakerId,
+      trackNumber,
+      timelineOffsetMs
+    })),
     [
-      { speakerId: '1533227577286852649', trackNumber: 1, timelineOffsetMs: 0 },
-      { speakerId: '1533228054724346087', trackNumber: 2, timelineOffsetMs: 0 },
-      { speakerId: '1533227577286852649', trackNumber: 1, timelineOffsetMs: 0 },
-      { speakerId: '1533228054724346087', trackNumber: 2, timelineOffsetMs: 0 }
+      {
+        speakerId: '1533227577286852649',
+        trackNumber: 1,
+        timelineOffsetMs: 1200
+      },
+      {
+        speakerId: '1533228054724346087',
+        trackNumber: 2,
+        timelineOffsetMs: 2750
+      },
+      {
+        speakerId: '1533227577286852649',
+        trackNumber: 1,
+        timelineOffsetMs: 1200
+      },
+      {
+        speakerId: '1533228054724346087',
+        trackNumber: 2,
+        timelineOffsetMs: 2750
+      }
     ]
   );
+  assert.deepEqual(preparedJobs[0]?.authoritativeTracks, [
+    {
+      speakerId: '1533227577286852649',
+      trackNumber: 1,
+      timelineOffsetMs: 1200
+    },
+    {
+      speakerId: '1533228054724346087',
+      trackNumber: 2,
+      timelineOffsetMs: 2750
+    }
+  ]);
+  assert.deepEqual(preparedJobs[1]?.authoritativeTracks, preparedJobs[0]?.authoritativeTracks);
   assert.equal(new Set(uploads.map(({ uploadId }) => uploadId)).size, 2);
   assert.equal(readyEvents[0]?.trackCount, 2);
   assert.match(readyEvents[0]?.sourceFilesChecksumSha256 ?? '', /^[0-9a-f]{64}$/);
@@ -442,7 +556,7 @@ test('rejects a corrupt first original job without blocking the next recording',
     const sourceFileBase = path.join(recordingRoot, `${recordingId}.ogg`);
     await Promise.all(
       Object.entries({
-        data: Buffer.from(`original-data-${recordingId}`),
+        data: rawOggPage(48_000, 1, 2, Buffer.from([0xf8, 0xff, 0xfe])),
         header1: Buffer.from('original-header-1'),
         header2: Buffer.from('original-header-2'),
         users,
@@ -470,9 +584,20 @@ test('rejects a corrupt first original job without blocking the next recording',
     recordingRoot,
     outboxRoot
   });
-  assert.equal(await staging.publishOriginalRecording({ startedEvent: event, terminalEvent, sourceFileBase: corruptBase }), true);
   assert.equal(
-    await staging.publishOriginalRecording({ startedEvent: secondStarted, terminalEvent: secondTerminal, sourceFileBase: validBase }),
+    await staging.publishOriginalRecording({
+      startedEvent: event,
+      terminalEvent,
+      sourceFileBase: corruptBase
+    }),
+    true
+  );
+  assert.equal(
+    await staging.publishOriginalRecording({
+      startedEvent: secondStarted,
+      terminalEvent: secondTerminal,
+      sourceFileBase: validBase
+    }),
     true
   );
 
@@ -514,7 +639,93 @@ test('rejects a corrupt first original job without blocking the next recording',
   assert.deepEqual(readyRecordings, ['recording-2']);
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), []);
   assert.deepEqual(await readdir(path.join(outboxRoot, 'rejected')), ['recording-1.json']);
-  assert.equal(await readFile(`${corruptBase}.data`, 'utf8'), 'original-data-recording-1');
+  assert.deepEqual(await readFile(`${corruptBase}.data`), rawOggPage(48_000, 1, 2, Buffer.from([0xf8, 0xff, 0xfe])));
+});
+
+test('permanently rejects malformed and truncated raw Ogg data without touching originals', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-invalid-ogg-outbox-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  await mkdir(recordingRoot, { recursive: true });
+
+  const malformed = rawOggPage(48_000, 1, 2, Buffer.from([0xf8, 0xff, 0xfe]));
+  malformed[22] ^= 0xff;
+  const complete = rawOggPage(96_000, 1, 2, Buffer.from([0xf8, 0xff, 0xfe]));
+  const invalidRecordings = [
+    { recordingId: 'recording-bad-crc', data: malformed },
+    {
+      recordingId: 'recording-truncated',
+      data: complete.subarray(0, complete.byteLength - 1)
+    }
+  ];
+
+  const staging = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, {
+    recordingRoot,
+    outboxRoot
+  });
+  for (const [index, invalid] of invalidRecordings.entries()) {
+    const sourceFileBase = path.join(recordingRoot, `${invalid.recordingId}.ogg`);
+    await Promise.all(
+      Object.entries({
+        data: invalid.data,
+        header1: Buffer.from('original-header-1'),
+        header2: Buffer.from('original-header-2'),
+        users: '"0":{}\n,"1":{"id":"1533227577286852649"}\n',
+        info: '{"format":1}',
+        log: 'closed\n'
+      }).map(([kind, contents]) => writeFile(`${sourceFileBase}.${kind}`, contents))
+    );
+    assert.equal(
+      await staging.publishOriginalRecording({
+        startedEvent: {
+          ...event,
+          eventId: `${invalid.recordingId}:1`,
+          recordingId: invalid.recordingId,
+          occurredAt: `2026-08-02T00:0${index + 2}:00.000Z`
+        },
+        terminalEvent: {
+          ...terminalEvent,
+          eventId: `${invalid.recordingId}:2`,
+          recordingId: invalid.recordingId,
+          occurredAt: `2026-08-02T00:0${index + 2}:30.000Z`
+        },
+        sourceFileBase
+      }),
+      true
+    );
+  }
+
+  let cookCalls = 0;
+  const restored = new BoundedMeetingIntegrationSink(
+    {
+      post: async () => undefined,
+      postAuthoritativeTrack: async () => undefined,
+      postAuthoritativeReady: async () => undefined
+    },
+    logger,
+    4,
+    2,
+    1024,
+    {
+      recordingRoot,
+      outboxRoot,
+      cooker: {
+        async cook() {
+          cookCalls++;
+          throw new Error('invalid raw data must be rejected before cooking');
+        }
+      }
+    }
+  );
+  await restored.restoreOriginalRecordingJobs();
+
+  assert.equal(await restored.drain(2000), true);
+  assert.equal(cookCalls, 0);
+  assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), []);
+  assert.deepEqual(await readdir(path.join(outboxRoot, 'rejected')), ['recording-bad-crc.json', 'recording-truncated.json']);
+  for (const invalid of invalidRecordings)
+    assert.deepEqual(await readFile(path.join(recordingRoot, `${invalid.recordingId}.ogg.data`)), invalid.data);
 });
 
 test('publishes one aborted terminal lifecycle when recording finalization fails', async () => {

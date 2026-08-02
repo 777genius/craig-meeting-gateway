@@ -1,10 +1,12 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
+import { type Stats, createReadStream } from 'node:fs';
 import { mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import fetch from 'node-fetch';
+
+import crc32 from './crc32';
 
 const sourceFileKinds = ['data', 'header1', 'header2', 'users', 'info', 'log'] as const;
 const maximumCookedTrackBytes = 64 * 1024 * 1024;
@@ -81,6 +83,12 @@ interface OriginalRecordingSourceFileReference {
   sizeBytes?: number;
 }
 
+interface PreparedAuthoritativeTrack {
+  speakerId: string;
+  trackNumber: number;
+  timelineOffsetMs: number;
+}
+
 interface OriginalRecordingOutboxJob {
   schemaVersion: 2;
   publicationId: string;
@@ -90,6 +98,7 @@ interface OriginalRecordingOutboxJob {
   startedEvent: MeetingStartedLifecycleEvent;
   terminalEvent: MeetingTerminalLifecycleEvent;
   sourceFiles: OriginalRecordingSourceFileReference[];
+  authoritativeTracks?: PreparedAuthoritativeTrack[];
 }
 
 interface PendingOriginalRecordingJob {
@@ -105,7 +114,7 @@ export interface AuthoritativeTrackMetadata {
   channelId: string;
   speakerId: string;
   trackNumber: number;
-  timelineOffsetMs: 0;
+  timelineOffsetMs: number;
   checksumSha256: string;
   sizeBytes: number;
 }
@@ -251,7 +260,10 @@ export class CraigOriginalRecordingCooker implements OriginalRecordingCooker {
     child.stderr.on('data', (chunk: Buffer | string) => {
       if (stderr.length < 4096) stderr += (typeof chunk === 'string' ? chunk : chunk.toString('utf8')).slice(0, 4096 - stderr.length);
     });
-    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    const exited = new Promise<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve, reject) => {
       child.once('error', reject);
       child.once('close', (code, signal) => resolve({ code, signal }));
     });
@@ -400,7 +412,10 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       for (const entry of entries) {
         const filePath = path.join(this.pendingOriginalRoot, entry);
         try {
-          this.enqueueOriginalJob({ filePath, job: await readOriginalRecordingJob(filePath) });
+          this.enqueueOriginalJob({
+            filePath,
+            job: await readOriginalRecordingJob(filePath)
+          });
         } catch (error) {
           this.logger.error(`Rejecting invalid Meeting original recording outbox job ${entry}`, error);
           await this.rejectOriginalJob(filePath, entry);
@@ -478,7 +493,10 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
           if (item.type !== 'voice' || batch.length >= this.batchSize) break;
           batch.push(item.packet);
         }
-        await this.transport.post('/v1/craig/voice-packets', { schemaVersion: 1, packets: batch });
+        await this.transport.post('/v1/craig/voice-packets', {
+          schemaVersion: 1,
+          packets: batch
+        });
         this.queue.splice(0, batch.length);
         this.queuedPackets -= batch.length;
       }
@@ -580,13 +598,34 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
 
   private async prepareOriginalJob(pending: PendingOriginalRecordingJob): Promise<OriginalRecordingOutboxJob> {
     if (pending.job.terminalEvent.type === 'meeting.aborted') return pending.job;
-    if (pending.job.sourceFiles.every((source) => source.checksumSha256 !== undefined && source.sizeBytes !== undefined)) return pending.job;
+    if (
+      pending.job.authoritativeTracks !== undefined &&
+      pending.job.sourceFiles.every((source) => source.checksumSha256 !== undefined && source.sizeBytes !== undefined)
+    )
+      return pending.job;
+
+    const usersSource = pending.job.sourceFiles.find(({ kind }) => kind === 'users')!;
+    const dataSource = pending.job.sourceFiles.find(({ kind }) => kind === 'data')!;
+    const users = await inspectOriginalRecordingUsers(this.resolveSourceFile(usersSource));
+    const data = await inspectOriginalRecordingData(
+      this.resolveSourceFile(dataSource),
+      users.tracks.map(({ trackNumber }) => trackNumber)
+    );
     const sourceFiles: OriginalRecordingSourceFileReference[] = [];
     for (const source of pending.job.sourceFiles) {
-      const digest = await digestFile(this.resolveSourceFile(source));
+      const digest =
+        source.kind === 'users' ? users.integrity : source.kind === 'data' ? data.integrity : await digestFile(this.resolveSourceFile(source));
+      assertOriginalSourceIntegrity(source, digest);
       sourceFiles.push({ ...source, ...digest });
     }
-    const prepared = { ...pending.job, sourceFiles };
+    const prepared: OriginalRecordingOutboxJob = {
+      ...pending.job,
+      sourceFiles,
+      authoritativeTracks: users.tracks.map((track) => ({
+        ...track,
+        timelineOffsetMs: data.timelineOffsets.get(track.trackNumber)!
+      }))
+    };
     await writeOriginalRecordingJob(pending.filePath, prepared);
     return prepared;
   }
@@ -596,20 +635,20 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     await this.transport.post('/v1/craig/events', job.terminalEvent);
     if (job.terminalEvent.type === 'meeting.aborted') return;
 
-    const users = await readOriginalRecordingUsers(this.resolveSourceFile(job.sourceFiles.find(({ kind }) => kind === 'users')!));
-    for (const user of users) {
-      const cooked = await this.originalCooker!.cook(job.recordingId, user.trackNumber);
+    if (job.authoritativeTracks === undefined) throw new PermanentOriginalRecordingError('Original recording track metadata was not prepared');
+    for (const track of job.authoritativeTracks) {
+      const cooked = await this.originalCooker!.cook(job.recordingId, track.trackNumber);
       try {
         await this.transport.postAuthoritativeTrack!(
           {
             schemaVersion: 1,
-            uploadId: `authoritative-track:v1:${job.recordingId}:${user.trackNumber}`,
+            uploadId: `authoritative-track:v1:${job.recordingId}:${track.trackNumber}`,
             recordingId: job.recordingId,
             guildId: job.guildId,
             channelId: job.channelId,
-            speakerId: user.speakerId,
-            trackNumber: user.trackNumber,
-            timelineOffsetMs: 0,
+            speakerId: track.speakerId,
+            trackNumber: track.trackNumber,
+            timelineOffsetMs: track.timelineOffsetMs,
             checksumSha256: cooked.checksumSha256,
             sizeBytes: cooked.sizeBytes
           },
@@ -629,7 +668,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       occurredAt: job.terminalEvent.occurredAt,
       type: 'recording.authoritative_ready',
       endedAt: job.terminalEvent.occurredAt,
-      trackCount: users.length,
+      trackCount: job.authoritativeTracks.length,
       sourceFilesChecksumSha256: sourceFilesChecksum(job.sourceFiles)
     });
   }
@@ -910,7 +949,16 @@ async function syncDirectory(directoryPath: string): Promise<void> {
 async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecordingOutboxJob> {
   const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
   if (!isRecord(parsed) || parsed.schemaVersion !== 2) throw new Error('Original recording outbox job has an unsupported schema');
-  const { publicationId, recordingId, guildId, channelId, startedEvent: rawStartedEvent, terminalEvent: rawTerminalEvent, sourceFiles } = parsed;
+  const {
+    publicationId,
+    recordingId,
+    guildId,
+    channelId,
+    startedEvent: rawStartedEvent,
+    terminalEvent: rawTerminalEvent,
+    sourceFiles,
+    authoritativeTracks: rawAuthoritativeTracks
+  } = parsed;
   if (
     typeof publicationId !== 'string' ||
     typeof recordingId !== 'string' ||
@@ -951,6 +999,8 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
   if (new Set(normalizedSources.map(({ kind }) => kind)).size !== sourceFileKinds.length)
     throw new Error('Original recording outbox source kinds must be unique');
 
+  const authoritativeTracks = parsePreparedAuthoritativeTracks(rawAuthoritativeTracks);
+
   return {
     schemaVersion: 2,
     publicationId,
@@ -959,8 +1009,39 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     channelId,
     startedEvent,
     terminalEvent,
-    sourceFiles: normalizedSources.sort((left, right) => sourceFileKinds.indexOf(left.kind) - sourceFileKinds.indexOf(right.kind))
+    sourceFiles: normalizedSources.sort((left, right) => sourceFileKinds.indexOf(left.kind) - sourceFileKinds.indexOf(right.kind)),
+    ...(authoritativeTracks === undefined ? {} : { authoritativeTracks })
   };
+}
+
+function parsePreparedAuthoritativeTracks(value: unknown): PreparedAuthoritativeTrack[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length < 1 || value.length > 64) throw new Error('Original recording outbox track metadata is malformed');
+  const tracks = value.map((track): PreparedAuthoritativeTrack => {
+    if (
+      !isRecord(track) ||
+      typeof track.speakerId !== 'string' ||
+      !/^\d{17,20}$/.test(track.speakerId) ||
+      typeof track.trackNumber !== 'number' ||
+      !Number.isSafeInteger(track.trackNumber) ||
+      track.trackNumber < 1 ||
+      track.trackNumber > 1000 ||
+      typeof track.timelineOffsetMs !== 'number' ||
+      !Number.isSafeInteger(track.timelineOffsetMs) ||
+      track.timelineOffsetMs < 0
+    )
+      throw new Error('Original recording outbox track metadata is invalid');
+    return {
+      speakerId: track.speakerId,
+      trackNumber: track.trackNumber,
+      timelineOffsetMs: track.timelineOffsetMs
+    };
+  });
+  if (new Set(tracks.map(({ trackNumber }) => trackNumber)).size !== tracks.length)
+    throw new Error('Original recording outbox track numbers must be unique');
+  if (new Set(tracks.map(({ speakerId }) => speakerId)).size !== tracks.length)
+    throw new Error('Original recording outbox speaker identities must be unique');
+  return tracks.sort((left, right) => left.trackNumber - right.trackNumber);
 }
 
 async function digestFile(filePath: string): Promise<{ checksumSha256: string; sizeBytes: number }> {
@@ -982,17 +1063,23 @@ async function digestFile(filePath: string): Promise<{ checksumSha256: string; s
   }
 }
 
-async function readOriginalRecordingUsers(filePath: string): Promise<Array<{ speakerId: string; trackNumber: number }>> {
-  let serialized: string;
+async function inspectOriginalRecordingUsers(filePath: string): Promise<{
+  tracks: Array<{ speakerId: string; trackNumber: number }>;
+  integrity: { checksumSha256: string; sizeBytes: number };
+}> {
+  let contents: Buffer;
   try {
-    serialized = await readFile(filePath, 'utf8');
+    const descriptor = await stat(filePath);
+    if (!descriptor.isFile()) throw new PermanentOriginalRecordingError(`Craig users source is not a regular file: ${filePath}`);
+    contents = await readFile(filePath);
+    if (contents.byteLength !== descriptor.size) throw new PermanentOriginalRecordingError(`Craig users source changed while reading: ${filePath}`);
   } catch (error) {
     if (isMissingOriginalSourceError(error)) throw new PermanentOriginalRecordingError(`Craig users source is missing: ${filePath}`);
     throw error;
   }
   let users: unknown;
   try {
-    users = JSON.parse(`{${serialized}}`) as unknown;
+    users = JSON.parse(`{${contents.toString('utf8')}}`) as unknown;
   } catch {
     throw new PermanentOriginalRecordingError('Craig users source is not valid JSON');
   }
@@ -1019,7 +1106,108 @@ async function readOriginalRecordingUsers(filePath: string): Promise<Array<{ spe
     throw new PermanentOriginalRecordingError('Craig users source contains duplicate track numbers');
   if (new Set(mapped.map(({ speakerId }) => speakerId)).size !== mapped.length)
     throw new PermanentOriginalRecordingError('Craig users source contains duplicate speaker identities');
-  return mapped;
+  return {
+    tracks: mapped,
+    integrity: {
+      checksumSha256: createHash('sha256').update(contents).digest('hex'),
+      sizeBytes: contents.byteLength
+    }
+  };
+}
+
+async function inspectOriginalRecordingData(
+  filePath: string,
+  trackNumbers: number[]
+): Promise<{
+  timelineOffsets: Map<number, number>;
+  integrity: { checksumSha256: string; sizeBytes: number };
+}> {
+  let descriptor: Stats;
+  try {
+    descriptor = await stat(filePath);
+    if (!descriptor.isFile()) throw new PermanentOriginalRecordingError(`Craig data source is not a regular file: ${filePath}`);
+  } catch (error) {
+    if (isMissingOriginalSourceError(error)) throw new PermanentOriginalRecordingError(`Craig data source is missing: ${filePath}`);
+    throw error;
+  }
+
+  const wantedTracks = new Set(trackNumbers);
+  const timelineOffsets = new Map<number, number>();
+  const checksum = createHash('sha256');
+  let buffered = Buffer.alloc(0);
+  let sizeBytes = 0;
+  let pageNumber = 0;
+
+  try {
+    for await (const rawChunk of createReadStream(filePath)) {
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk as Uint8Array);
+      checksum.update(chunk);
+      sizeBytes += chunk.byteLength;
+      buffered = buffered.byteLength === 0 ? chunk : Buffer.concat([buffered, chunk]);
+
+      while (buffered.byteLength >= 4) {
+        if (buffered.subarray(0, 4).toString('ascii') !== 'OggS')
+          throw new PermanentOriginalRecordingError(`Craig data source has an invalid Ogg capture pattern at page ${pageNumber + 1}`);
+        if (buffered.byteLength < 27) break;
+        if (buffered[4] !== 0)
+          throw new PermanentOriginalRecordingError(`Craig data source has an unsupported Ogg version at page ${pageNumber + 1}`);
+        if ((buffered[5] & ~0x07) !== 0)
+          throw new PermanentOriginalRecordingError(`Craig data source has invalid Ogg flags at page ${pageNumber + 1}`);
+
+        const segmentCount = buffered[26];
+        if (segmentCount === 0)
+          throw new PermanentOriginalRecordingError(`Craig data source has an empty Ogg segment table at page ${pageNumber + 1}`);
+        const headerBytes = 27 + segmentCount;
+        if (buffered.byteLength < headerBytes) break;
+        let packetBytes = 0;
+        for (let index = 27; index < headerBytes; index++) packetBytes += buffered[index];
+        if (buffered[headerBytes - 1] === 255)
+          throw new PermanentOriginalRecordingError(`Craig data source has a continued Ogg packet at page ${pageNumber + 1}`);
+        const pageBytes = headerBytes + packetBytes;
+        if (buffered.byteLength < pageBytes) break;
+
+        const page = buffered.subarray(0, pageBytes);
+        const recordedChecksum = page.readInt32LE(22);
+        const checksumInput = Buffer.from(page);
+        checksumInput.fill(0, 22, 26);
+        if (crc32(checksumInput) !== recordedChecksum)
+          throw new PermanentOriginalRecordingError(`Craig data source has an invalid Ogg checksum at page ${pageNumber + 1}`);
+
+        const trackNumber = page.readUInt32LE(14);
+        if (packetBytes > 0 && wantedTracks.has(trackNumber) && !timelineOffsets.has(trackNumber)) {
+          const granule = page.readBigUInt64LE(6);
+          if (granule === 0xffffffffffffffffn)
+            throw new PermanentOriginalRecordingError(`Craig data source track ${trackNumber} has no audio granule position`);
+          const timelineOffset = granule / 48n;
+          if (timelineOffset > BigInt(Number.MAX_SAFE_INTEGER))
+            throw new PermanentOriginalRecordingError(`Craig data source track ${trackNumber} has an unsafe audio granule position`);
+          timelineOffsets.set(trackNumber, Number(timelineOffset));
+        }
+
+        pageNumber++;
+        buffered = buffered.subarray(pageBytes);
+      }
+    }
+  } catch (error) {
+    if (isMissingOriginalSourceError(error)) throw new PermanentOriginalRecordingError(`Craig data source is missing: ${filePath}`);
+    throw error;
+  }
+
+  if (buffered.byteLength !== 0) throw new PermanentOriginalRecordingError(`Craig data source ends with a truncated Ogg page ${pageNumber + 1}`);
+  if (sizeBytes !== descriptor.size) throw new PermanentOriginalRecordingError(`Craig data source changed while reading: ${filePath}`);
+  for (const trackNumber of trackNumbers) {
+    if (!timelineOffsets.has(trackNumber)) throw new PermanentOriginalRecordingError(`Craig data source has no audio page for track ${trackNumber}`);
+  }
+  return {
+    timelineOffsets,
+    integrity: { checksumSha256: checksum.digest('hex'), sizeBytes }
+  };
+}
+
+function assertOriginalSourceIntegrity(source: OriginalRecordingSourceFileReference, actual: { checksumSha256: string; sizeBytes: number }): void {
+  if (source.checksumSha256 === undefined && source.sizeBytes === undefined) return;
+  if (source.checksumSha256 !== actual.checksumSha256 || source.sizeBytes !== actual.sizeBytes)
+    throw new PermanentOriginalRecordingError(`Original recording source changed after outbox preparation: ${source.relativePath}`);
 }
 
 function isMissingOriginalSourceError(error: unknown): error is NodeJS.ErrnoException {
