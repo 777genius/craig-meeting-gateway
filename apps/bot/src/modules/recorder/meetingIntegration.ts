@@ -10,6 +10,7 @@ import crc32 from './crc32';
 
 const sourceFileKinds = ['data', 'header1', 'header2', 'users', 'info', 'log'] as const;
 const maximumCookedTrackBytes = 64 * 1024 * 1024;
+const authoritativeTimelineBasis = 'craig-cook-shared-origin-v1' as const;
 
 type OriginalRecordingSourceFileKind = typeof sourceFileKinds[number];
 
@@ -99,6 +100,7 @@ interface OriginalRecordingOutboxJob {
   terminalEvent: MeetingTerminalLifecycleEvent;
   sourceFiles: OriginalRecordingSourceFileReference[];
   authoritativeTracks?: PreparedAuthoritativeTrack[];
+  authoritativeTimelineBasis?: typeof authoritativeTimelineBasis;
 }
 
 interface PendingOriginalRecordingJob {
@@ -599,6 +601,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private async prepareOriginalJob(pending: PendingOriginalRecordingJob): Promise<OriginalRecordingOutboxJob> {
     if (pending.job.terminalEvent.type === 'meeting.aborted') return pending.job;
     if (
+      pending.job.authoritativeTimelineBasis === authoritativeTimelineBasis &&
       pending.job.authoritativeTracks !== undefined &&
       pending.job.sourceFiles.every((source) => source.checksumSha256 !== undefined && source.sizeBytes !== undefined)
     )
@@ -623,8 +626,9 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       sourceFiles,
       authoritativeTracks: users.tracks.map((track) => ({
         ...track,
-        timelineOffsetMs: data.timelineOffsets.get(track.trackNumber)!
-      }))
+        timelineOffsetMs: data.timelineOffsetMs
+      })),
+      authoritativeTimelineBasis
     };
     await writeOriginalRecordingJob(pending.filePath, prepared);
     return prepared;
@@ -957,7 +961,8 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     startedEvent: rawStartedEvent,
     terminalEvent: rawTerminalEvent,
     sourceFiles,
-    authoritativeTracks: rawAuthoritativeTracks
+    authoritativeTracks: rawAuthoritativeTracks,
+    authoritativeTimelineBasis: rawAuthoritativeTimelineBasis
   } = parsed;
   if (
     typeof publicationId !== 'string' ||
@@ -1000,6 +1005,13 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     throw new Error('Original recording outbox source kinds must be unique');
 
   const authoritativeTracks = parsePreparedAuthoritativeTracks(rawAuthoritativeTracks);
+  if (rawAuthoritativeTimelineBasis !== undefined && rawAuthoritativeTimelineBasis !== authoritativeTimelineBasis)
+    throw new Error('Original recording outbox timeline basis is invalid');
+  if (
+    rawAuthoritativeTimelineBasis === authoritativeTimelineBasis &&
+    (authoritativeTracks === undefined || new Set(authoritativeTracks.map(({ timelineOffsetMs }) => timelineOffsetMs)).size !== 1)
+  )
+    throw new Error('Original recording outbox shared timeline metadata is invalid');
 
   return {
     schemaVersion: 2,
@@ -1010,7 +1022,8 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     startedEvent,
     terminalEvent,
     sourceFiles: normalizedSources.sort((left, right) => sourceFileKinds.indexOf(left.kind) - sourceFileKinds.indexOf(right.kind)),
-    ...(authoritativeTracks === undefined ? {} : { authoritativeTracks })
+    ...(authoritativeTracks === undefined ? {} : { authoritativeTracks }),
+    ...(rawAuthoritativeTimelineBasis === undefined ? {} : { authoritativeTimelineBasis })
   };
 }
 
@@ -1119,7 +1132,7 @@ async function inspectOriginalRecordingData(
   filePath: string,
   trackNumbers: number[]
 ): Promise<{
-  timelineOffsets: Map<number, number>;
+  timelineOffsetMs: number;
   integrity: { checksumSha256: string; sizeBytes: number };
 }> {
   let descriptor: Stats;
@@ -1132,7 +1145,8 @@ async function inspectOriginalRecordingData(
   }
 
   const wantedTracks = new Set(trackNumbers);
-  const timelineOffsets = new Map<number, number>();
+  const tracksWithAudio = new Set<number>();
+  let timelineOffsetMs: number | undefined;
   const checksum = createHash('sha256');
   let buffered = Buffer.alloc(0);
   let sizeBytes = 0;
@@ -1173,15 +1187,16 @@ async function inspectOriginalRecordingData(
         if (crc32(checksumInput) !== recordedChecksum)
           throw new PermanentOriginalRecordingError(`Craig data source has an invalid Ogg checksum at page ${pageNumber + 1}`);
 
-        const trackNumber = page.readUInt32LE(14);
-        if (packetBytes > 0 && wantedTracks.has(trackNumber) && !timelineOffsets.has(trackNumber)) {
+        if (packetBytes > 0) {
+          const trackNumber = page.readUInt32LE(14);
           const granule = page.readBigUInt64LE(6);
           if (granule === 0xffffffffffffffffn)
             throw new PermanentOriginalRecordingError(`Craig data source track ${trackNumber} has no audio granule position`);
-          const timelineOffset = granule / 48n;
-          if (timelineOffset > BigInt(Number.MAX_SAFE_INTEGER))
+          const pageOffsetMs = granule / 48n;
+          if (pageOffsetMs > BigInt(Number.MAX_SAFE_INTEGER))
             throw new PermanentOriginalRecordingError(`Craig data source track ${trackNumber} has an unsafe audio granule position`);
-          timelineOffsets.set(trackNumber, Number(timelineOffset));
+          timelineOffsetMs ??= Number(pageOffsetMs);
+          if (wantedTracks.has(trackNumber)) tracksWithAudio.add(trackNumber);
         }
 
         pageNumber++;
@@ -1196,10 +1211,11 @@ async function inspectOriginalRecordingData(
   if (buffered.byteLength !== 0) throw new PermanentOriginalRecordingError(`Craig data source ends with a truncated Ogg page ${pageNumber + 1}`);
   if (sizeBytes !== descriptor.size) throw new PermanentOriginalRecordingError(`Craig data source changed while reading: ${filePath}`);
   for (const trackNumber of trackNumbers) {
-    if (!timelineOffsets.has(trackNumber)) throw new PermanentOriginalRecordingError(`Craig data source has no audio page for track ${trackNumber}`);
+    if (!tracksWithAudio.has(trackNumber)) throw new PermanentOriginalRecordingError(`Craig data source has no audio page for track ${trackNumber}`);
   }
+  if (timelineOffsetMs === undefined) throw new PermanentOriginalRecordingError('Craig data source has no non-empty Ogg pages');
   return {
-    timelineOffsets,
+    timelineOffsetMs,
     integrity: { checksumSha256: checksum.digest('hex'), sizeBytes }
   };
 }

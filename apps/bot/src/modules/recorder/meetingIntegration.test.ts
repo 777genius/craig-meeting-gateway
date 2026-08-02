@@ -368,7 +368,7 @@ test('HTTP original recording contract streams audio metadata and requires ready
   await transport.postAuthoritativeReady(ready);
 });
 
-test('restores exact lifecycle events before tracks after losing the realtime queue', async (context) => {
+test('restores exact lifecycle events and one shared cooked-track origin after losing the realtime queue', async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), 'craig-original-outbox-test-'));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const recordingRoot = path.join(root, 'recordings');
@@ -378,9 +378,9 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
   const sources: Record<string, string | Buffer> = {
     data: Buffer.concat([
       rawOggPage(900_000, 2, 1, Buffer.alloc(0)),
-      rawOggPage(57_600, 1, 2, Buffer.from([0xf8, 0xff, 0xfe])),
+      rawOggPage(57_624, 1, 2, Buffer.from([0xf8, 0xff, 0xfe])),
       rawOggPage(123_456, 1, 3, Buffer.alloc(0)),
-      rawOggPage(132_024, 2, 2, Buffer.from([0xf8, 0xff, 0xfe]))
+      rawOggPage(134_424, 2, 2, Buffer.from([0xf8, 0xff, 0xfe]))
     ]),
     header1: Buffer.from('original-header-1'),
     header2: Buffer.from('original-header-2'),
@@ -403,6 +403,25 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
     true
   );
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), ['recording-1.json']);
+  const pendingJobPath = path.join(outboxRoot, 'pending', 'recording-1.json');
+  const legacyPreparedJob = JSON.parse(await readFile(pendingJobPath, 'utf8')) as {
+    sourceFiles: Array<{ kind: string; relativePath: string }>;
+    authoritativeTracks?: Array<Pick<AuthoritativeTrackMetadata, 'speakerId' | 'trackNumber' | 'timelineOffsetMs'>>;
+  };
+  legacyPreparedJob.sourceFiles = legacyPreparedJob.sourceFiles.map((source) => {
+    const contents = sources[source.kind]!;
+    const bytes = Buffer.isBuffer(contents) ? contents : Buffer.from(contents);
+    return {
+      ...source,
+      checksumSha256: createHash('sha256').update(bytes).digest('hex'),
+      sizeBytes: bytes.byteLength
+    };
+  });
+  legacyPreparedJob.authoritativeTracks = [
+    { speakerId: '1533227577286852649', trackNumber: 1, timelineOffsetMs: 1200 },
+    { speakerId: '1533228054724346087', trackNumber: 2, timelineOffsetMs: 2800 }
+  ];
+  await writeFile(pendingJobPath, `${JSON.stringify(legacyPreparedJob)}\n`);
 
   const uploads: AuthoritativeTrackMetadata[] = [];
   const readyEvents: AuthoritativeRecordingReadyEvent[] = [];
@@ -410,6 +429,7 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
   const deliveryOrder: string[] = [];
   const preparedJobs: Array<{
     authoritativeTracks?: Array<Pick<AuthoritativeTrackMetadata, 'speakerId' | 'trackNumber' | 'timelineOffsetMs'>>;
+    authoritativeTimelineBasis?: string;
   }> = [];
   let readyAttempts = 0;
   const cooker: OriginalRecordingCooker = {
@@ -482,7 +502,7 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
       {
         speakerId: '1533228054724346087',
         trackNumber: 2,
-        timelineOffsetMs: 2750
+        timelineOffsetMs: 1200
       },
       {
         speakerId: '1533227577286852649',
@@ -492,7 +512,7 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
       {
         speakerId: '1533228054724346087',
         trackNumber: 2,
-        timelineOffsetMs: 2750
+        timelineOffsetMs: 1200
       }
     ]
   );
@@ -505,10 +525,15 @@ test('restores exact lifecycle events before tracks after losing the realtime qu
     {
       speakerId: '1533228054724346087',
       trackNumber: 2,
-      timelineOffsetMs: 2750
+      timelineOffsetMs: 1200
     }
   ]);
+  assert.equal(preparedJobs[0]?.authoritativeTimelineBasis, 'craig-cook-shared-origin-v1');
   assert.deepEqual(preparedJobs[1]?.authoritativeTracks, preparedJobs[0]?.authoritativeTracks);
+  assert.deepEqual(
+    uploads.slice(0, 2).map(({ trackNumber, timelineOffsetMs }) => timelineOffsetMs + (trackNumber === 1 ? 0 : 1600)),
+    [1200, 2800]
+  );
   assert.equal(new Set(uploads.map(({ uploadId }) => uploadId)).size, 2);
   assert.equal(readyEvents[0]?.trackCount, 2);
   assert.match(readyEvents[0]?.sourceFilesChecksumSha256 ?? '', /^[0-9a-f]{64}$/);
