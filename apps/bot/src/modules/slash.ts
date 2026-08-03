@@ -20,6 +20,7 @@ import { onCommandRun } from '../influx';
 import { prisma } from '../prisma';
 import { reportErrorFromCommand } from '../sentry';
 import { blessServer, checkRecordingPermission, cutoffText, disableComponents, formatVoiceCode, paginateRecordings, unblessServer } from '../util';
+import { forwardOwnedCraigGatewayInteraction } from './gatewayInteractionOwnership';
 import type RecorderModule from './recorder';
 import { RecordingState } from './recorder/recording';
 
@@ -62,7 +63,7 @@ export default class SlashModule<T extends DexareClient<SlashConfig>> extends De
       .withServer(
         new GatewayServer((handler) =>
           this.registerEvent('rawWS', (_, event) => {
-            if (event.t === 'INTERACTION_CREATE') handler(event.d as any);
+            forwardOwnedCraigGatewayInteraction(event, this.creator.commands.values(), handler);
           })
         )
       )
