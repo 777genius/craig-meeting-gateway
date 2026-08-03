@@ -70,11 +70,13 @@ const generated = {
         requestTimeoutMs: positiveInteger('MEETING_REQUEST_TIMEOUT_MS', 5000, 60000)
       },
       meetingAutoRecord: {
-        enabled: meetingAutoRecordChannelIds.length > 0,
+        enabled: true,
         channelIds: meetingAutoRecordChannelIds,
         syntheticBotUserIds: meetingAutoRecordSyntheticBotUserIds,
         startDelayMs: nonNegativeInteger('MEETING_AUTO_RECORD_START_DELAY_MS', 250, 60000),
-        emptyGraceMs: nonNegativeInteger('MEETING_AUTO_RECORD_EMPTY_GRACE_MS', 5000, 60000)
+        emptyGraceMs: nonNegativeInteger('MEETING_AUTO_RECORD_EMPTY_GRACE_MS', 5000, 60000),
+        platformConfiguration: true,
+        configurationPollMs: positiveInteger('MEETING_AUTO_RECORD_CONFIGURATION_POLL_MS', 5000, 60000)
       },
       webapp: {
         on: false

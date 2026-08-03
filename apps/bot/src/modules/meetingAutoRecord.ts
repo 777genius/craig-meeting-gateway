@@ -10,6 +10,7 @@ import {
   normalizeMeetingAutoRecordConfig
 } from './meetingAutoRecordCoordinator';
 import type RecorderModule from './recorder';
+import { type MeetingPlatformConfigurationClient, createMeetingPlatformConfigurationClient } from './recorder/meetingIntegration';
 import Recording, { RecordingState } from './recorder/recording';
 
 export type { MeetingAutoRecordConfig } from './meetingAutoRecordCoordinator';
@@ -18,6 +19,12 @@ export type { MeetingAutoRecordConfig } from './meetingAutoRecordCoordinator';
 // It is a deployment-only allowlist path for private synthetic E2E guilds.
 export default class MeetingAutoRecordModule extends DexareModule<DexareClient<CraigBotConfig>> {
   private coordinator?: MeetingAutoRecordCoordinator;
+  private platformConfigurationClient?: MeetingPlatformConfigurationClient;
+  private configurationPollTimer?: NodeJS.Timeout;
+  private configurationPolling = false;
+  private platformConfigurationEnabled = false;
+  private configurationPollMs = 5_000;
+  private disposed = false;
 
   constructor(client: DexareClient<CraigBotConfig>) {
     super(client, {
@@ -40,6 +47,9 @@ export default class MeetingAutoRecordModule extends DexareModule<DexareClient<C
       return;
     }
 
+    this.platformConfigurationEnabled = config.platformConfiguration;
+    this.configurationPollMs = config.configurationPollMs;
+
     // The public application ID is also the bot user ID and is available before
     // the gateway ready event; `bot.user` is intentionally unavailable here.
     this.coordinator = new MeetingAutoRecordCoordinator(config, this.client.config.applicationID, {
@@ -56,10 +66,23 @@ export default class MeetingAutoRecordModule extends DexareModule<DexareClient<C
     this.registerEvent('voiceChannelJoin', this.onVoiceChannelJoin.bind(this));
     this.registerEvent('voiceChannelLeave', this.onVoiceChannelLeave.bind(this));
     this.registerEvent('voiceChannelSwitch', this.onVoiceChannelSwitch.bind(this));
-    this.logger.info(`Meeting auto-record enabled for ${[...this.coordinator.configuredChannelIds()].length} explicitly allowlisted channel(s)`);
+    if (this.platformConfigurationEnabled && !this.client.config.craig.meetingIntegration?.enabled) {
+      this.platformConfigurationEnabled = false;
+      this.logger.warn(
+        'Meeting auto-record platform configuration is enabled but Meeting integration is disabled; retaining the static allowlist fallback'
+      );
+    }
+    this.logger.info(
+      `Meeting auto-record enabled for ${[...this.coordinator.configuredChannelIds()].length} static fallback channel(s)${
+        this.platformConfigurationEnabled ? '; Meeting Platform configuration polling is enabled' : ''
+      }`
+    );
   }
 
   unload() {
+    this.disposed = true;
+    if (this.configurationPollTimer) clearTimeout(this.configurationPollTimer);
+    this.configurationPollTimer = undefined;
     this.coordinator?.dispose();
     this.unregisterAllEvents();
   }
@@ -99,12 +122,12 @@ export default class MeetingAutoRecordModule extends DexareModule<DexareClient<C
 
     const recording = new Recording(this.recorder, channel as Eris.StageChannel | Eris.VoiceChannel, member.user, true);
     this.recorder.recordings.set(guildId, recording);
-    this.logger.info(`Starting allowlisted Meeting auto-record ${recording.id} in ${channelId}`);
+    this.logger.info(`Starting configured Meeting auto-record ${recording.id} in ${channelId}`);
 
     try {
       await recording.start(parsedRewards, false);
     } catch (error) {
-      this.logger.error(`Failed to start allowlisted Meeting auto-record ${recording.id}`, error);
+      this.logger.error(`Failed to start configured Meeting auto-record ${recording.id}`, error);
       recording.state = RecordingState.ERROR;
       await recording.stop(true).catch(() => undefined);
       return;
@@ -118,18 +141,19 @@ export default class MeetingAutoRecordModule extends DexareModule<DexareClient<C
     const recording = this.recorder.recordings.get(guildId);
     if (!recording || recording.id !== recordingId) return;
 
-    this.logger.info(`Stopping allowlisted Meeting auto-record ${recording.id}: no eligible participants remain`);
-    recording.pushToActivity('Meeting auto-record stopped because the allowlisted channel became empty.');
+    this.logger.info(`Stopping configured Meeting auto-record ${recording.id}: no eligible participants remain`);
+    recording.pushToActivity('Meeting auto-record stopped because the configured channel became empty.');
     await recording.stop();
   }
 
   private onReady() {
     if (!this.coordinator) return;
     for (const guild of this.client.bot.guilds.values()) {
-      for (const channelId of this.coordinator.configuredChannelIds()) {
+      for (const channelId of this.coordinator.configuredChannelIdsForGuild(guild.id)) {
         if (guild.channels.has(channelId)) this.coordinator.schedule(guild.id, channelId, false);
       }
     }
+    this.schedulePlatformConfigurationPoll(0);
   }
 
   private onVoiceChannelJoin(_: unknown, member: Eris.Member, channel: Eris.StageChannel | Eris.VoiceChannel) {
@@ -151,5 +175,44 @@ export default class MeetingAutoRecordModule extends DexareModule<DexareClient<C
     if (!this.coordinator?.observesParticipant({ id: member.id, bot: member.bot })) return;
     this.coordinator.schedule(member.guild.id, oldChannel.id, true);
     this.coordinator.schedule(member.guild.id, newChannel.id, false);
+  }
+
+  private schedulePlatformConfigurationPoll(delayMs: number): void {
+    if (!this.platformConfigurationEnabled || this.disposed || this.configurationPollTimer || this.configurationPolling) return;
+    this.configurationPollTimer = setTimeout(() => {
+      this.configurationPollTimer = undefined;
+      void this.pollPlatformConfiguration();
+    }, delayMs);
+  }
+
+  private async pollPlatformConfiguration(): Promise<void> {
+    if (this.disposed || this.configurationPolling || !this.platformConfigurationEnabled) return;
+    this.configurationPolling = true;
+    try {
+      this.platformConfigurationClient ??= await createMeetingPlatformConfigurationClient(this.client.config.craig.meetingIntegration, {
+        debug: (message) => this.logger.debug(message),
+        warn: (message) => this.logger.warn(message),
+        error: (message, error) => this.logger.error(message, error)
+      });
+      if (!this.platformConfigurationClient) return;
+
+      const configuration = await this.platformConfigurationClient.getConfiguration();
+      if (this.disposed || !this.coordinator) return;
+
+      const update = await this.coordinator.replacePlatformChannelSnapshot(
+        configuration.channels.map(({ guildId, voiceChannelId }) => ({ guildId, channelId: voiceChannelId }))
+      );
+      if (update.added.length || update.removed.length)
+        this.logger.info(`Reconciled Meeting Platform auto-record configuration: ${update.added.length} added, ${update.removed.length} removed`);
+    } catch (error) {
+      if (!this.disposed)
+        this.logger.warn(
+          'Failed to fetch Meeting Platform auto-record configuration; retaining the last-known-good snapshot or static fallback',
+          error
+        );
+    } finally {
+      this.configurationPolling = false;
+      this.schedulePlatformConfigurationPoll(this.configurationPollMs);
+    }
   }
 }

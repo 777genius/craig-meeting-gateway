@@ -4,13 +4,15 @@ import { type Stats, createReadStream } from 'node:fs';
 import { mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import fetch from 'node-fetch';
+import fetch, { type Response } from 'node-fetch';
 
 import crc32 from './crc32';
 
 const sourceFileKinds = ['data', 'header1', 'header2', 'users', 'info', 'log'] as const;
 const maximumCookedTrackBytes = 64 * 1024 * 1024;
 const authoritativeTimelineBasis = 'craig-cook-shared-origin-v1' as const;
+const maximumMeetingPlatformConfigurationChannels = 64;
+const discordSnowflake = /^\d{17,20}$/;
 
 type OriginalRecordingSourceFileKind = typeof sourceFileKinds[number];
 
@@ -21,6 +23,20 @@ export interface MeetingIntegrationConfig {
   maxQueuedPackets?: number;
   batchSize?: number;
   requestTimeoutMs?: number;
+}
+
+export interface MeetingPlatformConfigurationChannel {
+  guildId: string;
+  voiceChannelId: string;
+}
+
+export interface MeetingPlatformConfiguration {
+  schemaVersion: 1;
+  channels: readonly MeetingPlatformConfigurationChannel[];
+}
+
+export interface MeetingPlatformConfigurationClient {
+  getConfiguration(): Promise<MeetingPlatformConfiguration>;
 }
 
 export interface MeetingLifecycleEvent {
@@ -764,8 +780,22 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   }
 }
 
-export class HttpMeetingIntegrationTransport implements MeetingIntegrationTransport {
+export class HttpMeetingIntegrationTransport implements MeetingIntegrationTransport, MeetingPlatformConfigurationClient {
   constructor(private readonly endpoint: URL, private readonly token: string, private readonly requestTimeoutMs: number) {}
+
+  async getConfiguration(): Promise<MeetingPlatformConfiguration> {
+    const response = await this.request(
+      '/v1/craig/configuration',
+      {
+        method: 'GET',
+        headers: {
+          authorization: `Bearer ${this.token}`
+        }
+      },
+      200
+    );
+    return parseMeetingPlatformConfiguration(await response.json());
+  }
 
   async post(path: '/v1/craig/events' | '/v1/craig/voice-packets', body: unknown): Promise<void> {
     await this.request(path, {
@@ -811,7 +841,7 @@ export class HttpMeetingIntegrationTransport implements MeetingIntegrationTransp
     );
   }
 
-  private async request(pathname: string, init: Parameters<typeof fetch>[1], expectedStatus?: number): Promise<void> {
+  private async request(pathname: string, init: Parameters<typeof fetch>[1], expectedStatus?: number): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
     try {
@@ -822,6 +852,7 @@ export class HttpMeetingIntegrationTransport implements MeetingIntegrationTransp
           isRetryableMeetingIntegrationStatus(response.status),
           response.status
         );
+      return response;
     } finally {
       clearTimeout(timeout);
     }
@@ -834,6 +865,33 @@ export async function createMeetingIntegrationSink(
   recordingRoot?: string
 ): Promise<MeetingIntegrationSink> {
   if (!config?.enabled) return new NoopMeetingIntegrationSink();
+  const transport = await createHttpMeetingIntegrationTransport(config, logger);
+  if (!transport) return new NoopMeetingIntegrationSink();
+
+  const sink = new BoundedMeetingIntegrationSink(
+    transport,
+    logger,
+    config.maxQueuedPackets,
+    config.batchSize,
+    1024,
+    recordingRoot === undefined ? undefined : { recordingRoot }
+  );
+  await sink.restoreOriginalRecordingJobs();
+  return sink;
+}
+
+export async function createMeetingPlatformConfigurationClient(
+  config: MeetingIntegrationConfig | undefined,
+  logger: MeetingIntegrationLogger
+): Promise<MeetingPlatformConfigurationClient | undefined> {
+  return await createHttpMeetingIntegrationTransport(config, logger);
+}
+
+async function createHttpMeetingIntegrationTransport(
+  config: MeetingIntegrationConfig | undefined,
+  logger: MeetingIntegrationLogger
+): Promise<HttpMeetingIntegrationTransport | undefined> {
+  if (!config?.enabled) return undefined;
 
   const endpoint = new URL(config.endpoint);
   if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password)
@@ -847,16 +905,41 @@ export async function createMeetingIntegrationSink(
     throw new Error('Meeting integration requestTimeoutMs must be between 100 and 60000');
 
   logger.debug(`Meeting integration enabled for ${endpoint.origin}`);
-  const sink = new BoundedMeetingIntegrationSink(
-    new HttpMeetingIntegrationTransport(endpoint, token, requestTimeoutMs),
-    logger,
-    config.maxQueuedPackets,
-    config.batchSize,
-    1024,
-    recordingRoot === undefined ? undefined : { recordingRoot }
+  return new HttpMeetingIntegrationTransport(endpoint, token, requestTimeoutMs);
+}
+
+export function parseMeetingPlatformConfiguration(value: unknown): MeetingPlatformConfiguration {
+  if (!isRecord(value) || Object.keys(value).length !== 2 || value.schemaVersion !== 1 || !Array.isArray(value.channels))
+    throw new Error('Meeting Platform configuration response is malformed');
+  if (value.channels.length > maximumMeetingPlatformConfigurationChannels)
+    throw new Error(`Meeting Platform configuration cannot contain more than ${maximumMeetingPlatformConfigurationChannels} channels`);
+
+  const channelIds = new Set<string>();
+  const configuredChannels = new Map<string, MeetingPlatformConfigurationChannel>();
+  for (const rawChannel of value.channels) {
+    if (
+      !isRecord(rawChannel) ||
+      Object.keys(rawChannel).length !== 2 ||
+      typeof rawChannel.guildId !== 'string' ||
+      typeof rawChannel.voiceChannelId !== 'string' ||
+      !discordSnowflake.test(rawChannel.guildId) ||
+      !discordSnowflake.test(rawChannel.voiceChannelId)
+    )
+      throw new Error('Meeting Platform configuration contains an invalid channel');
+
+    const key = `${rawChannel.guildId}:${rawChannel.voiceChannelId}`;
+    if (configuredChannels.has(key) || channelIds.has(rawChannel.voiceChannelId))
+      throw new Error('Meeting Platform configuration contains duplicate channels');
+    channelIds.add(rawChannel.voiceChannelId);
+    configuredChannels.set(key, { guildId: rawChannel.guildId, voiceChannelId: rawChannel.voiceChannelId });
+  }
+
+  const channels = [...configuredChannels.values()].sort(
+    (left, right) =>
+      (left.guildId < right.guildId ? -1 : left.guildId > right.guildId ? 1 : 0) ||
+      (left.voiceChannelId < right.voiceChannelId ? -1 : left.voiceChannelId > right.voiceChannelId ? 1 : 0)
   );
-  await sink.restoreOriginalRecordingJobs();
-  return sink;
+  return { schemaVersion: 1, channels };
 }
 
 function retryDelay(consecutiveFailures: number): number {

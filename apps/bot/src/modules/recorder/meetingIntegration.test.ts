@@ -24,7 +24,8 @@ import {
   MeetingTerminalLifecycle,
   MeetingTerminalLifecycleEvent,
   MeetingVoicePacket,
-  OriginalRecordingCooker
+  OriginalRecordingCooker,
+  parseMeetingPlatformConfiguration
 } from './meetingIntegration';
 
 const logger: MeetingIntegrationLogger = {
@@ -438,6 +439,54 @@ test('permanent delivery rejection advances the realtime FIFO without retrying t
 test('retries only the explicitly recoverable HTTP statuses', () => {
   for (const status of [408, 409, 425, 429, 500, 503, 599]) assert.equal(isRetryableMeetingIntegrationStatus(status), true, String(status));
   for (const status of [300, 400, 401, 403, 404, 410, 422, 499]) assert.equal(isRetryableMeetingIntegrationStatus(status), false, String(status));
+});
+
+test('fetches and validates the authenticated Meeting Platform channel snapshot', async (context) => {
+  const requests: Array<{ path: string; headers: IncomingHttpHeaders }> = [];
+  const server = createServer((request, response) => {
+    requests.push({ path: request.url ?? '', headers: request.headers });
+    response.writeHead(200, { 'content-type': 'application/json' }).end(
+      JSON.stringify({
+        schemaVersion: 1,
+        channels: [
+          { guildId: '1533228590643155035', voiceChannelId: '1533228823045214399' },
+          { guildId: event.guildId, voiceChannelId: event.channelId }
+        ]
+      })
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  context.after(async () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))));
+
+  const address = server.address() as AddressInfo;
+  const transport = new HttpMeetingIntegrationTransport(new URL(`http://127.0.0.1:${address.port}`), 'test-token', 1000);
+  const configuration = await transport.getConfiguration();
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0]?.path, '/v1/craig/configuration');
+  assert.equal(requests[0]?.headers.authorization, 'Bearer test-token');
+  assert.deepEqual(configuration, {
+    schemaVersion: 1,
+    channels: [
+      { guildId: event.guildId, voiceChannelId: event.channelId },
+      { guildId: '1533228590643155035', voiceChannelId: '1533228823045214399' }
+    ]
+  });
+});
+
+test('rejects malformed Meeting Platform snapshots before they can replace the active configuration', () => {
+  assert.throws(
+    () =>
+      parseMeetingPlatformConfiguration({
+        schemaVersion: 1,
+        channels: [
+          { guildId: event.guildId, voiceChannelId: event.channelId },
+          { guildId: event.guildId, voiceChannelId: event.channelId }
+        ]
+      }),
+    /duplicate/
+  );
+  assert.throws(() => parseMeetingPlatformConfiguration({ schemaVersion: 2, channels: [] }), /malformed/);
 });
 
 test('HTTP original recording contract streams audio metadata and requires ready 202', async (context) => {

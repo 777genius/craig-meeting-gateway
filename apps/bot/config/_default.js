@@ -99,14 +99,17 @@ module.exports = {
         batchSize: 128,
         requestTimeoutMs: 5000
       },
-      // Optional private-guild E2E auto-record path. Disabled by default and
-      // restricted to exact channel/user snowflake allowlists when enabled.
+      // Optional private-guild E2E auto-record path. Disabled by default.
+      // Static channel IDs are used until an explicitly enabled Meeting Platform
+      // configuration snapshot arrives, then that snapshot is authoritative.
       meetingAutoRecord: {
         enabled: false,
         channelIds: [],
         syntheticBotUserIds: [],
         startDelayMs: 250,
-        emptyGraceMs: 5000
+        emptyGraceMs: 5000,
+        platformConfiguration: false,
+        configurationPollMs: 5000
       },
       // Webapp settings
       webapp: {

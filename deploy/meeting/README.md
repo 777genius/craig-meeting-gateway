@@ -27,7 +27,7 @@ Craig still pins `config@3.3.8`, which calls two `node:util` predicates removed 
 4. Attach the Meeting Platform ingestion service to that network with DNS alias `meeting-platform`, or change `MEETING_INTEGRATION_URL` to its internal service name. Never point this at a host-published public endpoint for E2E.
 5. Ensure the test bot's `/join`, `/stop` and recording commands were synchronized out of band and invite it only to the private test guild using the upstream bot/application-commands OAuth scopes.
 
-`MEETING_AUTO_RECORD_CHANNEL_IDS` scopes automatic recording to the dedicated Meeting E2E voice channel. `MEETING_AUTO_RECORD_SYNTHETIC_BOT_IDS` contains only the two synthetic audio bots that count toward automatic start/stop decisions. Both are comma-separated Discord snowflake lists; the sample contains the reserved E2E identities.
+The bot reads its authoritative auto-record channel snapshot from `GET /v1/craig/configuration` on the Meeting Platform service every `MEETING_AUTO_RECORD_CONFIGURATION_POLL_MS` (default: five seconds), using the existing mounted bearer token. `MEETING_AUTO_RECORD_CHANNEL_IDS` is an optional fail-closed static fallback until the first valid snapshot arrives; a successful empty snapshot disables auto-recording. `MEETING_AUTO_RECORD_SYNTHETIC_BOT_IDS` contains only synthetic audio bots that count toward automatic start/stop decisions. Both static lists are comma-separated Discord snowflake lists.
 
 No browser login is needed after the official bot token has been mounted. The Discord web session is unrelated to the long-running bot gateway session.
 

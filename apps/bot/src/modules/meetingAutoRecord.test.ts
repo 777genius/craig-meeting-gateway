@@ -151,12 +151,73 @@ test('does not stop during a transient leave and rejoin inside the empty grace p
   coordinator.dispose();
 });
 
+test('reconciles an already-populated channel when the first platform snapshot adds it', async () => {
+  const port = new FakePort();
+  port.channel.participants = [{ id: humanId, bot: false }];
+  const coordinator = new MeetingAutoRecordCoordinator(
+    normalizeMeetingAutoRecordConfig({ enabled: true, platformConfiguration: true }),
+    selfId,
+    port
+  );
+
+  await coordinator.reconcile(guildId, channelId);
+  assert.deepEqual(port.starts, []);
+
+  await coordinator.replacePlatformChannelSnapshot([{ guildId, channelId }]);
+
+  assert.deepEqual(port.starts, [humanId]);
+});
+
+test('uses the static fallback only until the first valid platform snapshot arrives', async () => {
+  const port = new FakePort();
+  port.channel.participants = [{ id: humanId, bot: false }];
+  const coordinator = new MeetingAutoRecordCoordinator(
+    normalizeMeetingAutoRecordConfig({ enabled: true, channelIds: [channelId], platformConfiguration: true }),
+    selfId,
+    port
+  );
+
+  await coordinator.reconcile(guildId, channelId);
+  assert.deepEqual(port.starts, [humanId]);
+
+  await coordinator.replacePlatformChannelSnapshot([]);
+  await coordinator.reconcile(guildId, channelId);
+  assert.deepEqual(port.stops, ['recording-1']);
+  assert.deepEqual(port.starts, [humanId]);
+});
+
+test('a successful platform snapshot removes a deconfigured owned recording without touching a manual recording', async () => {
+  const port = new FakePort();
+  port.channel.participants = [{ id: humanId, bot: false }];
+  const coordinator = new MeetingAutoRecordCoordinator(
+    normalizeMeetingAutoRecordConfig({ enabled: true, platformConfiguration: true }),
+    selfId,
+    port
+  );
+
+  await coordinator.replacePlatformChannelSnapshot([{ guildId, channelId }]);
+  assert.deepEqual(port.starts, [humanId]);
+
+  await coordinator.replacePlatformChannelSnapshot([]);
+  assert.deepEqual(port.stops, ['recording-1']);
+
+  port.active = { id: 'manual-recording', channelId };
+  await coordinator.replacePlatformChannelSnapshot([]);
+  assert.deepEqual(port.stops, ['recording-1']);
+  assert.equal(port.active.id, 'manual-recording');
+});
+
 test('configuration fails closed for empty, invalid, or oversized allowlists', () => {
   assert.throws(() => normalizeMeetingAutoRecordConfig({ enabled: true }), /at least one channel/);
+  assert.doesNotThrow(() => normalizeMeetingAutoRecordConfig({ enabled: true, platformConfiguration: true }));
   assert.throws(() => normalizeMeetingAutoRecordConfig({ enabled: true, channelIds: ['not-a-snowflake'] }), /Discord snowflake/);
   assert.throws(
     () => normalizeMeetingAutoRecordConfig({ enabled: true, channelIds: [channelId], syntheticBotUserIds: Array(129).fill(syntheticBotId) }),
     /more than 128/
   );
   assert.throws(() => normalizeMeetingAutoRecordConfig({ enabled: true, channelIds: [channelId], emptyGraceMs: 60_001 }), /between 0 and 60000/);
+  assert.throws(
+    () => normalizeMeetingAutoRecordConfig({ enabled: true, platformConfiguration: true, configurationPollMs: 99 }),
+    /configurationPollMs/
+  );
 });
