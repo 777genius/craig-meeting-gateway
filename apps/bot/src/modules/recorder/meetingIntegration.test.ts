@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { type IncomingHttpHeaders, createServer } from 'node:http';
@@ -54,7 +55,7 @@ const terminalEvent: MeetingTerminalLifecycleEvent = {
   reason: null
 };
 
-function rawOggPage(granule: number, trackNumber: number, sequenceNumber: number, packet: Buffer): Buffer {
+function rawOggPage(granule: number, trackNumber: number, sequenceNumber: number, packet: Buffer, headerType = 0): Buffer {
   const segments: number[] = [];
   let remaining = packet.byteLength;
   while (remaining >= 255) {
@@ -64,6 +65,7 @@ function rawOggPage(granule: number, trackNumber: number, sequenceNumber: number
   segments.push(remaining);
   const page = Buffer.alloc(27 + segments.length + packet.byteLength);
   page.write('OggS');
+  page.writeUInt8(headerType, 5);
   page.writeBigUInt64LE(BigInt(granule), 6);
   page.writeUInt32LE(trackNumber, 14);
   page.writeUInt32LE(sequenceNumber, 18);
@@ -72,6 +74,61 @@ function rawOggPage(granule: number, trackNumber: number, sequenceNumber: number
   packet.copy(page, 27 + segments.length);
   page.writeInt32LE(crc32(page), 22);
   return page;
+}
+
+async function runNative(command: string, args: string[], input?: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+    child.once('error', reject);
+    child.once('close', (code, signal) => {
+      if (code === 0) resolve(Buffer.concat(stdout));
+      else reject(new Error(`${command} failed (${code ?? signal ?? 'unknown'}): ${Buffer.concat(stderr).toString('utf8')}`));
+    });
+    child.stdin.end(input);
+  });
+}
+
+function oggCrc32(bytes: Buffer): number {
+  let crc = 0;
+  for (const value of bytes) {
+    crc ^= value << 24;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = ((crc << 1) ^ ((crc & 0x8000_0000) === 0 ? 0 : 0x04c1_1db7)) >>> 0;
+    }
+  }
+  return crc;
+}
+
+function inspectOggPages(bytes: Buffer): Array<{ body: Buffer; granule: bigint; sequence: number; type: number }> {
+  const pages: Array<{ body: Buffer; granule: bigint; sequence: number; type: number }> = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    assert.equal(bytes.toString('ascii', offset, offset + 4), 'OggS');
+    assert.ok(offset + 27 <= bytes.length);
+    const segmentCount = bytes.readUInt8(offset + 26);
+    assert.ok(offset + 27 + segmentCount <= bytes.length);
+    let bodyLength = 0;
+    for (let index = 0; index < segmentCount; index++) bodyLength += bytes.readUInt8(offset + 27 + index);
+    const bodyOffset = offset + 27 + segmentCount;
+    const end = bodyOffset + bodyLength;
+    assert.ok(end <= bytes.length);
+    const page = Buffer.from(bytes.subarray(offset, end));
+    const checksum = page.readUInt32LE(22);
+    page.fill(0, 22, 26);
+    assert.equal(oggCrc32(page), checksum);
+    pages.push({
+      body: bytes.subarray(bodyOffset, end),
+      granule: bytes.readBigUInt64LE(offset + 6),
+      sequence: bytes.readUInt32LE(offset + 18),
+      type: bytes.readUInt8(offset + 5)
+    });
+    offset = end;
+  }
+  return pages;
 }
 
 const packet: MeetingVoicePacket = {
@@ -85,6 +142,89 @@ const packet: MeetingVoicePacket = {
   receivedAtMs: 1000,
   relativeTimeMs: 20
 };
+
+test('cooks a page-aligned Craig stream with end granules and one final EOS page', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-oggcorrect-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const executable = path.join(root, 'oggcorrect');
+  const source = path.resolve(__dirname, '../../../../../cook/oggcorrect.c');
+  await runNative(process.env.CC ?? 'cc', ['-O2', '-o', executable, source]);
+
+  const opusHead = Buffer.alloc(19);
+  opusHead.write('OpusHead');
+  opusHead.writeUInt8(1, 8);
+  opusHead.writeUInt8(1, 9);
+  opusHead.writeUInt32LE(48_000, 12);
+  const opusTags = Buffer.alloc(16);
+  opusTags.write('OpusTags');
+  const opusPacket = Buffer.from([0xf8, 0xff, 0xfe]);
+  const sourcePages = [
+    rawOggPage(0, 1, 0, opusHead, 0x02),
+    rawOggPage(0, 1, 1, opusTags),
+    rawOggPage(48_000, 1, 2, opusPacket),
+    rawOggPage(48_960, 1, 3, opusPacket)
+  ];
+  const output = await runNative(executable, ['1'], Buffer.concat([...sourcePages, ...sourcePages]));
+  const pages = inspectOggPages(output);
+
+  assert.equal(pages.length, 4);
+  assert.equal(pages[0]?.type, 0x02);
+  assert.equal(pages[2]?.granule, 960n);
+  assert.equal(pages[2]?.type, 0);
+  assert.equal(pages[3]?.granule, 1920n);
+  assert.equal(pages[3]?.type, 0x04);
+  assert.equal(pages.filter(({ type }) => (type & 0x04) !== 0).length, 1);
+  assert.deepEqual(pages[2]?.body, opusPacket);
+  assert.deepEqual(pages[3]?.body, opusPacket);
+});
+
+test('keeps Opus headers and emits positive audio beyond pre-skip for a silent track', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-oggcorrect-silent-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const executable = path.join(root, 'oggcorrect');
+  const source = path.resolve(__dirname, '../../../../../cook/oggcorrect.c');
+  await runNative(process.env.CC ?? 'cc', ['-O2', '-o', executable, source]);
+
+  const preSkip = 3_840;
+  const opusHead = Buffer.alloc(19);
+  opusHead.write('OpusHead');
+  opusHead.writeUInt8(1, 8);
+  opusHead.writeUInt8(1, 9);
+  opusHead.writeUInt16LE(preSkip, 10);
+  opusHead.writeUInt32LE(48_000, 12);
+  const opusTags = Buffer.alloc(16);
+  opusTags.write('OpusTags');
+  const zeroPacket = Buffer.from([0xf8, 0xff, 0xfe]);
+  const keepHeaders = [rawOggPage(0, 1, 0, opusHead, 0x02), rawOggPage(0, 1, 1, opusTags)];
+  const otherStream = [rawOggPage(0, 2, 0, opusHead, 0x02), rawOggPage(0, 2, 1, opusTags), rawOggPage(48_000, 2, 2, zeroPacket)];
+  const cycles = [Buffer.concat([...keepHeaders, ...otherStream]), Buffer.concat(keepHeaders)];
+
+  for (const cycle of cycles) {
+    const output = await runNative(executable, ['1'], Buffer.concat([cycle, cycle]));
+    const pages = inspectOggPages(output);
+
+    assert.equal(pages.length, 7);
+    assert.deepEqual(pages[0]?.body, opusHead);
+    assert.deepEqual(pages[1]?.body, opusTags);
+    assert.equal(pages[0]?.type, 0x02);
+    assert.deepEqual(
+      pages.map(({ sequence }) => sequence),
+      [0, 1, 2, 3, 4, 5, 6]
+    );
+    assert.deepEqual(
+      pages.slice(2).map(({ granule }) => granule),
+      [960n, 1_920n, 2_880n, 3_840n, 4_800n]
+    );
+    assert.ok((pages.at(-1)?.granule ?? 0n) > BigInt(preSkip));
+    assert.deepEqual(
+      pages.slice(2).map(({ body }) => body),
+      [zeroPacket, zeroPacket, zeroPacket, zeroPacket, zeroPacket]
+    );
+    assert.equal(pages.filter(({ type }) => (type & 0x02) !== 0).length, 1);
+    assert.equal(pages.filter(({ type }) => (type & 0x04) !== 0).length, 1);
+    assert.equal(pages.at(-1)?.type, 0x04);
+  }
+});
 
 test('preserves lifecycle and accepted voice ordering while batching packets', async () => {
   const calls: Array<{ path: string; body: any }> = [];

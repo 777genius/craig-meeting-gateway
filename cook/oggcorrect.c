@@ -57,7 +57,24 @@ struct PacketList {
     int preSkip; // Number of frames to insert before this
     uint64_t inputGranulePos;
     uint64_t outputGranulePos;
+    uint64_t outputGranuleEnd;
 };
+
+#define OGG_BOS 0x02
+#define OGG_EOS 0x04
+
+struct HeaderList {
+    struct HeaderList *next;
+    struct OggHeader header;
+    unsigned char *data;
+    uint32_t size;
+};
+
+static int pendingOggPage = 0;
+static struct OggHeader pendingOggHeader;
+static unsigned char *pendingOggData = NULL;
+static uint32_t pendingOggDataSize = 0;
+static uint32_t pendingOggDataCapacity = 0;
 
 // The encoding for a packet with only zeroes
 const unsigned char zeroPacket[] = { 0xF8, 0xFF, 0xFE };
@@ -150,7 +167,7 @@ ssize_t writeAll(int fd, const void *vbuf, size_t count)
     return wt;
 }
 
-void writeOgg(struct OggHeader *header, const unsigned char *data, uint32_t size)
+void writeOggNow(struct OggHeader *header, const unsigned char *data, uint32_t size)
 {
     static unsigned char seqBuf[256];
     uint32_t seqCt = 0;
@@ -186,6 +203,37 @@ void writeOgg(struct OggHeader *header, const unsigned char *data, uint32_t size
     if (writeAll(1, data, size) != size) exit(1);
 }
 
+// Keep one page buffered so the actual final emitted page receives EOS. Craig's
+// source stream is open-ended, so its last input page is not marked in advance.
+void writeOgg(struct OggHeader *header, const unsigned char *data, uint32_t size)
+{
+    if (pendingOggPage)
+        writeOggNow(&pendingOggHeader, pendingOggData, pendingOggDataSize);
+
+    if (size > pendingOggDataCapacity) {
+        pendingOggData = realloc(pendingOggData, size);
+        if (!pendingOggData) {
+            perror("realloc");
+            exit(1);
+        }
+        pendingOggDataCapacity = size;
+    }
+    memcpy(pendingOggData, data, size);
+    pendingOggDataSize = size;
+    pendingOggHeader = *header;
+    pendingOggHeader.type &= ~OGG_EOS;
+    pendingOggPage = 1;
+}
+
+void finishOgg(void)
+{
+    if (!pendingOggPage)
+        return;
+    pendingOggHeader.type |= OGG_EOS;
+    writeOggNow(&pendingOggHeader, pendingOggData, pendingOggDataSize);
+    pendingOggPage = 0;
+}
+
 struct PacketList *pushPacket(struct PacketList *tail)
 {
     struct PacketList *ret = calloc(1, sizeof(struct PacketList));
@@ -193,6 +241,28 @@ struct PacketList *pushPacket(struct PacketList *tail)
         perror("calloc");
         exit(1);
     }
+    tail->next = ret;
+    return ret;
+}
+
+struct HeaderList *pushHeader(struct HeaderList *tail,
+                              const struct OggHeader *header,
+                              const unsigned char *data,
+                              uint32_t size)
+{
+    struct HeaderList *ret = calloc(1, sizeof(struct HeaderList));
+    if (ret == NULL) {
+        perror("calloc");
+        exit(1);
+    }
+    ret->data = malloc(size);
+    if (ret->data == NULL) {
+        perror("malloc");
+        exit(1);
+    }
+    ret->header = *header;
+    memcpy(ret->data, data, size);
+    ret->size = size;
     tail->next = ret;
     return ret;
 }
@@ -222,6 +292,7 @@ int main(int argc, char **argv)
 
     // What was the sequence number of the last packet we wrote?
     uint32_t lastSequenceNo = 0;
+    uint32_t audioPagesWritten = 0;
 
     // Size of our packet and how many bytes to skip
     uint32_t packetSize, skip;
@@ -232,6 +303,16 @@ int main(int argc, char **argv)
     // Our list of packets
     struct PacketList head = {0};
     struct PacketList *cur, *tail = &head;
+
+    // Keep the first header cycle so a track with no audio still retains its
+    // complete codec setup. The input is normally duplicated for two passes.
+    struct HeaderList headerHead = {0};
+    struct HeaderList *headerCur, *headerTail = &headerHead;
+    int cacheHeaders = 1;
+
+    // Opus discards these decoded samples before presenting audio.
+    uint32_t opusPreSkip = 0;
+    int isOpus = 0;
 
     // Buffer info
     unsigned char *buf = NULL;
@@ -284,6 +365,21 @@ int main(int argc, char **argv)
              memcmp(buf + skip, "\x04\0\0\x41", 4))) {
             // This isn't an expected header!
             continue;
+        }
+
+        // A second BOS is the start of the duplicated input cycle. Only cache
+        // the first cycle so headers-only input does not emit Head/Tags twice.
+        if (cacheHeaders && headerHead.next && (oggHeader.type & OGG_BOS))
+            cacheHeaders = 0;
+        if (cacheHeaders) {
+            headerTail = pushHeader(headerTail, &oggHeader,
+                buf + skip, packetSize - skip);
+            if (packetSize >= skip + 19 &&
+                !memcmp(buf + skip, "OpusHead", 8)) {
+                isOpus = 1;
+                opusPreSkip = (uint32_t) buf[skip+10] |
+                    ((uint32_t) buf[skip+11] << 8);
+            }
         }
 
         // Check if this is a FLAC header
@@ -480,6 +576,7 @@ int main(int argc, char **argv)
                 granulePos += mid->preSkip * packetTime;
                 mid->outputGranulePos = granulePos;
                 granulePos += mid->framesInPacket * packetTime;
+                mid->outputGranuleEnd = granulePos;
 
             } else if (granulePos >
                 mid->inputGranulePos + mid->frameSize * 25) {
@@ -490,6 +587,7 @@ int main(int argc, char **argv)
                 // Just right!
                 mid->outputGranulePos = granulePos;
                 granulePos += mid->framesInPacket * mid->frameSize;
+                mid->outputGranuleEnd = granulePos;
             }
         }
 
@@ -500,30 +598,24 @@ int main(int argc, char **argv)
 
     // If we're FLAC 44100kHz, adjust the granule positions for that
     if (flacRate == 44100) {
-        for (cur = head.next; cur; cur = cur->next)
+        for (cur = head.next; cur; cur = cur->next) {
             cur->outputGranulePos = cur->outputGranulePos * 147 / 160;
+            cur->outputGranuleEnd = cur->outputGranuleEnd * 147 / 160;
+        }
     }
 
-    // Now read and pass thru the header
+    // Emit the complete first header cycle. Reading headers again from the
+    // second pass loses OpusHead when every input stream is headers-only.
+    for (headerCur = headerHead.next; headerCur; headerCur = headerCur->next) {
+        headerCur->header.sequenceNo = lastSequenceNo++;
+        writeOgg(&headerCur->header, headerCur->data, headerCur->size);
+    }
+
+    // Advance the duplicated input cycle to its first audio page.
     do {
         if (oggHeader.granulePos != 0) {
-            // Passed the header
             break;
         }
-
-        if (oggHeader.streamNo != keepStreamNo)
-            continue;
-
-        skip = 0;
-        if (packetSize > 8 && !memcmp(buf, "ECVADD", 6)) {
-            // It's our VAD header, so skip that
-            skip = 8 + *((unsigned short *) (buf + 6));
-        }
-
-        // Pass through the normal header
-        oggHeader.sequenceNo = lastSequenceNo++;
-        writeOgg(&oggHeader, buf + skip, packetSize - skip);
-
     } while (readOgg(&preHeader, &oggHeader, &buf, &bufSz, &packetSize));
 
     skip = vadLevel ? 1 : 0;
@@ -531,6 +623,8 @@ int main(int argc, char **argv)
     // And finally, pass thru the data with corrected timestamps
     cur = head.next;
     do {
+        if (!cur || oggHeader.granulePos == 0)
+            break;
         if (oggHeader.streamNo != keepStreamNo || packetSize <= 1)
             continue;
 
@@ -544,6 +638,7 @@ int main(int argc, char **argv)
 
             for (int i = 0; i < cur->preSkip; i++) {
                 gapHeader.sequenceNo = lastSequenceNo++;
+                gapHeader.granulePos += time;
                 switch (flacRate) {
                     case 0: // Opus
                         writeOgg(&gapHeader, zeroPacket, sizeof(zeroPacket));
@@ -554,37 +649,51 @@ int main(int argc, char **argv)
                     default:
                         writeOgg(&gapHeader, zeroPacketFLAC48k, sizeof(zeroPacketFLAC48k));
                 }
-                gapHeader.granulePos += time;
+                audioPagesWritten++;
             }
         }
 
         // Then insert the current packet
         if (!(cur->flags & FLAG_DROP)) {
-            oggHeader.granulePos = cur->outputGranulePos;
+            oggHeader.granulePos = cur->outputGranuleEnd;
             oggHeader.sequenceNo = lastSequenceNo++;
             writeOgg(&oggHeader, buf + skip, packetSize - skip);
+            audioPagesWritten++;
         }
 
         cur = cur->next ? cur->next : cur;
 
     } while (readOgg(&preHeader, &oggHeader, &buf, &bufSz, &packetSize));
 
-    if (lastSequenceNo <= 2) {
+    if (audioPagesWritten == 0) {
         // This track had no actual audio. To avoid breakage, throw some on.
         struct OggHeader oggHeader = {0};
         oggHeader.streamNo = keepStreamNo;
-        oggHeader.sequenceNo = lastSequenceNo++;
         switch (flacRate) {
-            case 0: // Ogg
-                writeOgg(&oggHeader, zeroPacket, sizeof(zeroPacket));
+            case 0: { // Ogg
+                // Decode the minimum number of packets needed to get beyond
+                // Opus pre-skip and expose a positive-duration audio sample.
+                uint32_t packetCount = isOpus ? opusPreSkip / packetTime + 1 : 1;
+                for (uint32_t i = 0; i < packetCount; i++) {
+                    oggHeader.granulePos = (uint64_t) (i + 1) * packetTime;
+                    oggHeader.sequenceNo = lastSequenceNo++;
+                    writeOgg(&oggHeader, zeroPacket, sizeof(zeroPacket));
+                }
                 break;
+            }
             case 44100:
+                oggHeader.granulePos = packetTime * 147 / 160;
+                oggHeader.sequenceNo = lastSequenceNo++;
                 writeOgg(&oggHeader, zeroPacketFLAC44k, sizeof(zeroPacketFLAC44k));
                 break;
             default:
+                oggHeader.granulePos = packetTime;
+                oggHeader.sequenceNo = lastSequenceNo++;
                 writeOgg(&oggHeader, zeroPacketFLAC48k, sizeof(zeroPacketFLAC48k));
         }
     }
+
+    finishOgg();
 
     return 0;
 }
