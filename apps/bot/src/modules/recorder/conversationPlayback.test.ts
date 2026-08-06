@@ -274,7 +274,7 @@ test('cancellation records only the packet already accepted by the direct sender
   assert.deepEqual(connection.speaking, [true, false]);
   assert.deepEqual(
     events.map(({ type }) => type),
-    ['playback-started']
+    ['playback-started', 'playback-finished']
   );
 });
 

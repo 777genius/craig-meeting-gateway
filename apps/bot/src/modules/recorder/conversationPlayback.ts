@@ -543,6 +543,14 @@ export class CraigPlaybackController {
     this.rememberTerminal(active);
     active.sender?.cancel();
     this.options.arbiter.cancelConversation(this);
+    this.emit({
+      schemaVersion: 1,
+      type: 'playback-finished',
+      recordingId: active.recordingId,
+      turnId: active.turnId,
+      attemptId: active.attemptId,
+      finishedAtMs: currentTimestamp(this.now)
+    });
   }
 
   private fail(code: CraigPlaybackFailureCode, safeMessage: string, retryable: boolean): void {
