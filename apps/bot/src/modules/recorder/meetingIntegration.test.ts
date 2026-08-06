@@ -573,8 +573,8 @@ test('recovers the authoritative original after restart loses an incomplete live
     ]),
     header1: Buffer.from('original-header-1'),
     header2: Buffer.from('original-header-2'),
-    users: '"0":{}\n,"1":{"id":"1533227577286852649"}\n,"2":{"id":"1533228054724346087"}\n',
-    info: '{"format":1}',
+    users: '"0":{}\n,"1":{"id":"1533227577286852649"}\n,"2":{"id":"1533228054724346087","username":"Botik","globalName":"Botik","bot":true}\n',
+    info: '{"format":1,"clientId":"1533228054724346087"}',
     log: 'closed\n'
   };
   await Promise.all(Object.entries(sources).map(([kind, contents]) => writeFile(`${sourceFileBase}.${kind}`, contents)));
@@ -619,7 +619,7 @@ test('recovers the authoritative original after restart loses an incomplete live
     sourceFiles: Array<{ kind: string; relativePath: string }>;
     authoritativeTracks?: Array<Pick<AuthoritativeTrackMetadata, 'speakerId' | 'trackNumber' | 'timelineOffsetMs'>>;
   };
-  assert.deepEqual(recoveredJob.startedEvent.participantIds, ['1533227577286852649', '1533228054724346087']);
+  assert.deepEqual(recoveredJob.startedEvent.participantIds, ['1533227577286852649']);
   assert.equal(recoveredJob.terminalEvent.type, 'meeting.ended');
   assert.match(recoveredJob.terminalEvent.reason ?? '', /restarted during an active recording/);
   recoveredJob.sourceFiles = recoveredJob.sourceFiles.map((source) => {

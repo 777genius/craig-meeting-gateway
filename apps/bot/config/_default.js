@@ -99,6 +99,14 @@ module.exports = {
         batchSize: 128,
         requestTimeoutMs: 5000
       },
+      // Optional recording-scoped outbound playback channel. This shares the
+      // Meeting Platform service token and has no public Craig endpoint.
+      meetingPlayback: {
+        enabled: false,
+        endpoint: 'ws://127.0.0.1:4310/v1/craig/playback',
+        tokenFile: '/run/secrets/meeting_integration_token',
+        connectionTimeoutMs: 5000
+      },
       // Optional private-guild E2E auto-record path. Disabled by default.
       // Static channel IDs are used until an explicitly enabled Meeting Platform
       // configuration snapshot arrives, then that snapshot is authoritative.
@@ -166,7 +174,7 @@ module.exports = {
     status: {
       type: 4, // [custom status]
       name: 'craig',
-      state: 'Recording VCs • craig.chat'
+      state: 'Meeting Assistant'
     },
 
     logger: {

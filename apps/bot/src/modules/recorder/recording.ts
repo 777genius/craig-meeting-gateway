@@ -18,6 +18,14 @@ import { getSelfMember, ParsedRewards, wait } from '../../util';
 import type SlashModule from '../slash';
 import type RecorderModule from '.';
 import {
+  type AuthoritativeBotikPlaybackTrack,
+  appendAuthoritativeBotikPlaybackPacket,
+  createAuthoritativeBotikPlaybackTrack
+} from './authoritativePlaybackTrack';
+import { CraigPlaybackArbiter } from './conversationPlayback';
+import { ConversationPlaybackReconnect } from './conversationPlaybackReconnect';
+import { CraigConversationPlaybackSession, createConversationPlaybackSession } from './conversationPlaybackSession';
+import {
   type MeetingLifecycleEvent,
   type MeetingStartedLifecycleEvent,
   type MeetingTerminalLifecycleEvent,
@@ -108,6 +116,13 @@ export default class Recording {
   connection: Eris.VoiceConnection | null = null;
   receiver: Eris.VoiceDataStream | null = null;
   webapp?: WebappClient;
+  private readonly playbackArbiter = new CraigPlaybackArbiter(() => this.connection);
+  private conversationPlayback?: CraigConversationPlaybackSession;
+  private conversationPlaybackGeneration = 0;
+  private conversationPlaybackOpening?: Promise<void>;
+  private conversationPlaybackReopenRequested = false;
+  private readonly conversationPlaybackReconnect = new ConversationPlaybackReconnect(() => this.openConversationPlayback());
+  private botikPlaybackTrack?: AuthoritativeBotikPlaybackTrack;
 
   messageChannelID: string | null = null;
   messageID: string | null = null;
@@ -299,6 +314,7 @@ export default class Recording {
 
     this.active = true;
     this.started = true;
+    this.openConversationPlayback();
     await this.playNowRecording();
     this.updateMessage();
 
@@ -334,6 +350,7 @@ export default class Recording {
       clearTimeout(this.timeout);
       clearInterval(this.usageInterval);
       this.active = false;
+      this.closeConversationPlayback('recording-ended');
       this.recorder.logger.info(
         `Stopping recording ${this.id} by ${this.user.username}#${this.user.discriminator} (${this.user.id})${internal ? ' internally' : ''}${
           userID ? ` by ${userID}` : ''
@@ -528,6 +545,7 @@ export default class Recording {
 
     const reconnected = this.state === RecordingState.RECONNECTING;
     this.state = RecordingState.RECORDING;
+    if (this.active) this.openConversationPlayback();
     if (reconnected) {
       this.markConnectionRecovered();
       this.pushToActivity('Reconnected.');
@@ -566,8 +584,113 @@ export default class Recording {
 
     try {
       await access(filePath);
-      this.connection!.play(filePath, { format: 'ogg' });
+      this.playbackArbiter.playNowRecording(filePath);
     } catch (e) {}
+  }
+
+  private openConversationPlayback(): void {
+    if (this.conversationPlayback || !this.active || !this.connection) return;
+    if (this.conversationPlaybackOpening) {
+      this.conversationPlaybackReopenRequested = true;
+      return;
+    }
+
+    const generation = this.conversationPlaybackGeneration;
+    this.conversationPlaybackReopenRequested = false;
+    const opening = createConversationPlaybackSession({
+      config: this.recorder.client.config.craig.meetingPlayback,
+      recordingId: this.id,
+      guildId: this.channel.guild.id,
+      channelId: this.channel.id,
+      arbiter: this.playbackArbiter,
+      logger: {
+        debug: (message) => this.recorder.logger.debug(message),
+        warn: (message, error) => this.recorder.logger.warn(message, error)
+      },
+      onPacketDispatched: (opusPacket) => this.recordDispatchedConversationPacket(opusPacket),
+      onReady: () => this.conversationPlaybackReconnect.connected(),
+      onClosed: (reason) => {
+        if (this.conversationPlayback?.isClosed) this.conversationPlayback = undefined;
+        if (reason === 'transport-disconnected' && generation === this.conversationPlaybackGeneration)
+          this.conversationPlaybackReconnect.disconnected();
+      }
+    })
+      .then((session) => {
+        if (!session) return;
+        if (generation !== this.conversationPlaybackGeneration || !this.active || !this.connection) {
+          session.close('recording-ended');
+          return;
+        }
+        if (session.isClosed) {
+          this.conversationPlaybackReconnect.disconnected();
+          return;
+        }
+        this.conversationPlayback = session;
+      })
+      .catch((error) => {
+        this.recorder.logger.error(`Failed to open Meeting Platform playback for recording ${this.id}; recording continues`, error);
+        if (generation === this.conversationPlaybackGeneration) this.conversationPlaybackReconnect.disconnected();
+      });
+
+    this.conversationPlaybackOpening = opening;
+    void opening.finally(() => {
+      if (this.conversationPlaybackOpening === opening) this.conversationPlaybackOpening = undefined;
+      if (this.conversationPlaybackReopenRequested) {
+        this.conversationPlaybackReopenRequested = false;
+        this.openConversationPlayback();
+      }
+    });
+  }
+
+  private closeConversationPlayback(reason: 'recording-ended' | 'connection-unavailable'): void {
+    this.conversationPlaybackGeneration++;
+    this.conversationPlaybackReconnect.stop();
+    const session = this.conversationPlayback;
+    this.conversationPlayback = undefined;
+    session?.close(reason);
+  }
+
+  /**
+   * This is called only after the direct Discord voice API accepts the Opus
+   * frame. It deliberately bypasses onData and the Meeting live packet tee.
+   */
+  private recordDispatchedConversationPacket(opusPacket: Buffer): void {
+    const writer = this.writer;
+    if (!this.active || this.closing || !this.startTime || !writer) return;
+
+    try {
+      const track = this.getOrCreateAuthoritativeBotikPlaybackTrack(writer);
+      if (!track) return;
+
+      const chunkTime = process.hrtime(this.startTime);
+      const recordingGranule = chunkTime[0] * 48000 + ~~(chunkTime[1] / 20833.333);
+      const { packetNo, chunk } = appendAuthoritativeBotikPlaybackPacket(track, opusPacket, recordingGranule);
+      writer.writeChunk(track.user.track, packetNo, chunk, chunk.data);
+    } catch (error) {
+      // A local recording error must not interrupt an already accepted Discord send.
+      this.recorder.logger.error(`Failed to record dispatched Botik playback for recording ${this.id}; playback continues`, error);
+    }
+  }
+
+  private getOrCreateAuthoritativeBotikPlaybackTrack(writer: RecordingWriter): AuthoritativeBotikPlaybackTrack | undefined {
+    if (this.botikPlaybackTrack) return this.botikPlaybackTrack;
+
+    const speakerId = this.recorder.client.bot.user.id;
+    if (this.users[speakerId]) {
+      this.recorder.logger.error(`Cannot create the Botik playback track for recording ${this.id}: the bot already has an inbound track`);
+      return;
+    }
+
+    const track = createAuthoritativeBotikPlaybackTrack(speakerId, this.trackNo++);
+    this.botikPlaybackTrack = track;
+    try {
+      writer.writeUserHeader(track.user);
+      writer.writeUser(track.user);
+      this.writeToLog(`Writing dedicated Botik playback track ${track.user.track} (${speakerId})`);
+    } catch (error) {
+      this.recorder.logger.error(`Failed to initialize the Botik playback track for recording ${this.id}; playback continues`, error);
+    }
+    return track;
   }
 
   // Event handlers //
@@ -638,6 +761,7 @@ export default class Recording {
   }
 
   async onConnectionDisconnect(err?: Error) {
+    this.closeConversationPlayback('connection-unavailable');
     if (!this.active) return;
     this.writeToLog(`Got disconnected, ${err}`);
     this.recorder.logger.debug(`Recording ${this.id} disconnected`, err);
@@ -848,6 +972,8 @@ export default class Recording {
   async onData(data: Buffer, userID: string, timestamp: number, rtpSequence: number) {
     if (!this.active) return;
     if (!userID) return;
+    // Never loop Craig's own outbound Botik playback into an inbound live tee.
+    if (userID === this.recorder.client.bot.user.id) return;
 
     // Check if the packet is mostly zeros (all but one byte are zero)
     // Cloudflare voice servers (prefixed with `c-`) tend to do this for no reason at all

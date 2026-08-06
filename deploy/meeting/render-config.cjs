@@ -29,6 +29,12 @@ function nonNegativeInteger(name, fallback, maximum) {
   return value;
 }
 
+function strictBoolean(name, fallback) {
+  const raw = process.env[name] || String(fallback);
+  if (!['true', 'false'].includes(raw)) throw new Error(`${name} must be true or false`);
+  return raw === 'true';
+}
+
 function snowflakeList(name, maximum) {
   const raw = process.env[name] || '';
   if (!raw.trim()) return [];
@@ -41,9 +47,15 @@ function snowflakeList(name, maximum) {
 const applicationID = process.env.DISCORD_APPLICATION_ID || '';
 if (!/^\d{16,22}$/.test(applicationID)) throw new Error('DISCORD_APPLICATION_ID must be a Discord snowflake');
 
-const endpoint = new URL(process.env.MEETING_INTEGRATION_URL || 'http://meeting-api:4310');
+const endpoint = new URL(process.env.MEETING_INTEGRATION_URL || 'http://meeting-platform:4310');
 if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password)
   throw new Error('MEETING_INTEGRATION_URL must be an HTTP(S) URL without embedded credentials');
+
+const defaultPlaybackEndpoint = new URL('/v1/craig/playback', endpoint);
+defaultPlaybackEndpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
+const playbackEndpoint = new URL(process.env.MEETING_PLAYBACK_URL || defaultPlaybackEndpoint.toString());
+if (!['ws:', 'wss:'].includes(playbackEndpoint.protocol) || playbackEndpoint.username || playbackEndpoint.password)
+  throw new Error('MEETING_PLAYBACK_URL must be a WS(S) URL without embedded credentials');
 
 const discordToken = readSecret(discordTokenFile, 'Discord bot token');
 readSecret(meetingTokenFile, 'Meeting integration bearer');
@@ -68,6 +80,12 @@ const generated = {
         maxQueuedPackets: positiveInteger('MEETING_MAX_QUEUED_PACKETS', 8192, 262144),
         batchSize: positiveInteger('MEETING_PACKET_BATCH_SIZE', 128, 4096),
         requestTimeoutMs: positiveInteger('MEETING_REQUEST_TIMEOUT_MS', 5000, 60000)
+      },
+      meetingPlayback: {
+        enabled: strictBoolean('MEETING_PLAYBACK_ENABLED', false),
+        endpoint: playbackEndpoint.toString(),
+        tokenFile: meetingTokenFile,
+        connectionTimeoutMs: positiveInteger('MEETING_REQUEST_TIMEOUT_MS', 5000, 60000)
       },
       meetingAutoRecord: {
         enabled: true,
