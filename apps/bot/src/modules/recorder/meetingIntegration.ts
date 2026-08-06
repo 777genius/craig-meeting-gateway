@@ -445,6 +445,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     try {
       assertOriginalSourceFileBase(input.recordingId, this.recordingRoot, input.sourceFileBase);
       const users = await inspectOriginalRecordingUsers(`${input.sourceFileBase}.users`);
+      const botSpeakerId = await inspectOriginalRecordingBotSpeakerId(`${input.sourceFileBase}.info`);
       await inspectOriginalRecordingData(
         `${input.sourceFileBase}.data`,
         users.tracks.map(({ trackNumber }) => trackNumber)
@@ -462,7 +463,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
           channelId: input.channelId,
           occurredAt: input.startedAt,
           type: 'meeting.started',
-          participantIds: users.tracks.map(({ speakerId }) => speakerId)
+          participantIds: users.tracks.filter(({ speakerId }) => speakerId !== botSpeakerId).map(({ speakerId }) => speakerId)
         },
         terminalEvent: {
           schemaVersion: 1,
@@ -1276,6 +1277,23 @@ async function inspectOriginalRecordingUsers(filePath: string): Promise<{
       sizeBytes: contents.byteLength
     }
   };
+}
+
+/**
+ * Recovery reconstructs participantIds from .users, which now also contains
+ * Botik's authoritative playback track. The recording info file carries the
+ * actual Craig bot snowflake, so it is the stable exclusion key while the
+ * track remains present for authoritative upload preparation.
+ */
+async function inspectOriginalRecordingBotSpeakerId(filePath: string): Promise<string | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
+    if (!isRecord(parsed) || typeof parsed.clientId !== 'string' || !discordSnowflake.test(parsed.clientId)) return undefined;
+    return parsed.clientId;
+  } catch {
+    // Legacy/incomplete info files still retain all tracks rather than blocking recovery.
+    return undefined;
+  }
 }
 
 async function inspectOriginalRecordingData(

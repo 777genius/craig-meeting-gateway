@@ -14,6 +14,7 @@ import LoggerModule from './modules/logger';
 import MeetingAutoRecordModule, { MeetingAutoRecordConfig } from './modules/meetingAutoRecord';
 import MetricsModule from './modules/metrics';
 import RecorderModule from './modules/recorder';
+import type { MeetingPlaybackConfig } from './modules/recorder/conversationPlaybackSession';
 import type { MeetingIntegrationConfig } from './modules/recorder/meetingIntegration';
 import ShardingModule from './modules/sharding';
 import SlashModule from './modules/slash';
@@ -48,6 +49,7 @@ export interface CraigBotConfig extends BaseConfig {
     sizeLimitWebOpus: number;
     inviteID?: string;
     meetingIntegration?: MeetingIntegrationConfig;
+    meetingPlayback?: MeetingPlaybackConfig;
     meetingAutoRecord?: MeetingAutoRecordConfig;
     webapp: {
       on: boolean;
