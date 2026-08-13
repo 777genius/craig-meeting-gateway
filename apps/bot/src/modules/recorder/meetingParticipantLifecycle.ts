@@ -5,7 +5,7 @@ export class MeetingParticipantLifecycle {
   private readonly pendingPresence = new Map<string, boolean>();
   private started = false;
 
-  begin(currentParticipantIds: Iterable<string | number>, excludedParticipantId: string): string[] {
+  begin(currentParticipantIds: Iterable<string | number>): string[] {
     if (this.started) throw new Error('Meeting participant lifecycle already started');
 
     for (const participantId of currentParticipantIds) this.participants.add(String(participantId));
@@ -14,7 +14,6 @@ export class MeetingParticipantLifecycle {
       else this.participants.delete(participantId);
     }
     this.pendingPresence.clear();
-    this.participants.delete(excludedParticipantId);
     this.started = true;
     return [...this.participants];
   }

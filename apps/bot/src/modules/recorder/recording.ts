@@ -31,6 +31,7 @@ import {
   type MeetingTerminalLifecycleEvent,
   MeetingTerminalLifecycle
 } from './meetingIntegration';
+import { classifyDiscordActor, type DiscordActorIdentity, RecordingActorRegistry } from './meetingActorIdentity';
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
 import { WebappClient } from './webapp';
@@ -158,6 +159,7 @@ export default class Recording {
   integrationPacketDropWarned = false;
   private lifecycleSequence = 0;
   private readonly meetingParticipants = new MeetingParticipantLifecycle();
+  private readonly meetingActors = new RecordingActorRegistry();
   private stopPromise: Promise<void> | null = null;
   private connectionLossOpen = false;
   private readonly terminalMeetingLifecycle = new MeetingTerminalLifecycle();
@@ -274,8 +276,11 @@ export default class Recording {
     this.writer = new RecordingWriter(this, fileBase);
     this.writeToLog(`Connected to channel ${this.connection?.channelID} at ${this.connection?.endpoint}`);
 
-    const participantIds = this.meetingParticipants.begin(this.channel.voiceMembers.keys(), this.recorder.client.bot.user.id);
-    const startedEvent = this.createMeetingLifecycleEvent('meeting.started', { participantIds }) as MeetingStartedLifecycleEvent;
+    for (const member of this.channel.voiceMembers.values()) this.registerMeetingActor(member.id, member);
+    const recorderActorId = this.recorder.client.bot.user.id;
+    this.registerMeetingActor(recorderActorId, this.recorder.client.bot.user);
+    this.meetingParticipants.begin([...this.channel.voiceMembers.keys(), recorderActorId]);
+    const startedEvent = this.createMeetingLifecycleEvent('meeting.started', { actors: this.meetingActors.roster() }) as MeetingStartedLifecycleEvent;
     this.meetingStartedLifecycle = startedEvent;
     this.publishMeetingLifecycleEvent(startedEvent);
 
@@ -389,6 +394,7 @@ export default class Recording {
                     .publishOriginalRecording({
                       startedEvent,
                       terminalEvent: persistedTerminalEvent,
+                      actors: this.meetingActors.roster(),
                       sourceFileBase: writer.fileBase
                     })
                     .catch((error) => {
@@ -676,6 +682,7 @@ export default class Recording {
     if (this.botikPlaybackTrack) return this.botikPlaybackTrack;
 
     const speakerId = this.recorder.client.bot.user.id;
+    this.registerMeetingActor(speakerId, this.recorder.client.bot.user);
     if (this.users[speakerId]) {
       this.recorder.logger.error(`Cannot create the Botik playback track for recording ${this.id}: the bot already has an inbound track`);
       return;
@@ -711,8 +718,9 @@ export default class Recording {
     }
 
     const isPresent = member.voiceState.channelID === this.channel.id;
+    const actor = isPresent ? this.registerMeetingActor(member.id, member) : this.meetingActors.get(member.id);
     const transition = this.meetingParticipants.observe(member.id, isPresent);
-    if (transition !== null) this.publishMeetingLifecycle(transition, { participantId: member.id });
+    if (transition !== null && actor !== undefined) this.publishMeetingLifecycle(transition, { actor });
   }
 
   async onConnectionConnect() {
@@ -911,6 +919,7 @@ export default class Recording {
     if (this.users[userID]) return this.users[userID];
     if (Object.keys(this.users).length >= USER_HARD_LIMIT) return;
     let user = this.recorder.client.bot.users.get(userID);
+    this.registerMeetingActor(userID, user);
     this.users[userID] = {
       id: userID,
       username: user?.username ?? 'Unknown',
@@ -1042,7 +1051,7 @@ export default class Recording {
 
   private publishMeetingLifecycle(
     type: MeetingLifecycleEvent['type'],
-    details: Pick<MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+    details: Pick<MeetingLifecycleEvent, 'actors' | 'actor' | 'reason'>
   ): MeetingLifecycleEvent {
     const event = this.createMeetingLifecycleEvent(type, details);
     this.publishMeetingLifecycleEvent(event);
@@ -1051,10 +1060,10 @@ export default class Recording {
 
   private createMeetingLifecycleEvent(
     type: MeetingLifecycleEvent['type'],
-    details: Pick<MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+    details: Pick<MeetingLifecycleEvent, 'actors' | 'actor' | 'reason'>
   ): MeetingLifecycleEvent {
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       eventId: `${this.id}:${++this.lifecycleSequence}`,
       recordingId: this.id,
       guildId: this.channel.guild.id,
@@ -1068,6 +1077,12 @@ export default class Recording {
   private publishMeetingLifecycleEvent(event: MeetingLifecycleEvent): void {
     const accepted = this.recorder.meetingIntegration.publishLifecycle(event);
     if (!accepted) this.recorder.logger.error(`Meeting integration lifecycle queue is full for recording ${this.id} (${event.type})`);
+  }
+
+  private registerMeetingActor(actorId: string, identity: DiscordActorIdentity | null | undefined) {
+    const existing = this.meetingActors.get(actorId);
+    if (existing) return existing;
+    return this.meetingActors.register(classifyDiscordActor(actorId, identity, this.recorder.client.bot.user.id));
   }
 
   private markConnectionLost(reason: string) {

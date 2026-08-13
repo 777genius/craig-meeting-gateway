@@ -7,6 +7,7 @@ import path from 'node:path';
 import fetch, { type Response } from 'node-fetch';
 
 import crc32 from './crc32';
+import { compareOpaqueDiscordIds, type MeetingActor, RecordingActorRegistry, validateActorRoster } from './meetingActorIdentity';
 
 const sourceFileKinds = ['data', 'header1', 'header2', 'users', 'info', 'log'] as const;
 const maximumCookedTrackBytes = 64 * 1024 * 1024;
@@ -40,7 +41,7 @@ export interface MeetingPlatformConfigurationClient {
 }
 
 export interface MeetingLifecycleEvent {
-  schemaVersion: 1;
+  schemaVersion: 2;
   eventId: string;
   recordingId: string;
   guildId: string;
@@ -54,14 +55,14 @@ export interface MeetingLifecycleEvent {
     | 'meeting.connection_recovered'
     | 'meeting.ended'
     | 'meeting.aborted';
-  participantIds?: string[];
-  participantId?: string;
+  actors?: readonly MeetingActor[];
+  actor?: MeetingActor;
   reason?: string | null;
 }
 
 export interface MeetingStartedLifecycleEvent extends MeetingLifecycleEvent {
   type: 'meeting.started';
-  participantIds: string[];
+  actors: readonly MeetingActor[];
 }
 
 export interface MeetingTerminalLifecycleEvent extends MeetingLifecycleEvent {
@@ -90,6 +91,7 @@ type QueueItem = { type: 'lifecycle'; event: MeetingLifecycleEvent } | { type: '
 export interface OriginalRecordingPublicationInput {
   startedEvent: MeetingStartedLifecycleEvent;
   terminalEvent: MeetingTerminalLifecycleEvent;
+  actors: readonly MeetingActor[];
   sourceFileBase: string;
 }
 
@@ -116,16 +118,18 @@ interface PreparedAuthoritativeTrack {
 }
 
 interface OriginalRecordingOutboxJob {
-  schemaVersion: 2;
+  schemaVersion: 3;
   publicationId: string;
   recordingId: string;
   guildId: string;
   channelId: string;
   startedEvent: MeetingStartedLifecycleEvent;
   terminalEvent: MeetingTerminalLifecycleEvent;
+  actors: readonly MeetingActor[];
   sourceFiles: OriginalRecordingSourceFileReference[];
   authoritativeTracks?: PreparedAuthoritativeTrack[];
   authoritativeTimelineBasis?: typeof authoritativeTimelineBasis;
+  migratedFromOutboxSchemaVersion?: 2;
 }
 
 interface PendingOriginalRecordingJob {
@@ -147,13 +151,14 @@ export interface AuthoritativeTrackMetadata {
 }
 
 export interface AuthoritativeRecordingReadyEvent {
-  schemaVersion: 1;
+  schemaVersion: 2;
   eventId: string;
   recordingId: string;
   guildId: string;
   channelId: string;
   occurredAt: string;
   type: 'recording.authoritative_ready';
+  actors: readonly MeetingActor[];
   endedAt: string;
   trackCount: number;
   sourceFilesChecksumSha256: string;
@@ -380,18 +385,19 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   }
 
   publishLifecycle(event: MeetingLifecycleEvent): boolean {
+    const immutableEvent = parseMeetingLifecycleEventV2(event);
     // Lifecycle traffic is tiny and must remain ordered with the accepted audio.
     const queuedLifecycleEvents = this.queue.length - this.queuedPackets;
-    const isTerminal = event.type === 'meeting.ended' || event.type === 'meeting.aborted';
-    if (event.type === 'meeting.started') {
-      if (this.openRecordings.has(event.recordingId)) return false;
+    const isTerminal = immutableEvent.type === 'meeting.ended' || immutableEvent.type === 'meeting.aborted';
+    if (immutableEvent.type === 'meeting.started') {
+      if (this.openRecordings.has(immutableEvent.recordingId)) return false;
       if (queuedLifecycleEvents + this.openRecordings.size + 2 > this.maxQueuedLifecycleEvents) return false;
-      this.openRecordings.add(event.recordingId);
-    } else if (!this.openRecordings.has(event.recordingId)) return false;
+      this.openRecordings.add(immutableEvent.recordingId);
+    } else if (!this.openRecordings.has(immutableEvent.recordingId)) return false;
     else if (!isTerminal && queuedLifecycleEvents + this.openRecordings.size + 1 > this.maxQueuedLifecycleEvents) return false;
 
-    this.queue.push({ type: 'lifecycle', event });
-    if (isTerminal) this.openRecordings.delete(event.recordingId);
+    this.queue.push({ type: 'lifecycle', event: immutableEvent });
+    if (isTerminal) this.openRecordings.delete(immutableEvent.recordingId);
     this.scheduleProcessing();
     return true;
   }
@@ -425,8 +431,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       });
       const queuedJob = existing ?? job;
       if (existing === undefined) await writeOriginalRecordingJob(filePath, job);
-      else if (existing.publicationId !== job.publicationId)
-        throw new Error(`Original recording outbox contains a conflicting job for ${job.recordingId}`);
+      else assertSameOriginalPublication(existing, job);
       this.enqueueOriginalJob({ filePath, job: queuedJob });
       this.scheduleOriginalProcessing();
       return true;
@@ -453,21 +458,26 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       await Promise.all(sourceFileKinds.map((kind) => digestFile(`${input.sourceFileBase}.${kind}`)));
       const recoveryIdentity = createHash('sha256').update(input.recordingId).digest('hex').slice(0, 32);
 
+      const actors = users.tracks.map(({ speakerId }) => ({
+        actorId: speakerId,
+        kind: speakerId === botSpeakerId ? ('automation' as const) : ('unknown' as const)
+      }));
       return await this.publishOriginalRecording({
         sourceFileBase: input.sourceFileBase,
+        actors,
         startedEvent: {
-          schemaVersion: 1,
-          eventId: `recovery:v1:${recoveryIdentity}:started`,
+          schemaVersion: 2,
+          eventId: `recovery:v2:${recoveryIdentity}:started`,
           recordingId: input.recordingId,
           guildId: input.guildId,
           channelId: input.channelId,
           occurredAt: input.startedAt,
           type: 'meeting.started',
-          participantIds: users.tracks.filter(({ speakerId }) => speakerId !== botSpeakerId).map(({ speakerId }) => speakerId)
+          actors
         },
         terminalEvent: {
-          schemaVersion: 1,
-          eventId: `recovery:v1:${recoveryIdentity}:ended`,
+          schemaVersion: 2,
+          eventId: `recovery:v2:${recoveryIdentity}:ended`,
           recordingId: input.recordingId,
           guildId: input.guildId,
           channelId: input.channelId,
@@ -542,8 +552,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     this.originalJobs.push(pending);
     this.originalJobs.sort(
       (left, right) =>
-        left.job.terminalEvent.occurredAt.localeCompare(right.job.terminalEvent.occurredAt) ||
-        left.job.publicationId.localeCompare(right.job.publicationId)
+        compareOpaqueDiscordIds(left.job.terminalEvent.occurredAt, right.job.terminalEvent.occurredAt) ||
+        compareOpaqueDiscordIds(left.job.publicationId, right.job.publicationId)
     );
   }
 
@@ -700,15 +710,29 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       assertOriginalSourceIntegrity(source, digest);
       sourceFiles.push({ ...source, ...digest });
     }
+    let actors = pending.job.actors;
+    let startedEvent = pending.job.startedEvent;
+    if (pending.job.migratedFromOutboxSchemaVersion === 2) {
+      const migratedRegistry = new RecordingActorRegistry();
+      for (const actor of actors) migratedRegistry.register(actor);
+      for (const { speakerId } of users.tracks)
+        if (migratedRegistry.get(speakerId) === undefined) migratedRegistry.register({ actorId: speakerId, kind: 'unknown' });
+      actors = migratedRegistry.roster();
+      startedEvent = { ...startedEvent, actors };
+    }
+    const authoritativeTracks = users.tracks.map((track) => ({
+      ...track,
+      timelineOffsetMs: data.timelineOffsetMs
+    }));
     const prepared: OriginalRecordingOutboxJob = {
       ...pending.job,
+      actors,
+      startedEvent,
       sourceFiles,
-      authoritativeTracks: users.tracks.map((track) => ({
-        ...track,
-        timelineOffsetMs: data.timelineOffsetMs
-      })),
+      authoritativeTracks,
       authoritativeTimelineBasis
     };
+    assertEveryTrackHasActor(authoritativeTracks, prepared.actors);
     await writeOriginalRecordingJob(pending.filePath, prepared);
     return prepared;
   }
@@ -742,18 +766,19 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       }
     }
 
-    await this.transport.postAuthoritativeReady!({
-      schemaVersion: 1,
-      eventId: `${job.recordingId}:authoritative-ready:v1`,
+    await this.transport.postAuthoritativeReady!(parseAuthoritativeRecordingReadyEventV2({
+      schemaVersion: 2,
+      eventId: `${job.recordingId}:authoritative-ready:v2`,
       recordingId: job.recordingId,
       guildId: job.guildId,
       channelId: job.channelId,
       occurredAt: job.terminalEvent.occurredAt,
       type: 'recording.authoritative_ready',
+      actors: job.actors,
       endedAt: job.terminalEvent.occurredAt,
       trackCount: job.authoritativeTracks.length,
       sourceFilesChecksumSha256: sourceFilesChecksum(job.sourceFiles)
-    });
+    }));
   }
 
   private resolveSourceFile(source: OriginalRecordingSourceFileReference): string {
@@ -947,6 +972,94 @@ function retryDelay(consecutiveFailures: number): number {
   return Math.min(10_000, 100 * 2 ** Math.min(consecutiveFailures - 1, 7));
 }
 
+export function parseMeetingLifecycleEventV2(event: MeetingLifecycleEvent): MeetingLifecycleEvent {
+  if (event.schemaVersion !== 2) throw new Error('Meeting lifecycle event must use schema v2');
+  if (event.eventId.length < 1 || event.eventId.length > 128) throw new Error('Meeting lifecycle event ID is invalid');
+  assertRecordingId(event.recordingId);
+  if (!discordSnowflake.test(event.guildId) || !discordSnowflake.test(event.channelId))
+    throw new Error('Meeting lifecycle Discord identity is invalid');
+  if (!isCanonicalInstant(event.occurredAt)) throw new Error('Meeting lifecycle timestamp is invalid');
+  const base = {
+    schemaVersion: 2 as const,
+    eventId: event.eventId,
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId,
+    occurredAt: event.occurredAt,
+    type: event.type
+  };
+  if (event.type === 'meeting.started') {
+    const actors = validateActorRoster(event.actors);
+    return Object.freeze({ ...base, actors: Object.freeze(actors.map((actor) => Object.freeze({ ...actor }))) });
+  }
+  if (event.type === 'participant.joined' || event.type === 'participant.left') {
+    const actors = validateActorRoster(event.actor === undefined ? undefined : [event.actor]);
+    if (actors.length !== 1) throw new Error('Participant lifecycle event requires one actor');
+    return Object.freeze({ ...base, actor: actors[0] });
+  }
+  if (event.type === 'meeting.connection_lost' || event.type === 'meeting.connection_recovered' || event.type === 'meeting.ended' || event.type === 'meeting.aborted') {
+    if (event.reason !== null && (typeof event.reason !== 'string' || event.reason.length < 1 || event.reason.length > 256))
+      throw new Error('Meeting lifecycle reason is invalid');
+    return Object.freeze({ ...base, reason: event.reason });
+  }
+  throw new Error('Meeting lifecycle event type is unsupported');
+}
+
+export function parseAuthoritativeRecordingReadyEventV2(event: AuthoritativeRecordingReadyEvent): AuthoritativeRecordingReadyEvent {
+  const expectedFields = [
+    'schemaVersion',
+    'eventId',
+    'recordingId',
+    'guildId',
+    'channelId',
+    'occurredAt',
+    'type',
+    'actors',
+    'endedAt',
+    'trackCount',
+    'sourceFilesChecksumSha256'
+  ] as const;
+  if (!isRecord(event) || Object.keys(event).length !== expectedFields.length || expectedFields.some((field) => !(field in event)))
+    throw new Error('Authoritative recording ready event is malformed');
+  if (
+    event.schemaVersion !== 2 ||
+    event.type !== 'recording.authoritative_ready' ||
+    event.eventId.length < 1 ||
+    event.eventId.length > 128 ||
+    !discordSnowflake.test(event.guildId) ||
+    !discordSnowflake.test(event.channelId) ||
+    !isCanonicalInstant(event.occurredAt) ||
+    !isCanonicalInstant(event.endedAt) ||
+    !Number.isSafeInteger(event.trackCount) ||
+    event.trackCount < 1 ||
+    event.trackCount > 64 ||
+    !/^[0-9a-f]{64}$/.test(event.sourceFilesChecksumSha256)
+  )
+    throw new Error('Authoritative recording ready event is invalid');
+  assertRecordingId(event.recordingId);
+  const actors = validateActorRoster(event.actors);
+  return Object.freeze({
+    schemaVersion: 2,
+    eventId: event.eventId,
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId,
+    occurredAt: event.occurredAt,
+    type: 'recording.authoritative_ready',
+    actors: Object.freeze(actors.map((actor) => Object.freeze({ ...actor }))),
+    endedAt: event.endedAt,
+    trackCount: event.trackCount,
+    sourceFilesChecksumSha256: event.sourceFilesChecksumSha256
+  });
+}
+
+function assertEveryTrackHasActor(tracks: readonly PreparedAuthoritativeTrack[], actors: readonly MeetingActor[]): void {
+  const actorIds = new Set(actors.map(({ actorId }) => actorId));
+  for (const { speakerId } of tracks) {
+    if (!actorIds.has(speakerId)) throw new PermanentOriginalRecordingError(`Authoritative track actor ${speakerId} is absent from final roster`);
+  }
+}
+
 function isRetryableDeliveryError(error: unknown): boolean {
   if (error instanceof PermanentOriginalRecordingError) return false;
   return !(error instanceof MeetingIntegrationDeliveryError) || error.retryable;
@@ -960,7 +1073,7 @@ function parseLifecycleEnvelope(value: unknown, expectedFields: readonly string[
   if (!isRecord(value) || Object.keys(value).length !== expectedFields.length || expectedFields.some((field) => !(field in value)))
     throw new Error('Original recording outbox lifecycle event is malformed');
   if (
-    value.schemaVersion !== 1 ||
+    value.schemaVersion !== 2 ||
     typeof value.eventId !== 'string' ||
     value.eventId.length < 1 ||
     value.eventId.length > 128 ||
@@ -971,7 +1084,7 @@ function parseLifecycleEnvelope(value: unknown, expectedFields: readonly string[
   )
     throw new Error('Original recording outbox lifecycle envelope is invalid');
   assertRecordingId(value.recordingId);
-  if (!/^\d{16,22}$/.test(value.guildId) || !/^\d{16,22}$/.test(value.channelId))
+  if (!discordSnowflake.test(value.guildId as string) || !discordSnowflake.test(value.channelId as string))
     throw new Error('Original recording outbox lifecycle identity is invalid');
   if (!isCanonicalInstant(value.occurredAt)) throw new Error('Original recording outbox lifecycle timestamp is invalid');
   return value;
@@ -986,24 +1099,19 @@ function parseStartedLifecycleEvent(value: unknown): MeetingStartedLifecycleEven
     'channelId',
     'occurredAt',
     'type',
-    'participantIds'
+    'actors'
   ]);
-  if (
-    parsed.type !== 'meeting.started' ||
-    !Array.isArray(parsed.participantIds) ||
-    parsed.participantIds.length > 1000 ||
-    parsed.participantIds.some((participantId) => typeof participantId !== 'string' || !/^\d{16,22}$/.test(participantId))
-  )
-    throw new Error('Original recording outbox meeting.started event is invalid');
+  if (parsed.type !== 'meeting.started') throw new Error('Original recording outbox meeting.started event is invalid');
+  const actors = validateActorRoster(parsed.actors);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     eventId: parsed.eventId as string,
     recordingId: parsed.recordingId as string,
     guildId: parsed.guildId as string,
     channelId: parsed.channelId as string,
     occurredAt: parsed.occurredAt as string,
     type: 'meeting.started',
-    participantIds: [...parsed.participantIds] as string[]
+    actors
   };
 }
 
@@ -1015,7 +1123,7 @@ function parseTerminalLifecycleEvent(value: unknown): MeetingTerminalLifecycleEv
   )
     throw new Error('Original recording outbox terminal lifecycle event is invalid');
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     eventId: parsed.eventId as string,
     recordingId: parsed.recordingId as string,
     guildId: parsed.guildId as string,
@@ -1037,6 +1145,25 @@ function assertMatchingLifecycleIdentity(startedEvent: MeetingStartedLifecycleEv
     throw new Error('Original recording outbox lifecycle events do not describe one ordered recording');
 }
 
+function assertSameOriginalPublication(existing: OriginalRecordingOutboxJob, proposed: OriginalRecordingOutboxJob): void {
+  const immutableExisting = {
+    publicationId: existing.publicationId,
+    startedEvent: existing.startedEvent,
+    terminalEvent: existing.terminalEvent,
+    actors: existing.actors,
+    sources: existing.sourceFiles.map(({ kind, relativePath }) => ({ kind, relativePath }))
+  };
+  const immutableProposed = {
+    publicationId: proposed.publicationId,
+    startedEvent: proposed.startedEvent,
+    terminalEvent: proposed.terminalEvent,
+    actors: proposed.actors,
+    sources: proposed.sourceFiles.map(({ kind, relativePath }) => ({ kind, relativePath }))
+  };
+  if (JSON.stringify(immutableExisting) !== JSON.stringify(immutableProposed))
+    throw new Error(`Original recording outbox contains a conflicting job for ${proposed.recordingId}`);
+}
+
 function isCanonicalInstant(value: string): boolean {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
@@ -1045,20 +1172,27 @@ function isCanonicalInstant(value: string): boolean {
 function createOriginalRecordingJob(input: OriginalRecordingPublicationInput, recordingRoot: string): OriginalRecordingOutboxJob {
   const startedEvent = parseStartedLifecycleEvent(input.startedEvent);
   const terminalEvent = parseTerminalLifecycleEvent(input.terminalEvent);
+  const actors = validateActorRoster(input.actors);
   assertMatchingLifecycleIdentity(startedEvent, terminalEvent);
+  for (const startedActor of startedEvent.actors) {
+    const finalActor = actors.find(({ actorId }) => actorId === startedActor.actorId);
+    if (!finalActor || finalActor.kind !== startedActor.kind)
+      throw new Error('Original recording final actor roster must contain the immutable meeting.started roster');
+  }
   const { recordingId, guildId, channelId } = startedEvent;
   assertRecordingId(recordingId);
 
   assertOriginalSourceFileBase(recordingId, recordingRoot, input.sourceFileBase);
 
   return {
-    schemaVersion: 2,
-    publicationId: `authoritative-recording:v1:${recordingId}`,
+    schemaVersion: 3,
+    publicationId: `authoritative-recording:v2:${recordingId}`,
     recordingId,
     guildId,
     channelId,
     startedEvent,
     terminalEvent,
+    actors,
     sourceFiles: sourceFileKinds.map((kind) => ({
       kind,
       relativePath: `${recordingId}.ogg.${kind}`
@@ -1102,8 +1236,18 @@ async function syncDirectory(directoryPath: string): Promise<void> {
 }
 
 async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecordingOutboxJob> {
-  const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
-  if (!isRecord(parsed) || parsed.schemaVersion !== 2) throw new Error('Original recording outbox job has an unsupported schema');
+  const persisted = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
+  if (!isRecord(persisted)) throw new Error('Original recording outbox job has an unsupported schema');
+  if (persisted.schemaVersion === 2) {
+    const migrated = parseOriginalRecordingJobV3(migrateOriginalRecordingJobV2(persisted));
+    await writeOriginalRecordingJob(filePath, migrated);
+    return migrated;
+  }
+  if (persisted.schemaVersion !== 3) throw new Error('Original recording outbox job has an unsupported schema');
+  return parseOriginalRecordingJobV3(persisted);
+}
+
+function parseOriginalRecordingJobV3(parsed: Record<string, unknown>): OriginalRecordingOutboxJob {
   const {
     publicationId,
     recordingId,
@@ -1111,9 +1255,11 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     channelId,
     startedEvent: rawStartedEvent,
     terminalEvent: rawTerminalEvent,
+    actors: rawActors,
     sourceFiles,
     authoritativeTracks: rawAuthoritativeTracks,
-    authoritativeTimelineBasis: rawAuthoritativeTimelineBasis
+    authoritativeTimelineBasis: rawAuthoritativeTimelineBasis,
+    migratedFromOutboxSchemaVersion
   } = parsed;
   if (
     typeof publicationId !== 'string' ||
@@ -1123,14 +1269,21 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     !Array.isArray(sourceFiles)
   )
     throw new Error('Original recording outbox job is malformed');
+  if (migratedFromOutboxSchemaVersion !== undefined && migratedFromOutboxSchemaVersion !== 2)
+    throw new Error('Original recording outbox migration marker is invalid');
   assertRecordingId(recordingId);
-  if (publicationId !== `authoritative-recording:v1:${recordingId}` || !/^\d{16,22}$/.test(guildId) || !/^\d{16,22}$/.test(channelId))
+  if (publicationId !== `authoritative-recording:v2:${recordingId}` || !discordSnowflake.test(guildId) || !discordSnowflake.test(channelId))
     throw new Error('Original recording outbox job identity is invalid');
   const startedEvent = parseStartedLifecycleEvent(rawStartedEvent);
   const terminalEvent = parseTerminalLifecycleEvent(rawTerminalEvent);
+  const actors = validateActorRoster(rawActors);
   assertMatchingLifecycleIdentity(startedEvent, terminalEvent);
   if (startedEvent.recordingId !== recordingId || startedEvent.guildId !== guildId || startedEvent.channelId !== channelId)
     throw new Error('Original recording outbox lifecycle identity does not match its job');
+  for (const actor of startedEvent.actors) {
+    const finalActor = actors.find(({ actorId }) => actorId === actor.actorId);
+    if (!finalActor || finalActor.kind !== actor.kind) throw new Error('Original recording outbox final roster contradicts meeting.started');
+  }
   if (sourceFiles.length !== sourceFileKinds.length) throw new Error('Original recording outbox source file set is incomplete');
 
   const normalizedSources = sourceFiles.map((source): OriginalRecordingSourceFileReference => {
@@ -1156,6 +1309,7 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     throw new Error('Original recording outbox source kinds must be unique');
 
   const authoritativeTracks = parsePreparedAuthoritativeTracks(rawAuthoritativeTracks);
+  if (authoritativeTracks !== undefined) assertEveryTrackHasActor(authoritativeTracks, actors);
   if (rawAuthoritativeTimelineBasis !== undefined && rawAuthoritativeTimelineBasis !== authoritativeTimelineBasis)
     throw new Error('Original recording outbox timeline basis is invalid');
   if (
@@ -1165,16 +1319,167 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     throw new Error('Original recording outbox shared timeline metadata is invalid');
 
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     publicationId,
     recordingId,
     guildId,
     channelId,
     startedEvent,
     terminalEvent,
+    actors,
     sourceFiles: normalizedSources.sort((left, right) => sourceFileKinds.indexOf(left.kind) - sourceFileKinds.indexOf(right.kind)),
     ...(authoritativeTracks === undefined ? {} : { authoritativeTracks }),
-    ...(rawAuthoritativeTimelineBasis === undefined ? {} : { authoritativeTimelineBasis })
+    ...(rawAuthoritativeTimelineBasis === undefined ? {} : { authoritativeTimelineBasis }),
+    ...(migratedFromOutboxSchemaVersion === undefined ? {} : { migratedFromOutboxSchemaVersion: 2 })
+  };
+}
+
+function migrateOriginalRecordingJobV2(parsed: Record<string, unknown>): Record<string, unknown> {
+  const {
+    publicationId,
+    recordingId,
+    guildId,
+    channelId,
+    startedEvent: rawStartedEvent,
+    terminalEvent: rawTerminalEvent,
+    sourceFiles,
+    authoritativeTracks,
+    authoritativeTimelineBasis: timelineBasis
+  } = parsed;
+  if (
+    typeof recordingId !== 'string' ||
+    typeof guildId !== 'string' ||
+    typeof channelId !== 'string' ||
+    publicationId !== `authoritative-recording:v1:${recordingId}`
+  )
+    throw new Error('Original recording outbox v2 identity is invalid');
+  const startedEvent = parseLegacyStartedLifecycleEvent(rawStartedEvent);
+  const terminalEvent = parseLegacyTerminalLifecycleEvent(rawTerminalEvent);
+  const tracks = parsePreparedAuthoritativeTracks(authoritativeTracks);
+  const registry = new RecordingActorRegistry();
+  for (const participantId of startedEvent.participantIds)
+    if (registry.get(participantId) === undefined) registry.register({ actorId: participantId, kind: 'unknown' });
+  for (const track of tracks ?? [])
+    if (registry.get(track.speakerId) === undefined) registry.register({ actorId: track.speakerId, kind: 'unknown' });
+  const actors = registry.roster();
+  return {
+    schemaVersion: 3,
+    publicationId: `authoritative-recording:v2:${recordingId}`,
+    recordingId,
+    guildId,
+    channelId,
+    startedEvent: {
+      schemaVersion: 2,
+      eventId: startedEvent.eventId,
+      recordingId: startedEvent.recordingId,
+      guildId: startedEvent.guildId,
+      channelId: startedEvent.channelId,
+      occurredAt: startedEvent.occurredAt,
+      type: 'meeting.started',
+      actors
+    },
+    terminalEvent: { ...terminalEvent, schemaVersion: 2 },
+    actors,
+    sourceFiles,
+    ...(tracks === undefined ? {} : { authoritativeTracks: tracks }),
+    ...(timelineBasis === undefined ? {} : { authoritativeTimelineBasis: timelineBasis }),
+    migratedFromOutboxSchemaVersion: 2
+  };
+}
+
+function parseLegacyLifecycleEnvelope(value: unknown, expectedFields: readonly string[]): Record<string, unknown> {
+  if (!isRecord(value) || Object.keys(value).length !== expectedFields.length || expectedFields.some((field) => !(field in value)))
+    throw new Error('Original recording outbox v2 lifecycle event is malformed');
+  if (
+    value.schemaVersion !== 1 ||
+    typeof value.eventId !== 'string' ||
+    value.eventId.length < 1 ||
+    value.eventId.length > 128 ||
+    typeof value.recordingId !== 'string' ||
+    typeof value.guildId !== 'string' ||
+    typeof value.channelId !== 'string' ||
+    typeof value.occurredAt !== 'string'
+  )
+    throw new Error('Original recording outbox v2 lifecycle envelope is invalid');
+  assertRecordingId(value.recordingId);
+  if (!discordSnowflake.test(value.guildId) || !discordSnowflake.test(value.channelId) || !isCanonicalInstant(value.occurredAt))
+    throw new Error('Original recording outbox v2 lifecycle identity is invalid');
+  return value;
+}
+
+function parseLegacyStartedLifecycleEvent(value: unknown): {
+  schemaVersion: 1;
+  eventId: string;
+  recordingId: string;
+  guildId: string;
+  channelId: string;
+  occurredAt: string;
+  type: 'meeting.started';
+  participantIds: string[];
+} {
+  const parsed = parseLegacyLifecycleEnvelope(value, [
+    'schemaVersion',
+    'eventId',
+    'recordingId',
+    'guildId',
+    'channelId',
+    'occurredAt',
+    'type',
+    'participantIds'
+  ]);
+  if (
+    parsed.type !== 'meeting.started' ||
+    !Array.isArray(parsed.participantIds) ||
+    parsed.participantIds.length > 1000 ||
+    parsed.participantIds.some((participantId) => typeof participantId !== 'string' || !discordSnowflake.test(participantId))
+  )
+    throw new Error('Original recording outbox v2 meeting.started event is invalid');
+  return {
+    schemaVersion: 1,
+    eventId: parsed.eventId as string,
+    recordingId: parsed.recordingId as string,
+    guildId: parsed.guildId as string,
+    channelId: parsed.channelId as string,
+    occurredAt: parsed.occurredAt as string,
+    type: 'meeting.started',
+    participantIds: [...parsed.participantIds] as string[]
+  };
+}
+
+function parseLegacyTerminalLifecycleEvent(value: unknown): {
+  schemaVersion: 1;
+  eventId: string;
+  recordingId: string;
+  guildId: string;
+  channelId: string;
+  occurredAt: string;
+  type: 'meeting.ended' | 'meeting.aborted';
+  reason: string | null;
+} {
+  const parsed = parseLegacyLifecycleEnvelope(value, [
+    'schemaVersion',
+    'eventId',
+    'recordingId',
+    'guildId',
+    'channelId',
+    'occurredAt',
+    'type',
+    'reason'
+  ]);
+  if (
+    (parsed.type !== 'meeting.ended' && parsed.type !== 'meeting.aborted') ||
+    (parsed.reason !== null && (typeof parsed.reason !== 'string' || parsed.reason.length < 1 || parsed.reason.length > 256))
+  )
+    throw new Error('Original recording outbox v2 terminal lifecycle event is invalid');
+  return {
+    schemaVersion: 1,
+    eventId: parsed.eventId as string,
+    recordingId: parsed.recordingId as string,
+    guildId: parsed.guildId as string,
+    channelId: parsed.channelId as string,
+    occurredAt: parsed.occurredAt as string,
+    type: parsed.type,
+    reason: parsed.reason as string | null
   };
 }
 
@@ -1280,10 +1585,8 @@ async function inspectOriginalRecordingUsers(filePath: string): Promise<{
 }
 
 /**
- * Recovery reconstructs participantIds from .users, which now also contains
- * Botik's authoritative playback track. The recording info file carries the
- * actual Craig bot snowflake, so it is the stable exclusion key while the
- * track remains present for authoritative upload preparation.
+ * Recovery has no trustworthy provider membership proof, so source tracks are
+ * unknown unless the recording info identifies Craig's Botik/recorder actor.
  */
 async function inspectOriginalRecordingBotSpeakerId(filePath: string): Promise<string | undefined> {
   try {

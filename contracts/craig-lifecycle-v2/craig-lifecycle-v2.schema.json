@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://craig.chat/contracts/craig-lifecycle-v2.schema.json",
+  "title": "Craig lifecycle event schema v2",
+  "oneOf": [
+    { "$ref": "#/$defs/meetingStarted" },
+    { "$ref": "#/$defs/participantChanged" },
+    { "$ref": "#/$defs/connectionChanged" },
+    { "$ref": "#/$defs/meetingStopped" },
+    { "$ref": "#/$defs/artifactReady" },
+    { "$ref": "#/$defs/authoritativeReady" }
+  ],
+  "$defs": {
+    "snowflake": { "type": "string", "pattern": "^[0-9]{17,20}$" },
+    "identifier": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "instant": { "type": "string", "format": "date-time" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "storageKey": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!/)(?!.*\\.\\.).+$" },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actorId", "kind"],
+      "properties": {
+        "actorId": { "$ref": "#/$defs/snowflake" },
+        "kind": { "enum": ["human", "automation", "unknown"] }
+      }
+    },
+    "actors": {
+      "type": "array",
+      "maxItems": 1000,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/actor" },
+      "$comment": "Consumers MUST additionally reject repeated actorId values, including entries whose kinds conflict."
+    },
+    "envelope": {
+      "type": "object",
+      "required": ["schemaVersion", "eventId", "recordingId", "guildId", "channelId", "occurredAt", "type"],
+      "properties": {
+        "schemaVersion": { "const": 2 },
+        "eventId": { "$ref": "#/$defs/identifier" },
+        "recordingId": { "$ref": "#/$defs/identifier" },
+        "guildId": { "$ref": "#/$defs/snowflake" },
+        "channelId": { "$ref": "#/$defs/snowflake" },
+        "occurredAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "meetingStarted": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "eventId", "recordingId", "guildId", "channelId", "occurredAt", "type", "actors"],
+          "properties": {
+            "schemaVersion": true, "eventId": true, "recordingId": true, "guildId": true, "channelId": true, "occurredAt": true,
+            "type": { "const": "meeting.started" }, "actors": { "$ref": "#/$defs/actors" }
+          }
+        }
+      ]
+    },
+    "participantChanged": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schemaVersion", "eventId", "recordingId", "guildId", "channelId", "occurredAt", "type", "actor"],
+          "properties": {
+            "schemaVersion": true, "eventId": true, "recordingId": true, "guildId": true, "channelId": true, "occurredAt": true,
+            "type": { "enum": ["participant.joined", "participant.left"] }, "actor": { "$ref": "#/$defs/actor" }
+          }
+        }
+      ]
+    },
+    "connectionChanged": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "eventId", "recordingId", "guildId", "channelId", "occurredAt", "type", "reason"],
+          "properties": {
+            "schemaVersion": true, "eventId": true, "recordingId": true, "guildId": true, "channelId": true, "occurredAt": true,
+            "type": { "enum": ["meeting.connection_lost", "meeting.connection_recovered"] },
+            "reason": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 }
+          }
+        }
+      ]
+    },
+    "meetingStopped": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "eventId", "recordingId", "guildId", "channelId", "occurredAt", "type", "reason"],
+          "properties": {
+            "schemaVersion": true, "eventId": true, "recordingId": true, "guildId": true, "channelId": true, "occurredAt": true,
+            "type": { "enum": ["meeting.ended", "meeting.aborted"] },
+            "reason": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 }
+          }
+        }
+      ]
+    },
+    "artifactReady": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "eventId", "recordingId", "guildId", "channelId", "occurredAt", "type", "endedAt", "multitrackManifestKey", "usersManifestKey"],
+          "properties": {
+            "schemaVersion": true, "eventId": true, "recordingId": true, "guildId": true, "channelId": true, "occurredAt": true,
+            "type": { "const": "recording.artifact_ready" }, "endedAt": { "$ref": "#/$defs/instant" },
+            "multitrackManifestKey": { "$ref": "#/$defs/storageKey" }, "usersManifestKey": { "$ref": "#/$defs/storageKey" }
+          }
+        }
+      ]
+    },
+    "authoritativeReady": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["schemaVersion", "eventId", "recordingId", "guildId", "channelId", "occurredAt", "type", "actors", "endedAt", "sourceFilesChecksumSha256", "trackCount"],
+          "properties": {
+            "schemaVersion": true, "eventId": true, "recordingId": true, "guildId": true, "channelId": true, "occurredAt": true,
+            "type": { "const": "recording.authoritative_ready" }, "actors": { "$ref": "#/$defs/actors" },
+            "endedAt": { "$ref": "#/$defs/instant" }, "sourceFilesChecksumSha256": { "$ref": "#/$defs/sha256" },
+            "trackCount": { "type": "integer", "minimum": 1, "maximum": 64 }
+          }
+        }
+      ]
+    }
+  }
+}

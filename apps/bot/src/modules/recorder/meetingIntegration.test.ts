@@ -35,18 +35,18 @@ const logger: MeetingIntegrationLogger = {
 };
 
 const event: MeetingStartedLifecycleEvent = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   eventId: 'recording-1:1',
   recordingId: 'recording-1',
   guildId: '1533228590643155034',
   channelId: '1533228823045214398',
   occurredAt: '2026-08-02T00:00:00.000Z',
   type: 'meeting.started',
-  participantIds: ['1533227577286852649']
+  actors: [{ actorId: '1533227577286852649', kind: 'human' }]
 };
 
 const terminalEvent: MeetingTerminalLifecycleEvent = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   eventId: 'recording-1:2',
   recordingId: 'recording-1',
   guildId: '1533228590643155034',
@@ -269,8 +269,7 @@ test('rejects derived traffic outside an open meeting lifecycle', async () => {
   const participantJoined: MeetingLifecycleEvent = {
     ...event,
     eventId: 'recording-1:2',
-    participantId: '1533228054724346087',
-    participantIds: undefined,
+    actor: { actorId: '1533228054724346087', kind: 'automation' },
     type: 'participant.joined'
   };
 
@@ -293,6 +292,14 @@ test('rejects derived traffic outside an open meeting lifecycle', async () => {
   assert.deepEqual(calls, ['/v1/craig/events', '/v1/craig/voice-packets', '/v1/craig/events']);
 });
 
+test('rejects v1 lifecycle payloads instead of mixing schemas within a recording', () => {
+  const sink = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 8, 2);
+  assert.throws(
+    () => sink.publishLifecycle({ ...event, schemaVersion: 1 } as unknown as MeetingLifecycleEvent),
+    /must use schema v2/
+  );
+});
+
 test('reserves terminal capacity when lifecycle traffic reaches its bound', async () => {
   let release: (() => void) | undefined;
   const blocked = new Promise<void>((resolve) => {
@@ -309,8 +316,7 @@ test('reserves terminal capacity when lifecycle traffic reaches its bound', asyn
   const joined: MeetingLifecycleEvent = {
     ...event,
     eventId: 'recording-1:2',
-    participantId: '1533228054724346087',
-    participantIds: undefined,
+    actor: { actorId: '1533228054724346087', kind: 'automation' },
     type: 'participant.joined'
   };
 
@@ -321,7 +327,8 @@ test('reserves terminal capacity when lifecycle traffic reaches its bound', asyn
     sink.publishLifecycle({
       ...event,
       eventId: 'recording-1:4',
-      type: 'meeting.ended'
+      type: 'meeting.ended',
+      reason: null
     }),
     true
   );
@@ -350,7 +357,8 @@ test('tracks interleaved recording lifecycles independently', async () => {
     sink.publishLifecycle({
       ...event,
       eventId: 'recording-1:2',
-      type: 'meeting.ended'
+      type: 'meeting.ended',
+      reason: null
     }),
     true
   );
@@ -360,7 +368,8 @@ test('tracks interleaved recording lifecycles independently', async () => {
     sink.publishLifecycle({
       ...secondStart,
       eventId: 'recording-2:2',
-      type: 'meeting.ended'
+      type: 'meeting.ended',
+      reason: null
     }),
     true
   );
@@ -394,21 +403,29 @@ test('admits packets synchronously, clones after admission, and rejects overflow
 test('retries transient delivery failures without removing or reordering data', async () => {
   let attempts = 0;
   const delivered: string[] = [];
+  const attemptedPayloads: string[] = [];
   const transport: MeetingIntegrationTransport = {
-    async post(path) {
+    async post(path, body) {
       attempts++;
+      attemptedPayloads.push(JSON.stringify(body));
       if (attempts === 1) throw new Error('temporary outage');
       delivered.push(path);
     }
   };
   const sink = new BoundedMeetingIntegrationSink(transport, logger, 4, 2);
+  const retryEvent: MeetingStartedLifecycleEvent = { ...event, actors: event.actors.map((actor) => ({ ...actor })) };
 
-  sink.publishLifecycle(event);
+  sink.publishLifecycle(retryEvent);
+  retryEvent.eventId = 'mutated-after-admission';
+  (retryEvent.actors[0] as { kind: string }).kind = 'unknown';
   sink.publishPacket(packet, Buffer.from([1]));
 
   assert.equal(await sink.drain(2000), true);
   assert.equal(attempts, 3);
   assert.deepEqual(delivered, ['/v1/craig/events', '/v1/craig/voice-packets']);
+  assert.equal(attemptedPayloads[0], attemptedPayloads[1]);
+  assert.match(attemptedPayloads[0] ?? '', /"eventId":"recording-1:1"/);
+  assert.match(attemptedPayloads[0] ?? '', /"kind":"human"/);
 });
 
 test('permanent delivery rejection advances the realtime FIFO without retrying the rejected item', async () => {
@@ -428,7 +445,8 @@ test('permanent delivery rejection advances the realtime FIFO without retrying t
   sink.publishLifecycle({
     ...event,
     eventId: 'recording-1:2',
-    type: 'meeting.ended'
+    type: 'meeting.ended',
+    reason: null
   });
 
   assert.equal(await sink.drain(1000), true);
@@ -536,13 +554,14 @@ test('HTTP original recording contract streams audio metadata and requires ready
   assert.deepEqual(JSON.parse(Buffer.from(String(encodedMetadata), 'base64url').toString('utf8')), metadata);
 
   const ready: AuthoritativeRecordingReadyEvent = {
-    schemaVersion: 1,
-    eventId: 'recording-1:authoritative-ready:v1',
+    schemaVersion: 2,
+    eventId: 'recording-1:authoritative-ready:v2',
     recordingId: 'recording-1',
     guildId: event.guildId,
     channelId: event.channelId,
     occurredAt: '2026-08-02T00:01:00.000Z',
     type: 'recording.authoritative_ready',
+    actors: event.actors,
     endedAt: '2026-08-02T00:01:00.000Z',
     trackCount: 1,
     sourceFilesChecksumSha256: 'a'.repeat(64)
@@ -614,12 +633,18 @@ test('recovers the authoritative original after restart loses an incomplete live
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), ['recording-1.json']);
   const pendingJobPath = path.join(outboxRoot, 'pending', 'recording-1.json');
   const recoveredJob = JSON.parse(await readFile(pendingJobPath, 'utf8')) as {
+    schemaVersion: number;
     startedEvent: MeetingStartedLifecycleEvent;
     terminalEvent: MeetingTerminalLifecycleEvent;
+    actors: Array<{ actorId: string; kind: string }>;
     sourceFiles: Array<{ kind: string; relativePath: string }>;
     authoritativeTracks?: Array<Pick<AuthoritativeTrackMetadata, 'speakerId' | 'trackNumber' | 'timelineOffsetMs'>>;
   };
-  assert.deepEqual(recoveredJob.startedEvent.participantIds, ['1533227577286852649']);
+  assert.equal(recoveredJob.schemaVersion, 3);
+  assert.deepEqual(recoveredJob.startedEvent.actors, [
+    { actorId: '1533227577286852649', kind: 'unknown' },
+    { actorId: '1533228054724346087', kind: 'automation' }
+  ]);
   assert.equal(recoveredJob.terminalEvent.type, 'meeting.ended');
   assert.match(recoveredJob.terminalEvent.reason ?? '', /restarted during an active recording/);
   recoveredJob.sourceFiles = recoveredJob.sourceFiles.map((source) => {
@@ -639,6 +664,7 @@ test('recovers the authoritative original after restart loses an incomplete live
 
   const uploads: AuthoritativeTrackMetadata[] = [];
   const readyEvents: AuthoritativeRecordingReadyEvent[] = [];
+  const readyPayloads: string[] = [];
   const lifecycleEvents: MeetingLifecycleEvent[] = [];
   const deliveryOrder: string[] = [];
   const preparedJobs: Array<{
@@ -673,6 +699,7 @@ test('recovers the authoritative original after restart loses an incomplete live
     },
     async postAuthoritativeReady(ready) {
       readyAttempts++;
+      readyPayloads.push(JSON.stringify(ready));
       deliveryOrder.push('ready');
       preparedJobs.push(JSON.parse(await readFile(path.join(outboxRoot, 'pending', 'recording-1.json'), 'utf8')) as typeof preparedJobs[number]);
       if (readyAttempts === 1) throw new Error('network reset after uploads');
@@ -688,6 +715,7 @@ test('recovers the authoritative original after restart loses an incomplete live
 
   assert.equal(await restored.drain(2000), true);
   assert.equal(readyAttempts, 2);
+  assert.equal(readyPayloads[0], readyPayloads[1]);
   assert.deepEqual(lifecycleEvents, [recoveredJob.startedEvent, recoveredJob.terminalEvent, recoveredJob.startedEvent, recoveredJob.terminalEvent]);
   assert.deepEqual(deliveryOrder, [
     'event:meeting.started',
@@ -750,10 +778,127 @@ test('recovers the authoritative original after restart loses an incomplete live
   );
   assert.equal(new Set(uploads.map(({ uploadId }) => uploadId)).size, 2);
   assert.equal(readyEvents[0]?.trackCount, 2);
+  assert.deepEqual(readyEvents[0]?.actors, recoveredJob.actors);
   assert.match(readyEvents[0]?.sourceFilesChecksumSha256 ?? '', /^[0-9a-f]{64}$/);
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), []);
   for (const [kind, contents] of Object.entries(sources))
     assert.deepEqual(await readFile(`${sourceFileBase}.${kind}`), Buffer.isBuffer(contents) ? contents : Buffer.from(contents));
+});
+
+test('migrates persisted v2 outbox jobs to v3 and delivers one stable all-v2 lifecycle', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v2-outbox-migration-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  const pendingRoot = path.join(outboxRoot, 'pending');
+  const pendingPath = path.join(pendingRoot, `${event.recordingId}.json`);
+  const legacyBotActorId = '1533228054724346087';
+  await mkdir(recordingRoot, { recursive: true });
+  await mkdir(pendingRoot, { recursive: true });
+  const sourceFiles = ['data', 'header1', 'header2', 'users', 'info', 'log'].map((kind) => ({
+    kind,
+    relativePath: `${event.recordingId}.ogg.${kind}`,
+    checksumSha256: createHash('sha256').update(kind).digest('hex'),
+    sizeBytes: kind.length
+  }));
+  await writeFile(
+    pendingPath,
+    `${JSON.stringify({
+      schemaVersion: 2,
+      publicationId: `authoritative-recording:v1:${event.recordingId}`,
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      startedEvent: {
+        ...event,
+        schemaVersion: 1,
+        actors: undefined,
+        participantIds: [event.actors[0].actorId]
+      },
+      terminalEvent: { ...terminalEvent, schemaVersion: 1 },
+      sourceFiles,
+      authoritativeTracks: [
+        { speakerId: event.actors[0].actorId, trackNumber: 1, timelineOffsetMs: 1200 },
+        { speakerId: legacyBotActorId, trackNumber: 2, timelineOffsetMs: 1200 }
+      ],
+      authoritativeTimelineBasis: 'craig-cook-shared-origin-v1'
+    })}\n`
+  );
+
+  const lifecyclePayloads: string[] = [];
+  const readyPayloads: string[] = [];
+  const migratedJobs: string[] = [];
+  const migrationErrors: string[] = [];
+  let readyAttempts = 0;
+  const sink = new BoundedMeetingIntegrationSink(
+    {
+      async post(_requestPath, body) {
+        lifecyclePayloads.push(JSON.stringify(body));
+      },
+      async postAuthoritativeTrack() {},
+      async postAuthoritativeReady(ready) {
+        readyPayloads.push(JSON.stringify(ready));
+        migratedJobs.push(await readFile(pendingPath, 'utf8'));
+        readyAttempts++;
+        if (readyAttempts === 1) throw new Error('synthetic retry after durable v2 migration');
+      }
+    },
+    { debug: () => {}, warn: () => {}, error: (message, error) => migrationErrors.push(`${message}: ${String(error)}`) },
+    4,
+    2,
+    1024,
+    {
+      recordingRoot,
+      outboxRoot,
+      cooker: {
+        async cook(recordingId, trackNumber) {
+          const filePath = path.join(root, `${recordingId}-${trackNumber}-${readyAttempts}.ogg`);
+          const bytes = Buffer.from(`OggS-${trackNumber}`);
+          await writeFile(filePath, bytes);
+          return {
+            filePath,
+            checksumSha256: createHash('sha256').update(bytes).digest('hex'),
+            sizeBytes: bytes.byteLength,
+            dispose: async () => unlink(filePath).catch(() => undefined)
+          };
+        }
+      }
+    }
+  );
+  await sink.restoreOriginalRecordingJobs();
+
+  assert.equal(await sink.drain(2000), true);
+  assert.equal(readyAttempts, 2, migrationErrors.join('\n'));
+  assert.equal(lifecyclePayloads[0], lifecyclePayloads[2]);
+  assert.equal(lifecyclePayloads[1], lifecyclePayloads[3]);
+  assert.equal(readyPayloads[0], readyPayloads[1]);
+  assert.equal(migratedJobs[0], migratedJobs[1]);
+  const migrated = JSON.parse(migratedJobs[0]) as {
+    schemaVersion: number;
+    publicationId: string;
+    migratedFromOutboxSchemaVersion: number;
+    startedEvent: MeetingStartedLifecycleEvent;
+    terminalEvent: MeetingTerminalLifecycleEvent;
+    actors: Array<{ actorId: string; kind: string }>;
+  };
+  assert.equal(migrated.schemaVersion, 3);
+  assert.equal(migrated.publicationId, `authoritative-recording:v2:${event.recordingId}`);
+  assert.equal(migrated.migratedFromOutboxSchemaVersion, 2);
+  assert.equal(migrated.startedEvent.eventId, event.eventId);
+  assert.equal(migrated.terminalEvent.eventId, terminalEvent.eventId);
+  assert.deepEqual(migrated.startedEvent.actors, [
+    { actorId: event.actors[0].actorId, kind: 'unknown' },
+    { actorId: legacyBotActorId, kind: 'unknown' }
+  ]);
+  assert.deepEqual(migrated.actors, migrated.startedEvent.actors);
+  for (const payload of [...lifecyclePayloads, ...readyPayloads]) assert.equal(JSON.parse(payload).schemaVersion, 2);
+  const ready = JSON.parse(readyPayloads[0]) as AuthoritativeRecordingReadyEvent;
+  assert.deepEqual(ready.actors, migrated.actors);
+  assert.deepEqual(
+    ready.actors.map(({ actorId }) => actorId),
+    [event.actors[0].actorId, legacyBotActorId]
+  );
+  assert.deepEqual(await readdir(pendingRoot), []);
 });
 
 test('rejects legacy outbox jobs without deleting original Craig files', async (context) => {
@@ -784,6 +929,42 @@ test('rejects legacy outbox jobs without deleting original Craig files', async (
   assert.deepEqual(await readdir(pendingRoot), []);
   assert.deepEqual(await readdir(path.join(outboxRoot, 'rejected')), ['recording-legacy.json']);
   assert.equal(await readFile(originalPath, 'utf8'), 'authoritative-original');
+});
+
+test('accepts an exact durable retry and rejects duplicate actor and kind-changing publications', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v2-outbox-identity-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  await mkdir(recordingRoot, { recursive: true });
+  const sourceFileBase = path.join(recordingRoot, `${event.recordingId}.ogg`);
+  const sink = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, {
+    recordingRoot,
+    outboxRoot
+  });
+  const publication = { startedEvent: event, terminalEvent, actors: event.actors, sourceFileBase };
+
+  assert.equal(await sink.publishOriginalRecording(publication), true);
+  const persistedPath = path.join(outboxRoot, 'pending', `${event.recordingId}.json`);
+  const persisted = await readFile(persistedPath, 'utf8');
+  assert.equal(await sink.publishOriginalRecording(publication), true);
+  assert.equal(await readFile(persistedPath, 'utf8'), persisted);
+  assert.equal(
+    await sink.publishOriginalRecording({
+      ...publication,
+      startedEvent: { ...event, actors: [{ actorId: packet.speakerId, kind: 'unknown' }] },
+      actors: [{ actorId: packet.speakerId, kind: 'unknown' }]
+    }),
+    false
+  );
+  assert.equal(
+    await sink.publishOriginalRecording({
+      ...publication,
+      actors: [...event.actors, event.actors[0]]
+    }),
+    false
+  );
+  assert.equal(await readFile(persistedPath, 'utf8'), persisted);
 });
 
 test('rejects a corrupt first original job without blocking the next recording', async (context) => {
@@ -829,6 +1010,7 @@ test('rejects a corrupt first original job without blocking the next recording',
     await staging.publishOriginalRecording({
       startedEvent: event,
       terminalEvent,
+      actors: event.actors,
       sourceFileBase: corruptBase
     }),
     true
@@ -837,6 +1019,7 @@ test('rejects a corrupt first original job without blocking the next recording',
     await staging.publishOriginalRecording({
       startedEvent: secondStarted,
       terminalEvent: secondTerminal,
+      actors: secondStarted.actors,
       sourceFileBase: validBase
     }),
     true
@@ -883,7 +1066,7 @@ test('rejects a corrupt first original job without blocking the next recording',
   assert.deepEqual(await readFile(`${corruptBase}.data`), rawOggPage(48_000, 1, 2, Buffer.from([0xf8, 0xff, 0xfe])));
 });
 
-test('permanently rejects malformed and truncated raw Ogg data without touching originals', async (context) => {
+test('rejects malformed raw data and authoritative tracks whose actor is absent without touching originals', async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), 'craig-invalid-ogg-outbox-test-'));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const recordingRoot = path.join(root, 'recordings');
@@ -898,7 +1081,8 @@ test('permanently rejects malformed and truncated raw Ogg data without touching 
     {
       recordingId: 'recording-truncated',
       data: complete.subarray(0, complete.byteLength - 1)
-    }
+    },
+    { recordingId: 'recording-unrostered-actor', data: complete, speakerId: '1533228590643155035' }
   ];
 
   const staging = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, {
@@ -912,7 +1096,7 @@ test('permanently rejects malformed and truncated raw Ogg data without touching 
         data: invalid.data,
         header1: Buffer.from('original-header-1'),
         header2: Buffer.from('original-header-2'),
-        users: '"0":{}\n,"1":{"id":"1533227577286852649"}\n',
+        users: `"0":{}\n,"1":{"id":"${invalid.speakerId ?? packet.speakerId}"}\n`,
         info: '{"format":1}',
         log: 'closed\n'
       }).map(([kind, contents]) => writeFile(`${sourceFileBase}.${kind}`, contents))
@@ -931,6 +1115,7 @@ test('permanently rejects malformed and truncated raw Ogg data without touching 
           recordingId: invalid.recordingId,
           occurredAt: `2026-08-02T00:0${index + 2}:30.000Z`
         },
+        actors: event.actors,
         sourceFileBase
       }),
       true
@@ -964,7 +1149,11 @@ test('permanently rejects malformed and truncated raw Ogg data without touching 
   assert.equal(await restored.drain(2000), true);
   assert.equal(cookCalls, 0);
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), []);
-  assert.deepEqual(await readdir(path.join(outboxRoot, 'rejected')), ['recording-bad-crc.json', 'recording-truncated.json']);
+  assert.deepEqual(await readdir(path.join(outboxRoot, 'rejected')), [
+    'recording-bad-crc.json',
+    'recording-truncated.json',
+    'recording-unrostered-actor.json'
+  ]);
   for (const invalid of invalidRecordings)
     assert.deepEqual(await readFile(path.join(recordingRoot, `${invalid.recordingId}.ogg.data`)), invalid.data);
 });

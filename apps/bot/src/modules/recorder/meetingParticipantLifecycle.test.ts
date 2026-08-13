@@ -10,7 +10,7 @@ test('folds a participant join during startup into meeting.started without an ea
   const lifecycle = new MeetingParticipantLifecycle();
 
   assert.equal(lifecycle.observe(participantId, true), null);
-  assert.deepEqual(lifecycle.begin([], botId), [participantId]);
+  assert.deepEqual(lifecycle.begin([]), [participantId]);
   assert.equal(lifecycle.observe(participantId, false), 'participant.left');
 });
 
@@ -18,7 +18,7 @@ test('applies pre-start presence over a stale channel snapshot and emits later d
   const lifecycle = new MeetingParticipantLifecycle();
 
   assert.equal(lifecycle.observe(participantId, false), null);
-  assert.deepEqual(lifecycle.begin([botId, participantId], botId), []);
+  assert.deepEqual(lifecycle.begin([participantId]), []);
   assert.equal(lifecycle.observe(participantId, true), 'participant.joined');
   assert.equal(lifecycle.observe(participantId, true), null);
 });

@@ -1,0 +1,100 @@
+{
+  "bundleVersion": 1,
+  "contract": "craig-lifecycle-v2",
+  "events": [
+    {
+      "schemaVersion": 2,
+      "eventId": "synthetic-recording:1",
+      "recordingId": "synthetic-recording",
+      "guildId": "1533228590643155034",
+      "channelId": "1533228823045214398",
+      "occurredAt": "2026-08-13T00:00:00.000Z",
+      "type": "meeting.started",
+      "actors": [
+        { "actorId": "1533227577286852649", "kind": "human" },
+        { "actorId": "1533228054724346087", "kind": "automation" },
+        { "actorId": "1533228590643155035", "kind": "unknown" }
+      ]
+    },
+    {
+      "schemaVersion": 2,
+      "eventId": "synthetic-recording:2",
+      "recordingId": "synthetic-recording",
+      "guildId": "1533228590643155034",
+      "channelId": "1533228823045214398",
+      "occurredAt": "2026-08-13T00:00:01.000Z",
+      "type": "participant.joined",
+      "actor": { "actorId": "1533228590643155036", "kind": "automation" }
+    },
+    {
+      "schemaVersion": 2,
+      "eventId": "synthetic-recording:3",
+      "recordingId": "synthetic-recording",
+      "guildId": "1533228590643155034",
+      "channelId": "1533228823045214398",
+      "occurredAt": "2026-08-13T00:00:02.000Z",
+      "type": "participant.left",
+      "actor": { "actorId": "1533228590643155035", "kind": "unknown" }
+    },
+    {
+      "schemaVersion": 2,
+      "eventId": "synthetic-recording:4",
+      "recordingId": "synthetic-recording",
+      "guildId": "1533228590643155034",
+      "channelId": "1533228823045214398",
+      "occurredAt": "2026-08-13T00:00:03.000Z",
+      "type": "meeting.connection_lost",
+      "reason": "synthetic reconnect"
+    },
+    {
+      "schemaVersion": 2,
+      "eventId": "synthetic-recording:5",
+      "recordingId": "synthetic-recording",
+      "guildId": "1533228590643155034",
+      "channelId": "1533228823045214398",
+      "occurredAt": "2026-08-13T00:00:04.000Z",
+      "type": "meeting.connection_recovered",
+      "reason": null
+    },
+    {
+      "schemaVersion": 2,
+      "eventId": "synthetic-recording:6",
+      "recordingId": "synthetic-recording",
+      "guildId": "1533228590643155034",
+      "channelId": "1533228823045214398",
+      "occurredAt": "2026-08-13T00:01:00.000Z",
+      "type": "meeting.ended",
+      "reason": null
+    },
+    {
+      "schemaVersion": 2,
+      "eventId": "synthetic-recording:authoritative-ready:v2",
+      "recordingId": "synthetic-recording",
+      "guildId": "1533228590643155034",
+      "channelId": "1533228823045214398",
+      "occurredAt": "2026-08-13T00:01:00.000Z",
+      "type": "recording.authoritative_ready",
+      "actors": [
+        { "actorId": "1533227577286852649", "kind": "human" },
+        { "actorId": "1533228054724346087", "kind": "automation" },
+        { "actorId": "1533228590643155035", "kind": "unknown" },
+        { "actorId": "1533228590643155036", "kind": "automation" }
+      ],
+      "endedAt": "2026-08-13T00:01:00.000Z",
+      "trackCount": 4,
+      "sourceFilesChecksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "authoritativeTrackActorIds": [
+    "1533227577286852649",
+    "1533228054724346087",
+    "1533228590643155035",
+    "1533228590643155036"
+  ],
+  "identityLabels": {
+    "1533227577286852649": "synthetic-human",
+    "1533228054724346087": "synthetic-Botik-and-Craig-recorder",
+    "1533228590643155035": "synthetic-partial-member",
+    "1533228590643155036": "synthetic-application"
+  }
+}
