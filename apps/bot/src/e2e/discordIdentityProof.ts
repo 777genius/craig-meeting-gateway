@@ -1,9 +1,14 @@
 import { timingSafeEqual } from 'node:crypto';
-import { readFile, stat } from 'node:fs/promises';
+import type { BigIntStats } from 'node:fs';
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
 
 const DISCORD_API_ORIGIN = 'https://discord.com/api/v10';
 const SNOWFLAKE = /^\d{17,20}$/;
 const MAX_CHANNELS = 16;
+const MAX_SECRET_BYTES = 256;
+const MAX_DISCORD_BODY_BYTES = 16 * 1024;
+const DEFAULT_PROOF_TIMEOUT_MS = 10_000;
 
 export type SecretSnapshot = {
   content: Buffer;
@@ -20,6 +25,8 @@ export type SecretSnapshot = {
 export type DiscordIdentityProofDependencies = {
   readSecret?: (path: string) => Promise<SecretSnapshot>;
   fetch?: typeof globalThis.fetch;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 };
 
 export type DiscordIdentityProof = {
@@ -37,27 +44,54 @@ export class DiscordIdentityProofError extends Error {
   }
 }
 
-async function readSecretSnapshot(path: string): Promise<SecretSnapshot> {
-  const before = await stat(path, { bigint: true });
-  if (!before.isFile()) throw new DiscordIdentityProofError('secret_not_regular_file');
-  const content = await readFile(path);
-  const after = await stat(path, { bigint: true });
-  const snapshot = (metadata: typeof before): SecretSnapshot => ({
+function snapshot(content: Buffer, metadata: BigIntStats): SecretSnapshot {
+  return {
     content,
     device: metadata.dev,
     inode: metadata.ino,
-    mode: Number(metadata.mode & 0o777n),
+    mode: Number(metadata.mode & 0o7777n),
     uid: Number(metadata.uid),
     gid: Number(metadata.gid),
     size: metadata.size,
     modifiedNs: metadata.mtimeNs,
     changedNs: metadata.ctimeNs
-  });
-  const beforeSnapshot = snapshot(before);
-  const afterSnapshot = snapshot(after);
-  if (!sameGeneration(beforeSnapshot, afterSnapshot) || BigInt(content.length) !== after.size)
-    throw new DiscordIdentityProofError('secret_changed_during_read');
-  return afterSnapshot;
+  };
+}
+
+export async function readDiscordBotSecretSnapshot(path: string): Promise<SecretSnapshot> {
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    throw new DiscordIdentityProofError('secret_open_failed');
+  }
+
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) throw new DiscordIdentityProofError('secret_not_regular_file');
+    if (before.size < 1n || before.size > BigInt(MAX_SECRET_BYTES)) throw new DiscordIdentityProofError('invalid_secret_size');
+
+    const content = Buffer.alloc(Number(before.size));
+    let offset = 0;
+    while (offset < content.length) {
+      const { bytesRead } = await handle.read(content, offset, content.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    const overflow = Buffer.alloc(1);
+    const { bytesRead: overflowBytes } = await handle.read(overflow, 0, 1, offset);
+    const after = await handle.stat({ bigint: true });
+    const beforeSnapshot = snapshot(content, before);
+    const afterSnapshot = snapshot(content, after);
+    if (offset !== content.length || overflowBytes !== 0 || !sameGeneration(beforeSnapshot, afterSnapshot))
+      throw new DiscordIdentityProofError('secret_changed_during_read');
+    return afterSnapshot;
+  } catch (error) {
+    if (error instanceof DiscordIdentityProofError) throw error;
+    throw new DiscordIdentityProofError('secret_read_failed');
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }
 
 function exactSnowflake(name: string, value: string | undefined): string {
@@ -77,7 +111,7 @@ function exactChannelIds(value: string | undefined): string[] {
 
 function assertCustody(secret: SecretSnapshot): void {
   if (secret.uid !== 10001 || secret.gid !== 10001 || secret.mode !== 0o400) throw new DiscordIdentityProofError('invalid_secret_custody');
-  if (secret.content.length < 20 || secret.content.length > 256) throw new DiscordIdentityProofError('invalid_secret_size');
+  if (secret.content.length < 20 || secret.content.length > MAX_SECRET_BYTES) throw new DiscordIdentityProofError('invalid_secret_size');
 }
 
 function sameGeneration(left: SecretSnapshot, right: SecretSnapshot): boolean {
@@ -98,16 +132,101 @@ function sameContent(left: Buffer, right: Buffer): boolean {
   return timingSafeEqual(left, right);
 }
 
-async function discordGet(fetcher: typeof globalThis.fetch, path: string, token: string): Promise<Record<string, unknown>> {
-  const response = await fetcher(`${DISCORD_API_ORIGIN}${path}`, {
-    headers: { authorization: `Bot ${token}`, accept: 'application/json' },
-    redirect: 'error',
-    signal: AbortSignal.timeout(10_000)
+async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
   });
-  if (!response.ok) throw new DiscordIdentityProofError(`discord_http_${response.status}`);
-  const body: unknown = await response.json();
+}
+
+async function readBoundedJson(response: Response, signal: AbortSignal): Promise<Record<string, unknown>> {
+  const declaredLength = response.headers.get('content-length');
+  if (declaredLength !== null) {
+    const length = Number(declaredLength);
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_DISCORD_BODY_BYTES)
+      throw new DiscordIdentityProofError('discord_response_too_large');
+  }
+  if (!response.body) throw new DiscordIdentityProofError('invalid_discord_response');
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    let done = false;
+    while (!done) {
+      if (signal.aborted) throw signal.reason;
+      const result = await abortable(reader.read(), signal);
+      done = result.done;
+      if (done) break;
+      const value = result.value;
+      if (!value) throw new DiscordIdentityProofError('invalid_discord_response');
+      length += value.byteLength;
+      if (length > MAX_DISCORD_BODY_BYTES) throw new DiscordIdentityProofError('discord_response_too_large');
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch {
+    throw new DiscordIdentityProofError('invalid_discord_response');
+  }
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new DiscordIdentityProofError('invalid_discord_response');
   return body as Record<string, unknown>;
+}
+
+async function discordGet(fetcher: typeof globalThis.fetch, path: string, token: string, signal: AbortSignal): Promise<Record<string, unknown>> {
+  try {
+    const response = await abortable(
+      fetcher(`${DISCORD_API_ORIGIN}${path}`, {
+        headers: { authorization: `Bot ${token}`, accept: 'application/json' },
+        redirect: 'error',
+        signal
+      }),
+      signal
+    );
+    if (!response.ok) throw new DiscordIdentityProofError(`discord_http_${response.status}`);
+    return await readBoundedJson(response, signal);
+  } catch (error) {
+    if (signal.aborted && signal.reason instanceof DiscordIdentityProofError) throw signal.reason;
+    if (error instanceof DiscordIdentityProofError) throw error;
+    throw new DiscordIdentityProofError('discord_request_failed');
+  }
+}
+
+function proofSignal(
+  externalSignal: AbortSignal | undefined,
+  timeoutMs: number
+): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw new DiscordIdentityProofError('invalid_proof_timeout');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new DiscordIdentityProofError('proof_timeout')), timeoutMs);
+  timeout.unref();
+  const onAbort = () => controller.abort(new DiscordIdentityProofError('proof_cancelled'));
+  if (externalSignal?.aborted) onAbort();
+  else externalSignal?.addEventListener('abort', onAbort, { once: true });
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout);
+      externalSignal?.removeEventListener('abort', onAbort);
+    }
+  };
 }
 
 export async function createDiscordIdentityProof(
@@ -121,35 +240,40 @@ export async function createDiscordIdentityProof(
   const secretPath = environment.DISCORD_BOT_TOKEN_FILE || '/run/secrets/discord_bot_token';
   if (secretPath !== '/run/secrets/discord_bot_token') throw new DiscordIdentityProofError('unexpected_secret_path');
 
-  const readSecret = dependencies.readSecret || readSecretSnapshot;
-  const fetcher = dependencies.fetch || globalThis.fetch;
-  const before = await readSecret(secretPath);
-  assertCustody(before);
-  const token = before.content.toString('utf8').trim();
-  if (!token || /[\r\n\0]/.test(token)) throw new DiscordIdentityProofError('invalid_secret_content');
+  const deadline = proofSignal(dependencies.signal, dependencies.timeoutMs ?? DEFAULT_PROOF_TIMEOUT_MS);
+  try {
+    const readSecret = dependencies.readSecret || readDiscordBotSecretSnapshot;
+    const fetcher = dependencies.fetch || globalThis.fetch;
+    const before = await abortable(readSecret(secretPath), deadline.signal);
+    assertCustody(before);
+    const token = before.content.toString('utf8').trim();
+    if (!token || /[\r\n\0]/.test(token)) throw new DiscordIdentityProofError('invalid_secret_content');
 
-  const self = await discordGet(fetcher, '/users/@me', token);
-  if (!SNOWFLAKE.test(String(self.id || '')) || self.bot !== true) throw new DiscordIdentityProofError('identity_is_not_bot');
-  if (self.id !== applicationId) throw new DiscordIdentityProofError('application_identity_mismatch');
+    const self = await discordGet(fetcher, '/users/@me', token, deadline.signal);
+    if (!SNOWFLAKE.test(String(self.id || '')) || self.bot !== true) throw new DiscordIdentityProofError('identity_is_not_bot');
+    if (self.id !== applicationId) throw new DiscordIdentityProofError('application_identity_mismatch');
 
-  const guild = await discordGet(fetcher, `/guilds/${guildId}`, token);
-  if (guild.id !== guildId) throw new DiscordIdentityProofError('guild_identity_mismatch');
+    const guild = await discordGet(fetcher, `/guilds/${guildId}`, token, deadline.signal);
+    if (guild.id !== guildId) throw new DiscordIdentityProofError('guild_identity_mismatch');
 
-  for (const channelId of channelIds) {
-    const channel = await discordGet(fetcher, `/channels/${channelId}`, token);
-    if (channel.id !== channelId || channel.guild_id !== guildId) throw new DiscordIdentityProofError('channel_identity_mismatch');
+    for (const channelId of channelIds) {
+      const channel = await discordGet(fetcher, `/channels/${channelId}`, token, deadline.signal);
+      if (channel.id !== channelId || channel.guild_id !== guildId) throw new DiscordIdentityProofError('channel_identity_mismatch');
+    }
+
+    const after = await abortable(readSecret(secretPath), deadline.signal);
+    assertCustody(after);
+    if (!sameGeneration(before, after) || !sameContent(before.content, after.content))
+      throw new DiscordIdentityProofError('secret_changed_during_proof');
+
+    return {
+      schemaVersion: 1,
+      ok: true,
+      bot: { id: String(self.id), bot: true },
+      target: { testOnly: true, guildId, channelIds },
+      secret: { path: '/run/secrets/discord_bot_token', uid: 10001, gid: 10001, mode: '0400', stable: true }
+    };
+  } finally {
+    deadline.dispose();
   }
-
-  const after = await readSecret(secretPath);
-  assertCustody(after);
-  if (!sameGeneration(before, after) || !sameContent(before.content, after.content))
-    throw new DiscordIdentityProofError('secret_changed_during_proof');
-
-  return {
-    schemaVersion: 1,
-    ok: true,
-    bot: { id: String(self.id), bot: true },
-    target: { testOnly: true, guildId, channelIds },
-    secret: { path: '/run/secrets/discord_bot_token', uid: 10001, gid: 10001, mode: '0400', stable: true }
-  };
 }

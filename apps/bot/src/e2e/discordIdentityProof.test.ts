@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { createDiscordIdentityProof, DiscordIdentityProofError, SecretSnapshot } from './discordIdentityProof';
+import { createDiscordIdentityProof, DiscordIdentityProofError, readDiscordBotSecretSnapshot, SecretSnapshot } from './discordIdentityProof';
+import { runDiscordIdentityProofCommand } from './discordIdentityProofCommand';
 
 const guildId = '1533228590643155034';
 const channelIds = ['1533228823045214398', '1533228823045214399'];
@@ -100,6 +104,43 @@ test('rejects incorrect secret custody before sending a credential', async () =>
   assert.equal(called, false);
 });
 
+test('opens the real secret without following symlinks and bounds reads to 256 bytes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'craig-identity-proof-'));
+  const secret = join(directory, 'secret');
+  const link = join(directory, 'link');
+  try {
+    await writeFile(secret, Buffer.alloc(257, 0x61), { mode: 0o400 });
+    await symlink(secret, link);
+    await assert.rejects(
+      readDiscordBotSecretSnapshot(link),
+      (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'secret_open_failed'
+    );
+    await assert.rejects(
+      readDiscordBotSecretSnapshot(secret),
+      (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'invalid_secret_size'
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('real filesystem snapshot preserves special permission bits for exact custody rejection', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'craig-identity-proof-'));
+  const secret = join(directory, 'secret');
+  try {
+    await writeFile(secret, token, { mode: 0o400 });
+    await chmod(secret, 0o4400);
+    const actual = await readDiscordBotSecretSnapshot(secret);
+    assert.equal(actual.mode, 0o4400);
+    await assert.rejects(
+      createDiscordIdentityProof(environment, { readSecret: async () => actual, fetch: async () => new Response('{}') }),
+      (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'invalid_secret_custody'
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('rejects a valid bot token for a different configured application', async () => {
   const fetcher: typeof fetch = async () => new Response(JSON.stringify({ id: '1533224474609057999', bot: true }));
 
@@ -137,4 +178,80 @@ test('rejects a channel outside the declared private test guild', async () => {
     createDiscordIdentityProof(environment, { readSecret: async () => snapshot(), fetch: fetcher }),
     (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'channel_identity_mismatch'
   );
+});
+
+test('rejects oversized Discord bodies from content-length and streaming limits', async () => {
+  const declared: typeof fetch = async () => new Response('{}', { headers: { 'content-length': '16385' } });
+  await assert.rejects(
+    createDiscordIdentityProof(environment, { readSecret: async () => snapshot(), fetch: declared }),
+    (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'discord_response_too_large'
+  );
+
+  const streaming: typeof fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(16_385));
+          controller.close();
+        }
+      })
+    );
+  await assert.rejects(
+    createDiscordIdentityProof(environment, { readSecret: async () => snapshot(), fetch: streaming }),
+    (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'discord_response_too_large'
+  );
+});
+
+test('one total proof deadline is propagated to and cancels a pending request', async () => {
+  let receivedSignal: AbortSignal | undefined;
+  const pending: typeof fetch = async (_input, init) => {
+    receivedSignal = init?.signal || undefined;
+    return await new Promise<Response>((_resolve, reject) => {
+      receivedSignal?.addEventListener('abort', () => reject(receivedSignal?.reason), { once: true });
+    });
+  };
+
+  await assert.rejects(
+    createDiscordIdentityProof(environment, { readSecret: async () => snapshot(), fetch: pending, timeoutMs: 10 }),
+    (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'proof_timeout'
+  );
+  assert.equal(receivedSignal?.aborted, true);
+});
+
+test('one total proof deadline also cancels a stalled response body', async () => {
+  const stalled: typeof fetch = async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{'));
+        }
+      })
+    );
+
+  await assert.rejects(
+    createDiscordIdentityProof(environment, { readSecret: async () => snapshot(), fetch: stalled, timeoutMs: 10 }),
+    (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'proof_timeout'
+  );
+});
+
+test('command emits exactly one canonical bounded JSON line for filesystem failures', async () => {
+  const lines: string[] = [];
+  const exitCode = await runDiscordIdentityProofCommand(
+    environment,
+    (line) => lines.push(line),
+    async () => {
+      throw new DiscordIdentityProofError('secret_open_failed');
+    }
+  );
+
+  assert.equal(exitCode, 1);
+  assert.deepEqual(lines, ['{"schemaVersion":1,"ok":false,"code":"secret_open_failed"}\n']);
+  assert.ok(lines[0].length < 128);
+});
+
+test('entrypoint delegates proof failures directly to the canonical CLI', async () => {
+  const entrypoint = await readFile(join(process.cwd(), 'deploy/meeting/entrypoint.sh'), 'utf8');
+  const proofCase = entrypoint.match(/discord-identity-proof\)\n([\s\S]*?)\n {4};;/)?.[1] || '';
+  assert.doesNotMatch(proofCase, /require_secret_file|echo|stderr/);
+  assert.match(proofCase, /exec node .*discordIdentityProofCli\.js/);
 });

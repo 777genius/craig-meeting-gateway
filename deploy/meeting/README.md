@@ -36,7 +36,7 @@ No browser login is needed after the official bot token has been mounted. The Di
 
 The image contains a one-shot, test-only identity proof. It reads the token only from `/run/secrets/discord_bot_token`, verifies exact UID/GID `10001:10001` and mode `0400`, calls Discord API v10 for `/users/@me`, requires that identity to match `DISCORD_APPLICATION_ID`, checks the declared private guild and each declared test channel, then rereads the secret and timing-safe compares its content and file generation. The token never appears in output.
 
-Set `CRAIG_E2E_TEST_ONLY=true`, `CRAIG_E2E_DISCORD_GUILD_ID` to the exact private test guild snowflake, and `CRAIG_E2E_DISCORD_CHANNEL_IDS` to one to sixteen exact comma-separated test channel snowflakes. Run the one-shot command only in that test deployment:
+Set `CRAIG_E2E_TEST_ONLY=true`, `CRAIG_E2E_DISCORD_GUILD_ID` to the exact private test guild snowflake, and `CRAIG_E2E_DISCORD_CHANNEL_IDS` to one to sixteen exact comma-separated test channel snowflakes. These IDs are an integration-owned allowlist: pin them in the test deployment configuration, review changes to them, and never populate them dynamically from Discord discovery. Run the one-shot command only in that test deployment:
 
 ```sh
 docker compose --env-file deploy/meeting/.env -f deploy/meeting/compose.yaml run --rm \

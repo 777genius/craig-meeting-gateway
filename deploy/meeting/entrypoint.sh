@@ -42,7 +42,6 @@ case "${1:-bot}" in
     exec node --require=/app/deploy/meeting/node24-compat.cjs --enable-source-maps /app/apps/bot/dist/index.js
     ;;
   discord-identity-proof)
-    require_secret_file "${DISCORD_BOT_TOKEN_FILE:-/run/secrets/discord_bot_token}" "Discord bot token"
     exec node --enable-source-maps /app/apps/bot/dist/e2e/discordIdentityProofCli.js
     ;;
   *)
