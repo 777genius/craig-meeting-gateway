@@ -234,6 +234,58 @@ test('one total proof deadline also cancels a stalled response body', async () =
   );
 });
 
+test('stalled read with never-settling cancellation cannot hold proof or CLI past the total deadline', async () => {
+  let cancelCalled = false;
+  const stalled: typeof fetch = async () =>
+    new Response(
+      new ReadableStream({
+        pull: () => new Promise<void>(() => undefined),
+        cancel: () => {
+          cancelCalled = true;
+          return new Promise<void>(() => undefined);
+        }
+      })
+    );
+
+  const startedAt = Date.now();
+  const lines: string[] = [];
+  const exitCode = await runDiscordIdentityProofCommand(
+    environment,
+    (line) => lines.push(line),
+    (commandEnvironment) => createDiscordIdentityProof(commandEnvironment, { readSecret: async () => snapshot(), fetch: stalled, timeoutMs: 10 })
+  );
+
+  assert.equal(exitCode, 1);
+  assert.ok(Date.now() - startedAt < 1_000);
+  assert.equal(cancelCalled, true);
+  assert.deepEqual(lines, ['{"schemaVersion":1,"ok":false,"code":"proof_timeout"}\n']);
+});
+
+test('non-2xx responses terminate stalled bodies and abort the request lifecycle', async () => {
+  let cancelCalled = false;
+  let requestSignal: AbortSignal | undefined;
+  const rejected: typeof fetch = async (_input, init) => {
+    requestSignal = init?.signal || undefined;
+    return new Response(
+      new ReadableStream({
+        pull: () => new Promise<void>(() => undefined),
+        cancel: () => {
+          cancelCalled = true;
+          return new Promise<void>(() => undefined);
+        }
+      }),
+      { status: 401 }
+    );
+  };
+
+  await assert.rejects(
+    createDiscordIdentityProof(environment, { readSecret: async () => snapshot(), fetch: rejected }),
+    (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'discord_http_401'
+  );
+  assert.equal(cancelCalled, true);
+  assert.equal(requestSignal?.aborted, true);
+});
+
 test('command emits exactly one canonical bounded JSON line for filesystem failures', async () => {
   const lines: string[] = [];
   const exitCode = await runDiscordIdentityProofCommand(

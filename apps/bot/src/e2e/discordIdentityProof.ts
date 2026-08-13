@@ -137,8 +137,27 @@ async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise
   return await new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(signal.reason);
     signal.addEventListener('abort', onAbort, { once: true });
-    operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    operation.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    );
   });
+}
+
+function cancelBody(body: ReadableStream<Uint8Array> | null, reader?: ReadableStreamDefaultReader<Uint8Array>): void {
+  let cancellation: Promise<void>;
+  try {
+    cancellation = reader ? reader.cancel() : body ? body.cancel() : Promise.resolve();
+  } catch {
+    return;
+  }
+  void cancellation.catch(() => undefined);
 }
 
 async function readBoundedJson(response: Response, signal: AbortSignal): Promise<Record<string, unknown>> {
@@ -167,7 +186,7 @@ async function readBoundedJson(response: Response, signal: AbortSignal): Promise
       chunks.push(value);
     }
   } finally {
-    await reader.cancel().catch(() => undefined);
+    cancelBody(response.body, reader);
   }
 
   const bytes = new Uint8Array(length);
@@ -197,7 +216,10 @@ async function discordGet(fetcher: typeof globalThis.fetch, path: string, token:
       }),
       signal
     );
-    if (!response.ok) throw new DiscordIdentityProofError(`discord_http_${response.status}`);
+    if (!response.ok) {
+      cancelBody(response.body);
+      throw new DiscordIdentityProofError(`discord_http_${response.status}`);
+    }
     return await readBoundedJson(response, signal);
   } catch (error) {
     if (signal.aborted && signal.reason instanceof DiscordIdentityProofError) throw signal.reason;
@@ -225,6 +247,7 @@ function proofSignal(
     dispose: () => {
       clearTimeout(timeout);
       externalSignal?.removeEventListener('abort', onAbort);
+      if (!controller.signal.aborted) controller.abort(new DiscordIdentityProofError('proof_finished'));
     }
   };
 }
