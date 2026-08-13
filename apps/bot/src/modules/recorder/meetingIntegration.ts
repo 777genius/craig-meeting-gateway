@@ -7,7 +7,7 @@ import path from 'node:path';
 import fetch, { type Response } from 'node-fetch';
 
 import crc32 from './crc32';
-import { compareOpaqueDiscordIds, type MeetingActor, RecordingActorRegistry, validateActorRoster } from './meetingActorIdentity';
+import { type MeetingActor, compareOpaqueDiscordIds, RecordingActorRegistry, validateActorRoster } from './meetingActorIdentity';
 
 const sourceFileKinds = ['data', 'header1', 'header2', 'users', 'info', 'log'] as const;
 const maximumCookedTrackBytes = 64 * 1024 * 1024;
@@ -766,19 +766,21 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       }
     }
 
-    await this.transport.postAuthoritativeReady!(parseAuthoritativeRecordingReadyEventV2({
-      schemaVersion: 2,
-      eventId: `${job.recordingId}:authoritative-ready:v2`,
-      recordingId: job.recordingId,
-      guildId: job.guildId,
-      channelId: job.channelId,
-      occurredAt: job.terminalEvent.occurredAt,
-      type: 'recording.authoritative_ready',
-      actors: job.actors,
-      endedAt: job.terminalEvent.occurredAt,
-      trackCount: job.authoritativeTracks.length,
-      sourceFilesChecksumSha256: sourceFilesChecksum(job.sourceFiles)
-    }));
+    await this.transport.postAuthoritativeReady!(
+      parseAuthoritativeRecordingReadyEventV2({
+        schemaVersion: 2,
+        eventId: `${job.recordingId}:authoritative-ready:v2`,
+        recordingId: job.recordingId,
+        guildId: job.guildId,
+        channelId: job.channelId,
+        occurredAt: job.terminalEvent.occurredAt,
+        type: 'recording.authoritative_ready',
+        actors: job.actors,
+        endedAt: job.terminalEvent.occurredAt,
+        trackCount: job.authoritativeTracks.length,
+        sourceFilesChecksumSha256: sourceFilesChecksum(job.sourceFiles)
+      })
+    );
   }
 
   private resolveSourceFile(source: OriginalRecordingSourceFileReference): string {
@@ -997,7 +999,12 @@ export function parseMeetingLifecycleEventV2(event: MeetingLifecycleEvent): Meet
     if (actors.length !== 1) throw new Error('Participant lifecycle event requires one actor');
     return Object.freeze({ ...base, actor: actors[0] });
   }
-  if (event.type === 'meeting.connection_lost' || event.type === 'meeting.connection_recovered' || event.type === 'meeting.ended' || event.type === 'meeting.aborted') {
+  if (
+    event.type === 'meeting.connection_lost' ||
+    event.type === 'meeting.connection_recovered' ||
+    event.type === 'meeting.ended' ||
+    event.type === 'meeting.aborted'
+  ) {
     if (event.reason !== null && (typeof event.reason !== 'string' || event.reason.length < 1 || event.reason.length > 256))
       throw new Error('Meeting lifecycle reason is invalid');
     return Object.freeze({ ...base, reason: event.reason });
@@ -1091,16 +1098,7 @@ function parseLifecycleEnvelope(value: unknown, expectedFields: readonly string[
 }
 
 function parseStartedLifecycleEvent(value: unknown): MeetingStartedLifecycleEvent {
-  const parsed = parseLifecycleEnvelope(value, [
-    'schemaVersion',
-    'eventId',
-    'recordingId',
-    'guildId',
-    'channelId',
-    'occurredAt',
-    'type',
-    'actors'
-  ]);
+  const parsed = parseLifecycleEnvelope(value, ['schemaVersion', 'eventId', 'recordingId', 'guildId', 'channelId', 'occurredAt', 'type', 'actors']);
   if (parsed.type !== 'meeting.started') throw new Error('Original recording outbox meeting.started event is invalid');
   const actors = validateActorRoster(parsed.actors);
   return {
@@ -1359,8 +1357,7 @@ function migrateOriginalRecordingJobV2(parsed: Record<string, unknown>): Record<
   const registry = new RecordingActorRegistry();
   for (const participantId of startedEvent.participantIds)
     if (registry.get(participantId) === undefined) registry.register({ actorId: participantId, kind: 'unknown' });
-  for (const track of tracks ?? [])
-    if (registry.get(track.speakerId) === undefined) registry.register({ actorId: track.speakerId, kind: 'unknown' });
+  for (const track of tracks ?? []) if (registry.get(track.speakerId) === undefined) registry.register({ actorId: track.speakerId, kind: 'unknown' });
   const actors = registry.roster();
   return {
     schemaVersion: 3,

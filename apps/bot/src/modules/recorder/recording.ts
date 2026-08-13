@@ -25,13 +25,13 @@ import {
 import { CraigPlaybackArbiter } from './conversationPlayback';
 import { ConversationPlaybackReconnect } from './conversationPlaybackReconnect';
 import { CraigConversationPlaybackSession, createConversationPlaybackSession } from './conversationPlaybackSession';
+import { type DiscordActorIdentity, classifyDiscordActor, RecordingActorRegistry } from './meetingActorIdentity';
 import {
   type MeetingLifecycleEvent,
   type MeetingStartedLifecycleEvent,
   type MeetingTerminalLifecycleEvent,
   MeetingTerminalLifecycle
 } from './meetingIntegration';
-import { classifyDiscordActor, type DiscordActorIdentity, RecordingActorRegistry } from './meetingActorIdentity';
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
 import { WebappClient } from './webapp';

@@ -3,7 +3,6 @@ import test from 'node:test';
 
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 
-const botId = '1533224474609057793';
 const participantId = '1533227577286852649';
 
 test('folds a participant join during startup into meeting.started without an early delta', () => {

@@ -26,24 +26,18 @@ export function compareOpaqueDiscordIds(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-export function classifyDiscordActor(
-  actorId: string,
-  identity: DiscordActorIdentity | null | undefined,
-  recorderActorId: string
-): MeetingActor {
+export function classifyDiscordActor(actorId: string, identity: DiscordActorIdentity | null | undefined, recorderActorId: string): MeetingActor {
   assertActorId(actorId);
   assertActorId(recorderActorId);
   if (actorId === recorderActorId) return Object.freeze({ actorId, kind: 'automation' });
   if (!identity) return Object.freeze({ actorId, kind: 'unknown' });
 
   const identityIds = [identity.id, identity.user?.id].filter((value): value is string => typeof value === 'string');
-  if (identityIds.length === 0 || identityIds.some((id) => id !== actorId))
-    return Object.freeze({ actorId, kind: 'unknown' });
+  if (identityIds.length === 0 || identityIds.some((id) => id !== actorId)) return Object.freeze({ actorId, kind: 'unknown' });
 
   const botSignals = [identity.bot, identity.user?.bot].filter((value): value is boolean => typeof value === 'boolean');
   if (botSignals.some(Boolean) && botSignals.some((value) => !value)) return Object.freeze({ actorId, kind: 'unknown' });
-  if (botSignals.includes(true) || typeof identity.applicationId === 'string')
-    return Object.freeze({ actorId, kind: 'automation' });
+  if (botSignals.includes(true) || typeof identity.applicationId === 'string') return Object.freeze({ actorId, kind: 'automation' });
   if (botSignals.includes(false)) return Object.freeze({ actorId, kind: 'human' });
   return Object.freeze({ actorId, kind: 'unknown' });
 }

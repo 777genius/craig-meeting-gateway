@@ -294,10 +294,7 @@ test('rejects derived traffic outside an open meeting lifecycle', async () => {
 
 test('rejects v1 lifecycle payloads instead of mixing schemas within a recording', () => {
   const sink = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 8, 2);
-  assert.throws(
-    () => sink.publishLifecycle({ ...event, schemaVersion: 1 } as unknown as MeetingLifecycleEvent),
-    /must use schema v2/
-  );
+  assert.throws(() => sink.publishLifecycle({ ...event, schemaVersion: 1 } as unknown as MeetingLifecycleEvent), /must use schema v2/);
 });
 
 test('reserves terminal capacity when lifecycle traffic reaches its bound', async () => {

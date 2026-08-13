@@ -4,13 +4,13 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { test } from 'node:test';
 
+import { compareOpaqueDiscordIds } from './meetingActorIdentity';
 import {
   type AuthoritativeRecordingReadyEvent,
   type MeetingLifecycleEvent,
   parseAuthoritativeRecordingReadyEventV2,
   parseMeetingLifecycleEventV2
 } from './meetingIntegration';
-import { compareOpaqueDiscordIds } from './meetingActorIdentity';
 
 const contractRoot = path.resolve(__dirname, '../../../../../contracts/craig-lifecycle-v2');
 
@@ -21,7 +21,7 @@ test('exports byte-pinned cross-repository lifecycle v2 schema and canonical fix
   const sums = sumsBytes.toString('utf8').trim().split('\n');
   assert.equal(sums.length, 2);
   for (const line of sums) {
-    const match = /^([0-9a-f]{64})  ([A-Za-z0-9.-]+)$/.exec(line);
+    const match = /^([0-9a-f]{64}) {2}([A-Za-z0-9.-]+)$/.exec(line);
     assert.ok(match);
     const bytes = await readFile(path.join(contractRoot, match[2]));
     assert.equal(createHash('sha256').update(bytes).digest('hex'), match[1]);

@@ -28,7 +28,13 @@ test('classifies bots, applications, Botik and the Craig recorder as automation'
 });
 
 test('classifies missing, partial, mismatched and conflicting Discord identities as unknown', () => {
-  for (const identity of [undefined, {}, { id: humanId }, { id: applicationId, bot: false }, { id: humanId, bot: false, user: { id: humanId, bot: true } }])
+  for (const identity of [
+    undefined,
+    {},
+    { id: humanId },
+    { id: applicationId, bot: false },
+    { id: humanId, bot: false, user: { id: humanId, bot: true } }
+  ])
     assert.deepEqual(classifyDiscordActor(humanId, identity, botikId), { actorId: humanId, kind: 'unknown' });
 });
 
@@ -69,11 +75,19 @@ test('sorts opaque Discord IDs deterministically without locale-sensitive compar
 
 test('rejects duplicate and conflicting actor roster entries at the contract boundary', () => {
   assert.throws(
-    () => validateActorRoster([{ actorId: humanId, kind: 'human' }, { actorId: humanId, kind: 'human' }]),
+    () =>
+      validateActorRoster([
+        { actorId: humanId, kind: 'human' },
+        { actorId: humanId, kind: 'human' }
+      ]),
     /repeats actor/
   );
   assert.throws(
-    () => validateActorRoster([{ actorId: humanId, kind: 'human' }, { actorId: humanId, kind: 'automation' }]),
+    () =>
+      validateActorRoster([
+        { actorId: humanId, kind: 'human' },
+        { actorId: humanId, kind: 'automation' }
+      ]),
     /repeats actor/
   );
 });
