@@ -61,7 +61,7 @@ function snapshot(content: Buffer, metadata: BigIntStats): SecretSnapshot {
 export async function readDiscordBotSecretSnapshot(path: string): Promise<SecretSnapshot> {
   let handle: Awaited<ReturnType<typeof open>>;
   try {
-    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch {
     throw new DiscordIdentityProofError('secret_open_failed');
   }
@@ -132,8 +132,9 @@ function sameContent(left: Buffer, right: Buffer): boolean {
   return timingSafeEqual(left, right);
 }
 
-async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+async function abortable<T>(start: () => Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) throw signal.reason;
+  const operation = start();
   return await new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(signal.reason);
     signal.addEventListener('abort', onAbort, { once: true });
@@ -176,7 +177,7 @@ async function readBoundedJson(response: Response, signal: AbortSignal): Promise
     let done = false;
     while (!done) {
       if (signal.aborted) throw signal.reason;
-      const result = await abortable(reader.read(), signal);
+      const result = await abortable(() => reader.read(), signal);
       done = result.done;
       if (done) break;
       const value = result.value;
@@ -209,11 +210,12 @@ async function readBoundedJson(response: Response, signal: AbortSignal): Promise
 async function discordGet(fetcher: typeof globalThis.fetch, path: string, token: string, signal: AbortSignal): Promise<Record<string, unknown>> {
   try {
     const response = await abortable(
-      fetcher(`${DISCORD_API_ORIGIN}${path}`, {
-        headers: { authorization: `Bot ${token}`, accept: 'application/json' },
-        redirect: 'error',
-        signal
-      }),
+      () =>
+        fetcher(`${DISCORD_API_ORIGIN}${path}`, {
+          headers: { authorization: `Bot ${token}`, accept: 'application/json' },
+          redirect: 'error',
+          signal
+        }),
       signal
     );
     if (!response.ok) {
@@ -267,7 +269,7 @@ export async function createDiscordIdentityProof(
   try {
     const readSecret = dependencies.readSecret || readDiscordBotSecretSnapshot;
     const fetcher = dependencies.fetch || globalThis.fetch;
-    const before = await abortable(readSecret(secretPath), deadline.signal);
+    const before = await abortable(() => readSecret(secretPath), deadline.signal);
     assertCustody(before);
     const token = before.content.toString('utf8').trim();
     if (!token || /[\r\n\0]/.test(token)) throw new DiscordIdentityProofError('invalid_secret_content');
@@ -284,7 +286,7 @@ export async function createDiscordIdentityProof(
       if (channel.id !== channelId || channel.guild_id !== guildId) throw new DiscordIdentityProofError('channel_identity_mismatch');
     }
 
-    const after = await abortable(readSecret(secretPath), deadline.signal);
+    const after = await abortable(() => readSecret(secretPath), deadline.signal);
     assertCustody(after);
     if (!sameGeneration(before, after) || !sameContent(before.content, after.content))
       throw new DiscordIdentityProofError('secret_changed_during_proof');

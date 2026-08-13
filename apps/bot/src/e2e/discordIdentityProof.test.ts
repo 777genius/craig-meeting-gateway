@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -124,6 +125,42 @@ test('opens the real secret without following symlinks and bounds reads to 256 b
   }
 });
 
+test('FIFO secret path cannot hold a child command open and emits one canonical line', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'craig-identity-proof-'));
+  const fifo = join(directory, 'secret-fifo');
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const mkfifo = spawn('mkfifo', [fifo], { stdio: 'ignore' });
+      mkfifo.once('error', reject);
+      mkfifo.once('exit', (code) => (code === 0 ? resolve() : reject(new Error(`mkfifo exited ${code}`))));
+    });
+
+    const fixture = join(__dirname, 'discordIdentityProofFifoFixture.ts');
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, [...process.execArgv, fixture, fifo], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error('FIFO proof child exceeded total deadline'));
+      }, 1_000);
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+      child.once('error', reject);
+      child.once('exit', (code) => {
+        clearTimeout(timeout);
+        resolve({ code, stdout, stderr });
+      });
+    });
+
+    assert.equal(result.code, 1);
+    assert.equal(result.stderr, '');
+    assert.deepEqual(result.stdout.split('\n'), ['{"schemaVersion":1,"ok":false,"code":"secret_not_regular_file"}', '']);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('real filesystem snapshot preserves special permission bits for exact custody rejection', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'craig-identity-proof-'));
   const secret = join(directory, 'secret');
@@ -216,6 +253,36 @@ test('one total proof deadline is propagated to and cancels a pending request', 
     (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'proof_timeout'
   );
   assert.equal(receivedSignal?.aborted, true);
+});
+
+test('pre-aborted proof does not start secret reads or Discord requests', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let secretReads = 0;
+  let requests = 0;
+  const lines: string[] = [];
+
+  const exitCode = await runDiscordIdentityProofCommand(
+    environment,
+    (line) => lines.push(line),
+    (commandEnvironment) =>
+      createDiscordIdentityProof(commandEnvironment, {
+        signal: controller.signal,
+        readSecret: async () => {
+          secretReads += 1;
+          return snapshot();
+        },
+        fetch: async () => {
+          requests += 1;
+          return new Response('{}');
+        }
+      })
+  );
+
+  assert.equal(secretReads, 0);
+  assert.equal(requests, 0);
+  assert.equal(exitCode, 1);
+  assert.deepEqual(lines, ['{"schemaVersion":1,"ok":false,"code":"proof_cancelled"}\n']);
 });
 
 test('one total proof deadline also cancels a stalled response body', async () => {
