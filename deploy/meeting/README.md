@@ -39,12 +39,16 @@ The image contains a one-shot, test-only identity proof. It reads the token only
 Set `CRAIG_E2E_TEST_ONLY=true`, `CRAIG_E2E_DISCORD_GUILD_ID` to the exact private test guild snowflake, and `CRAIG_E2E_DISCORD_CHANNEL_IDS` to one to sixteen exact comma-separated test channel snowflakes. These IDs are an integration-owned allowlist: pin them in the test deployment configuration, review changes to them, and never populate them dynamically from Discord discovery. Run the one-shot command only in that test deployment:
 
 ```sh
-docker compose --env-file deploy/meeting/.env -f deploy/meeting/compose.yaml run --rm \
+docker compose --env-file deploy/meeting/.env \
+  -f deploy/meeting/compose.yaml \
+  -f deploy/meeting/compose.test-only.yaml run --rm \
   -e CRAIG_E2E_TEST_ONLY=true \
   -e CRAIG_E2E_DISCORD_GUILD_ID=00000000000000000 \
   -e CRAIG_E2E_DISCORD_CHANNEL_IDS=00000000000000001 \
   bot discord-identity-proof
 ```
+
+The explicit test-only overlay labels the probe container `e2e.test-only=true`. Do not include this overlay in the long-running or production deployment.
 
 Success is one canonical JSON line containing schema version, bot ID, exact target IDs and non-secret custody facts. Failure is one bounded JSON line with a stable error code and a non-zero exit status. Do not run this against a public guild or a non-test bot application.
 

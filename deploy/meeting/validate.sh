@@ -20,4 +20,15 @@ CRAIG_SECRETS_DIR=$placeholder_dir \
     --file "$deploy_dir/compose.yaml" \
     config --quiet
 
-echo "Craig Meeting compose configuration and immutable source revision are valid. No containers were started."
+test_only_config=$(
+  CRAIG_SECRETS_DIR=$placeholder_dir \
+    CRAIG_SOURCE_REVISION=$validation_source_revision \
+    docker compose \
+      --env-file "$deploy_dir/.env.example" \
+      --file "$deploy_dir/compose.yaml" \
+      --file "$deploy_dir/compose.test-only.yaml" \
+      config
+)
+printf '%s\n' "$test_only_config" | grep -q 'e2e.test-only: "true"'
+
+echo "Craig Meeting base and test-only compose configurations and immutable source revision are valid. No containers were started."

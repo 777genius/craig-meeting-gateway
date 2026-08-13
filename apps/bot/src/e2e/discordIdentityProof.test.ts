@@ -391,3 +391,16 @@ test('entrypoint delegates proof failures directly to the canonical CLI', async 
   assert.doesNotMatch(proofCase, /require_secret_file|echo|stderr/);
   assert.match(proofCase, /exec node .*discordIdentityProofCli\.js/);
 });
+
+test('release container requires the compiled proof artifact and test-only overlay marks the probe target', async () => {
+  const dockerfile = await readFile(join(process.cwd(), 'deploy/meeting/Dockerfile'), 'utf8');
+  const entrypoint = await readFile(join(process.cwd(), 'deploy/meeting/entrypoint.sh'), 'utf8');
+  const testOnlyOverlay = await readFile(join(process.cwd(), 'deploy/meeting/compose.test-only.yaml'), 'utf8');
+
+  assert.match(dockerfile, /COPY --from=build --chown=craig:craig \/app\/apps\/bot\/dist \/app\/apps\/bot\/dist/);
+  assert.match(dockerfile, /test -r \/app\/apps\/bot\/dist\/e2e\/discordIdentityProofCli\.js/);
+  assert.match(dockerfile, /test -r \/app\/apps\/bot\/dist\/e2e\/discordIdentityProofCommand\.js/);
+  assert.match(dockerfile, /test -r \/app\/apps\/bot\/dist\/e2e\/discordIdentityProof\.js/);
+  assert.match(entrypoint, /exec node --enable-source-maps \/app\/apps\/bot\/dist\/e2e\/discordIdentityProofCli\.js/);
+  assert.match(testOnlyOverlay, /^services:\n  bot:\n    labels:\n      e2e\.test-only: "true"\n$/);
+});

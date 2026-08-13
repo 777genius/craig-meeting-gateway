@@ -101,7 +101,10 @@ COPY --chown=root:root deploy/meeting/render-config.cjs /app/deploy/meeting/rend
 COPY --chown=root:root deploy/meeting/healthcheck.cjs /app/deploy/meeting/healthcheck.cjs
 COPY --chown=root:root deploy/meeting/node24-compat.cjs /app/deploy/meeting/node24-compat.cjs
 
-RUN chmod 0555 /app/deploy/meeting/entrypoint.sh \
+RUN test -r /app/apps/bot/dist/e2e/discordIdentityProofCli.js \
+  && test -r /app/apps/bot/dist/e2e/discordIdentityProofCommand.js \
+  && test -r /app/apps/bot/dist/e2e/discordIdentityProof.js \
+  && chmod 0555 /app/deploy/meeting/entrypoint.sh \
   && chmod 0444 /app/deploy/meeting/render-config.cjs /app/deploy/meeting/healthcheck.cjs /app/deploy/meeting/node24-compat.cjs \
   && chmod 0555 /app/cook.sh /app/cook/*.sh /app/cook/*.js
 

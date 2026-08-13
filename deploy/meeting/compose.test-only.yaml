@@ -1,0 +1,4 @@
+services:
+  bot:
+    labels:
+      e2e.test-only: "true"
