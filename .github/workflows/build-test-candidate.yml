@@ -1,0 +1,135 @@
+name: Build Craig test candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Exact commit selected for this workflow run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: craig-test-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build linux/amd64 candidate
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE_REPOSITORY: ghcr.io/777genius/craig-meeting-e2e-candidate
+    steps:
+      - name: Validate requested source revision
+        env:
+          REQUESTED_SOURCE_REVISION: ${{ inputs.source_revision }}
+          WORKFLOW_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ "$REQUESTED_SOURCE_REVISION" != "$WORKFLOW_SOURCE_REVISION" ]; then
+            echo "source_revision must exactly match github.sha" >&2
+            exit 1
+          fi
+
+      - name: Check out the selected source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the test candidate
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/meeting/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            SOURCE_REVISION=${{ github.sha }}
+          tags: ${{ env.IMAGE_REPOSITORY }}:sha-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Write non-authorizing build candidate
+        env:
+          REPOSITORY_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ github.sha }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          case "$REPOSITORY_DIGEST" in
+            sha256:[0-9a-f][0-9a-f]*) ;;
+            *) echo "Build did not return an OCI repository digest" >&2; exit 1 ;;
+          esac
+          test "${#REPOSITORY_DIGEST}" -eq 71
+
+          dockerfile_sha256=$(sha256sum deploy/meeting/Dockerfile | cut -d ' ' -f 1)
+          lockfile_sha256=$(sha256sum yarn.lock | cut -d ' ' -f 1)
+          workflow_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}"
+
+          jq -n \
+            --arg component "craig-meeting-gateway" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg imageRepository "$IMAGE_REPOSITORY" \
+            --arg sourceRevision "$SOURCE_REVISION" \
+            --arg repositoryDigest "$REPOSITORY_DIGEST" \
+            --arg platform "linux/amd64" \
+            --arg ociRevision "$SOURCE_REVISION" \
+            --arg workflowUrl "$workflow_url" \
+            --argjson workflowAttempt "$WORKFLOW_ATTEMPT" \
+            --arg dockerfilePath "deploy/meeting/Dockerfile" \
+            --arg dockerfileSha256 "$dockerfile_sha256" \
+            --arg lockfilePath "yarn.lock" \
+            --arg lockfileSha256 "$lockfile_sha256" \
+            '{
+              schemaVersion: 1,
+              kind: "hosted-test-build-candidate",
+              authority: false,
+              component: $component,
+              repository: $repository,
+              imageRepository: $imageRepository,
+              sourceRevision: $sourceRevision,
+              repositoryDigest: $repositoryDigest,
+              platform: $platform,
+              oci: {revision: $ociRevision},
+              workflow: {url: $workflowUrl, attempt: $workflowAttempt},
+              inputs: {
+                dockerfile: {path: $dockerfilePath, sha256: $dockerfileSha256},
+                lockfile: {path: $lockfilePath, sha256: $lockfileSha256}
+              }
+            }' > build-candidate.json
+          jq -e \
+            '.schemaVersion == 1 and
+             .kind == "hosted-test-build-candidate" and
+             .authority == false and
+             (.repositoryDigest | test("^sha256:[0-9a-f]{64}$")) and
+             (.sourceRevision | test("^[0-9a-f]{40}$")) and
+             .oci.revision == .sourceRevision and
+             .platform == "linux/amd64"' \
+            build-candidate.json >/dev/null
+
+      - name: Upload build candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: craig-build-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build-candidate.json
+          if-no-files-found: error
+          retention-days: 14
