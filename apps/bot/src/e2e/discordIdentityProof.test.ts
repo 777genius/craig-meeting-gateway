@@ -218,11 +218,28 @@ test('rejects a channel outside the declared private test guild', async () => {
 });
 
 test('rejects oversized Discord bodies from content-length and streaming limits', async () => {
-  const declared: typeof fetch = async () => new Response('{}', { headers: { 'content-length': '16385' } });
-  await assert.rejects(
-    createDiscordIdentityProof(environment, { readSecret: async () => snapshot(), fetch: declared }),
-    (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'discord_response_too_large'
-  );
+  for (const declaredLength of ['invalid', '16385']) {
+    let cancelCalled = false;
+    let requestSignal: AbortSignal | undefined;
+    const declared: typeof fetch = async (_input, init) => {
+      requestSignal = init?.signal || undefined;
+      return new Response(
+        new ReadableStream({
+          pull: () => new Promise<void>(() => undefined),
+          cancel: () => {
+            cancelCalled = true;
+          }
+        }),
+        { headers: { 'content-length': declaredLength } }
+      );
+    };
+    await assert.rejects(
+      createDiscordIdentityProof(environment, { readSecret: async () => snapshot(), fetch: declared }),
+      (error: unknown) => error instanceof DiscordIdentityProofError && error.code === 'discord_response_too_large'
+    );
+    assert.equal(cancelCalled, true);
+    assert.equal(requestSignal?.aborted, true);
+  }
 
   const streaming: typeof fetch = async () =>
     new Response(

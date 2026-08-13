@@ -165,8 +165,10 @@ async function readBoundedJson(response: Response, signal: AbortSignal): Promise
   const declaredLength = response.headers.get('content-length');
   if (declaredLength !== null) {
     const length = Number(declaredLength);
-    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_DISCORD_BODY_BYTES)
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_DISCORD_BODY_BYTES) {
+      cancelBody(response.body);
       throw new DiscordIdentityProofError('discord_response_too_large');
+    }
   }
   if (!response.body) throw new DiscordIdentityProofError('invalid_discord_response');
 
