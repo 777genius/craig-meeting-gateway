@@ -16,7 +16,8 @@ Craig still pins `config@3.3.8`, which calls two `node:util` predicates removed 
 ## Prepare
 
 1. Copy `.env.example` to `.env`, set the public Discord application ID, and set `CRAIG_SOURCE_REVISION` to the exact 40 or 64 character lowercase commit used as the build context. The same revision is used as the immutable image tag and OCI `org.opencontainers.image.revision` label.
-2. Create the four files described in `secrets/README.md`, with mode `0600`. The PostgreSQL password in `database_url` must match `postgres_password`.
+2. Create the four files described in `secrets/README.md`. The PostgreSQL password in `database_url` must match `postgres_password`.
+   The `discord_bot_token` source file must be owned by numeric UID/GID `10001:10001` with exact mode `0400`; local Compose implements file-backed secrets as bind mounts, so the source custody is what the non-root Craig UID `10001` observes. The identity proof rejects any other owner or permission bits. Keep the other secret files at mode `0600` for their documented consumers.
    Create the PostgreSQL data directory with owner UID/GID `70:70`, the Redis data directory with owner UID/GID `999:1000`, and the recording directory with owner UID/GID `10001:10001`.
 3. Create the shared network if the parent Meeting Platform stack does not own it:
 
@@ -30,6 +31,22 @@ Craig still pins `config@3.3.8`, which calls two `node:util` predicates removed 
 The bot reads its authoritative auto-record channel snapshot from `GET /v1/craig/configuration` on the Meeting Platform service every `MEETING_AUTO_RECORD_CONFIGURATION_POLL_MS` (default: five seconds), using the existing mounted bearer token. `MEETING_AUTO_RECORD_CHANNEL_IDS` is an optional fail-closed static fallback until the first valid snapshot arrives; a successful empty snapshot disables auto-recording. `MEETING_AUTO_RECORD_SYNTHETIC_BOT_IDS` contains only synthetic audio bots that count toward automatic start/stop decisions. Both static lists are comma-separated Discord snowflake lists.
 
 No browser login is needed after the official bot token has been mounted. The Discord web session is unrelated to the long-running bot gateway session.
+
+## Prove the mounted Discord identity
+
+The image contains a one-shot, test-only identity proof. It reads the token only from `/run/secrets/discord_bot_token`, verifies exact UID/GID `10001:10001` and mode `0400`, calls Discord API v10 for `/users/@me`, requires that identity to match `DISCORD_APPLICATION_ID`, checks the declared private guild and each declared test channel, then rereads the secret and timing-safe compares its content and file generation. The token never appears in output.
+
+Set `CRAIG_E2E_TEST_ONLY=true`, `CRAIG_E2E_DISCORD_GUILD_ID` to the exact private test guild snowflake, and `CRAIG_E2E_DISCORD_CHANNEL_IDS` to one to sixteen exact comma-separated test channel snowflakes. Run the one-shot command only in that test deployment:
+
+```sh
+docker compose --env-file deploy/meeting/.env -f deploy/meeting/compose.yaml run --rm \
+  -e CRAIG_E2E_TEST_ONLY=true \
+  -e CRAIG_E2E_DISCORD_GUILD_ID=00000000000000000 \
+  -e CRAIG_E2E_DISCORD_CHANNEL_IDS=00000000000000001 \
+  bot discord-identity-proof
+```
+
+Success is one canonical JSON line containing schema version, bot ID, exact target IDs and non-secret custody facts. Failure is one bounded JSON line with a stable error code and a non-zero exit status. Do not run this against a public guild or a non-test bot application.
 
 ## Validate without credentials or startup
 

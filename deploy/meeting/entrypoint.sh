@@ -41,6 +41,10 @@ case "${1:-bot}" in
     : > /run/craig-config/startup.ready
     exec node --require=/app/deploy/meeting/node24-compat.cjs --enable-source-maps /app/apps/bot/dist/index.js
     ;;
+  discord-identity-proof)
+    require_secret_file "${DISCORD_BOT_TOKEN_FILE:-/run/secrets/discord_bot_token}" "Discord bot token"
+    exec node --enable-source-maps /app/apps/bot/dist/e2e/discordIdentityProofCli.js
+    ;;
   *)
     echo "Craig startup: unsupported command '$1'" >&2
     exit 64

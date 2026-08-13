@@ -158,7 +158,11 @@ services:
       CRAIG_LOG_LEVEL: ${CRAIG_LOG_LEVEL:-info}
     secrets:
       - database_url
-      - discord_bot_token
+      - source: discord_bot_token
+        target: discord_bot_token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
       - meeting_integration_token
     networks:
       data:
