@@ -212,19 +212,37 @@ test('rolls back rejected v3 producer evidence before the next accepted transiti
       channelId,
       occurredAt: '2026-08-18T00:00:00.000Z'
     },
-    []
+    [{ id: participantId, bot: false, system: false, webhook: false }]
   );
+  const beforeRejectedTransition = lifecycle.durableSnapshot();
+  lifecycle.durableAdmission = () => {
+    throw new Error('participant transition materialized durable admission');
+  };
   Object.assign(recording, { lifecycleV3: lifecycle });
 
+  await recording.onVoiceStateUpdate({ ...participantMember(true), bot: true } as Parameters<RecordingType['onVoiceStateUpdate']>[0], oldVoiceState);
+  assert.equal(admissions[0], undefined);
+  assert.deepEqual(lifecycle.durableSnapshot(), beforeRejectedTransition);
+
   await recording.onVoiceStateUpdate(participantMember(true), oldVoiceState);
-  await recording.onVoiceStateUpdate(participantMember(true), oldVoiceState);
+  const afterAcceptedTransition = lifecycle.durableSnapshot();
 
   assert.deepEqual(
     events.map(({ eventId }) => eventId),
     ['recording-1:1', 'recording-1:2']
   );
-  assert.equal(admissions[1]?.recordingId, started.recordingId);
-  assert.deepEqual(admissions[1]?.actors, [{ actorId: participantId, kind: 'human' }]);
+  assert.deepEqual(
+    events.map((event) => (event.schemaVersion === 3 ? event.actorObservationState : null)),
+    ['conflicted', 'consistent']
+  );
+  assert.equal(admissions[1], undefined);
+  assert.deepEqual(afterAcceptedTransition.producer, beforeRejectedTransition.producer);
+  assert.equal(afterAcceptedTransition.actorObservationState, 'consistent');
+  assert.deepEqual(afterAcceptedTransition.actors, [{ actorId: participantId, kind: 'human' }]);
+  assert.deepEqual(
+    afterAcceptedTransition.pendingOutbox.map(({ eventId }) => eventId),
+    [started.eventId, 'recording-1:2']
+  );
 });
 
 test('admits a transition without materializing growing producer history', async () => {

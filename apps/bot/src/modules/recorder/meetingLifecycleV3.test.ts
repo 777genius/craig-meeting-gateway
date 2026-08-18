@@ -8,6 +8,7 @@ import {
   actorSemanticsVersion,
   createCraigLifecycleV3Producer,
   deriveCraigActorFromDiscord,
+  maximumCraigActorRosterSize,
   maximumCraigPendingLifecycleEvents,
   parseMeetingLifecycleProducerConfiguration,
   restoreCraigLifecycleV3ProducerFromSnapshot,
@@ -78,8 +79,9 @@ test('generates real v3 envelopes, copies producer input, and seals a sorted ros
 
 test('validates actor batches transactionally before any ledger mutation', () => {
   const lifecycle = createCraigLifecycleV3Producer(config, context);
+  assert.equal(maximumCraigActorRosterSize, 1_000);
   const before = lifecycle.durableSnapshot();
-  const oversized = Array.from({ length: 1001 }, (_, index) => ({
+  const oversized = Array.from({ length: maximumCraigActorRosterSize + 1 }, (_, index) => ({
     id: String(10000000000000000n + BigInt(index)),
     bot: false,
     system: false,

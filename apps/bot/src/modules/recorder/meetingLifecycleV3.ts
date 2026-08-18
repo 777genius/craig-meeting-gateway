@@ -1,7 +1,7 @@
 export const sealedActorRosterCapabilityId = 'meeting.lifecycle.sealed-actor-roster.v1' as const;
 export const actorSemanticsVersion = 1 as const;
 export const meetingLifecycleV3SchemaVersion = 3 as const;
-export const maximumCraigActorRosterSize = 10_000 as const;
+export const maximumCraigActorRosterSize = 1_000 as const;
 /** Hard fail-closed bound for one recording's unacknowledged durable journal. */
 export const maximumCraigPendingLifecycleEvents = 1_024 as const;
 
