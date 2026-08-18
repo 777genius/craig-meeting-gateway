@@ -33,8 +33,11 @@ interface PlaybackFinishCommand extends PlaybackIdentity {
 
 interface PlaybackCancelCommand extends PlaybackIdentity {
   type: 'playback-cancel';
-  /** Exact Meeting logger observation time. Optional until Meeting's v1 producer propagates it. */
+  schemaVersion: 1 | 2;
+  meetingId?: string;
+  cancellationObservedAtMs?: number;
   cancellationObservedAt?: string;
+  reason: string;
 }
 
 type CraigPlaybackCommand = PlaybackStartCommand | PlaybackAudioChunkCommand | PlaybackFinishCommand | PlaybackCancelCommand;
@@ -95,7 +98,11 @@ export interface CraigPlaybackControllerOptions {
    * generation is revoked. Returning false fails closed and leaves playback
    * active so the command can be retried after durability recovers.
    */
-  onCancellation?(cancellation: Readonly<PlaybackIdentity & { cancellationObservedAt?: string }>): boolean;
+  onCancellation(cancellation: Readonly<PlaybackCancelCommand>): boolean;
+  /** Consults the durable per-attempt fence before admitting start or PCM. */
+  isAttemptRevoked(identity: Readonly<PlaybackIdentity>): boolean;
+  /** Records a packet offered after the exact cancelled attempt was revoked. */
+  onPostCancellationPacket(identity: Readonly<PlaybackIdentity>): boolean;
   createOpusEncoder?: () => CraigPlaybackOpusEncoder;
   now?: () => number;
   timer?: CraigPlaybackTimer;
@@ -345,9 +352,13 @@ export class CraigPlaybackController {
   private readonly timer: CraigPlaybackTimer;
   private active: ActivePlayback | undefined;
   private lastTerminal: PlaybackIdentity | undefined;
+  private readonly revokedAttempts = new Set<string>();
   private closed = false;
 
   constructor(private readonly options: CraigPlaybackControllerOptions) {
+    if (typeof options.onCancellation !== 'function' || typeof options.isAttemptRevoked !== 'function' ||
+        typeof options.onPostCancellationPacket !== 'function')
+      throw new Error('Durable playback cancellation, restart lookup, and post-fence attempt handlers are required');
     this.createOpusEncoder = options.createOpusEncoder ?? (() => new OpusEncoder(CRAIG_PLAYBACK_SAMPLE_RATE_HZ, 2));
     this.now = options.now ?? (() => Date.now());
     this.timer = options.timer ?? {
@@ -408,6 +419,7 @@ export class CraigPlaybackController {
   }
 
   private handleStart(command: PlaybackStartCommand): boolean {
+    if (this.isRevoked(command)) return true;
     if (this.active) {
       if (this.matchesActive(command)) return true;
       this.fail('playback-error', 'A previous playback turn is still active.', true);
@@ -428,6 +440,16 @@ export class CraigPlaybackController {
   }
 
   private handleAudioChunk(command: PlaybackAudioChunkCommand): boolean {
+    if (this.isRevoked(command)) {
+      // This callback is intentionally outside a catch. The packet is not
+      // handled unless the exact attempted count is durable.
+      if (this.options.onPostCancellationPacket(Object.freeze({
+        recordingId: command.recordingId,
+        turnId: command.turnId,
+        attemptId: command.attemptId
+      })) !== true) return false;
+      return true;
+    }
     const active = this.active;
     if (!active) return this.matchesLastTerminal(command);
     if (!this.matches(active, command)) return true;
@@ -475,24 +497,22 @@ export class CraigPlaybackController {
 
   private handleCancel(command: PlaybackCancelCommand): boolean {
     const active = this.active;
-    if (!active) return true;
-    if (!this.matches(active, command)) return true;
-
-    // Meeting v1 historically omitted its logger's observedAt. Never invent a
-    // Craig timestamp: without that trusted value the verifier's exact-time
-    // proof cannot be produced, although local playback cancellation remains
-    // backward compatible.
-    if (
-      this.options.onCancellation?.({
-        recordingId: command.recordingId,
-        turnId: command.turnId,
-        attemptId: command.attemptId,
-        ...(command.cancellationObservedAt === undefined ? {} : { cancellationObservedAt: command.cancellationObservedAt })
-      }) === false
-    )
-      return true;
-    this.cancel(active);
+    // Revocation is an identity operation, not an active-player operation. A
+    // cancellation may race start, arrive while another turn owns playback,
+    // or be replayed after restart; durability must win all of those races.
+    if (this.options.onCancellation(Object.freeze({ ...command })) !== true)
+      return false;
+    this.revokedAttempts.add(this.identityKey(command));
+    if (active && this.matches(active, command)) this.cancel(active);
     return true;
+  }
+
+  private isRevoked(identity: PlaybackIdentity): boolean {
+    return this.revokedAttempts.has(this.identityKey(identity)) || this.options.isAttemptRevoked(identity) === true;
+  }
+
+  private identityKey(identity: PlaybackIdentity): string {
+    return `${identity.recordingId}\0${identity.turnId}\0${identity.attemptId}`;
   }
 
   private enqueueFrame(active: ActivePlayback, monoFrame: Buffer): boolean {
@@ -655,9 +675,25 @@ function parseCraigPlaybackCommand(value: unknown): CraigPlaybackCommand {
       return { ...identity, type };
     }
     case 'playback-cancel': {
-      const baseKeys = ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'reason'];
-      const keys = value.cancellationObservedAt === undefined ? baseKeys : [...baseKeys, 'cancellationObservedAt'];
-      const identity = parseEnvelope(value, keys);
+      if (value.schemaVersion === 2) {
+        if (!hasExactlyKeys(value, ['schemaVersion', 'type', 'meetingId', 'recordingId', 'turnId', 'attemptId', 'cancellationObservedAtMs', 'reason']))
+          throw new Error('Playback cancel v2 envelope is invalid');
+        const identity = {
+          recordingId: parseIdentifier(value.recordingId),
+          turnId: parseIdentifier(value.turnId),
+          attemptId: parseIdentifier(value.attemptId)
+        };
+        const meetingId = parseIdentifier(value.meetingId);
+        const reason = parseIdentifier(value.reason);
+        if (!Number.isSafeInteger(value.cancellationObservedAtMs) || (value.cancellationObservedAtMs as number) < 0 ||
+            (value.cancellationObservedAtMs as number) > 8_640_000_000_000_000)
+          throw new Error('Playback cancellation observation time is invalid');
+        return { ...identity, schemaVersion: 2, type, meetingId, cancellationObservedAtMs: value.cancellationObservedAtMs as number, reason };
+      }
+      const v1Keys = value.cancellationObservedAt === undefined
+        ? ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'reason']
+        : ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'reason', 'cancellationObservedAt'];
+      const identity = parseEnvelope(value, v1Keys);
       if (
         value.reason !== 'barge-in' &&
         value.reason !== 'meeting-ended' &&
@@ -666,11 +702,14 @@ function parseCraigPlaybackCommand(value: unknown): CraigPlaybackCommand {
         value.reason !== 'superseded'
       )
         throw new Error('Playback cancel reason is invalid');
+      const reason = value.reason;
       if (value.cancellationObservedAt !== undefined && !isCanonicalInstant(value.cancellationObservedAt))
         throw new Error('Playback cancellation observation time is invalid');
       return {
         ...identity,
+        schemaVersion: 1,
         type,
+        reason,
         ...(value.cancellationObservedAt === undefined ? {} : { cancellationObservedAt: value.cancellationObservedAt })
       };
     }

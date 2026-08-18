@@ -22,6 +22,7 @@ export interface DurableBotikTrackProof {
 /** Exact Meeting HEAD 6b06b1d verifier/logger boundary. */
 export interface CraigAuthoritativeCancellationPcmFenceLog {
   acceptedPacketCountAfterCancellation: 0;
+  attemptedPacketCountAfterCancellation: number;
   attemptId: string;
   cancellationObservedAt: string;
   fenceObservedAt: string;
@@ -34,6 +35,8 @@ export interface CraigAuthoritativeCancellationPcmFenceLog {
 }
 
 export function createAuthoritativeCancellationPcmFenceLog(input: {
+  acceptedPacketCountAfterCancellation?: number;
+  attemptedPacketCountAfterCancellation: number;
   attemptId: string;
   cancellationObservedAt: string;
   fenceObservedAt: string;
@@ -53,8 +56,13 @@ export function createAuthoritativeCancellationPcmFenceLog(input: {
   const fenceObservedAt = canonicalTimestamp(input.fenceObservedAt, 'fenceObservedAt');
   if (fenceObservedAt < cancellationObservedAt) throw new Error('Cancellation PCM fence precedes Meeting cancellation observation');
   if (!/^[a-f0-9]{64}$/.test(input.trackSha256)) throw new Error('Final uploaded Botik track checksum is invalid');
+  if ((input.acceptedPacketCountAfterCancellation ?? 0) !== 0)
+    throw new Error('Durable cancellation fence records accepted PCM after cancellation');
+  if (!Number.isSafeInteger(input.attemptedPacketCountAfterCancellation) || input.attemptedPacketCountAfterCancellation < 0)
+    throw new Error('Durable cancellation fence attempted PCM count is invalid');
   return deepFreeze({
-    acceptedPacketCountAfterCancellation: 0 as const,
+    acceptedPacketCountAfterCancellation: (input.acceptedPacketCountAfterCancellation ?? 0) as 0,
+    attemptedPacketCountAfterCancellation: input.attemptedPacketCountAfterCancellation,
     attemptId: input.attemptId,
     cancellationObservedAt,
     fenceObservedAt,

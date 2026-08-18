@@ -58,6 +58,22 @@ class FakeEncoder implements CraigPlaybackOpusEncoder {
 
 const logger = { debug: () => {}, warn: () => {} };
 
+test('requires durable restart lookup and post-fence recording at the session composition boundary', async () => {
+  await assert.rejects(
+    // @ts-expect-error all durable cancellation ports are mandatory even when playback is disabled
+    createConversationPlaybackSession({
+      config: undefined,
+      recordingId,
+      guildId,
+      channelId,
+      arbiter: new CraigPlaybackArbiter(() => new FakeVoiceConnection()),
+      logger,
+      onCancellation: () => true
+    }),
+    /restart lookup, and post-fence attempt handlers are required/
+  );
+});
+
 function start(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     schemaVersion: 1,
@@ -115,6 +131,9 @@ test('opens an authenticated recording-scoped outbound session and emits playbac
     createGatewaySessionId: () => 'gateway-session-1',
     createOpusEncoder: () => new FakeEncoder(),
     now: () => 4_000,
+    onCancellation: () => true,
+    isAttemptRevoked: () => false,
+    onPostCancellationPacket: () => true,
     onPacketDispatched: (packet) => dispatchedPackets.push(Buffer.from(packet)),
     socketFactory: (url, options) => {
       socketUrl = url;
@@ -179,6 +198,9 @@ test('closes the outbound transport for a cross-recording command', async (conte
     channelId,
     arbiter: new CraigPlaybackArbiter(() => new FakeVoiceConnection()),
     logger,
+    onCancellation: () => true,
+    isAttemptRevoked: () => false,
+    onPostCancellationPacket: () => true,
     onClosed: (reason) => {
       closeReason = reason;
     },

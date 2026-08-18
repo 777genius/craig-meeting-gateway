@@ -1,7 +1,7 @@
 export const sealedActorRosterCapabilityId = 'meeting.lifecycle.sealed-actor-roster.v1' as const;
 export const actorSemanticsVersion = 1 as const;
 export const meetingLifecycleV3SchemaVersion = 3 as const;
-export const maximumCraigActorRosterSize = 1_000 as const;
+export const maximumCraigActorRosterSize = 10_000 as const;
 /** Hard fail-closed bound for one recording's unacknowledged durable journal. */
 export const maximumCraigPendingLifecycleEvents = 1_024 as const;
 
@@ -67,6 +67,17 @@ export type DurableCraigLifecycleV3Snapshot = Readonly<{
   sealedReady: CraigLifecycleV3Event | null;
 }>;
 
+/** Bounded producer state accompanying one admission; it never copies event history. */
+export type CraigLifecycleV3Admission = Readonly<{
+  recordingId: string;
+  guildId: string;
+  channelId: string;
+  producer: CraigProducerIdentity;
+  actorObservationState: 'consistent' | 'conflicted';
+  actors: CraigActor[];
+  sealedReady: CraigLifecycleV3Event | null;
+}>;
+
 /**
  * Applies the Meeting consumer's fail-closed knowledge eligibility rule to a
  * producer-sealed roster. Automation, incomplete identity evidence, and any
@@ -114,14 +125,24 @@ export class CraigActorObservationLedger {
     this.producer = freezeProducerIdentity(producer);
   }
 
-  observeBatch(authenticatedActors: readonly AuthenticatedDiscordActor[]): void {
+  observeBatch(authenticatedActors: readonly AuthenticatedDiscordActor[]): () => void {
     if (!Array.isArray(authenticatedActors)) throw new Error('Craig actor batch is invalid');
     const actors = authenticatedActors.map(deriveCraigActorFromDiscord);
     const additions = new Set(actors.filter(({ actorId }) => !this.kindsByActor.has(actorId)).map(({ actorId }) => actorId));
     if (this.kindsByActor.size + additions.size > maximumCraigActorRosterSize) throw new Error('Craig actor roster exceeds its bounded size');
 
+    const previousConflict = this.conflicted;
+    const previous = new Map<string, CraigActorKind | undefined>();
+    for (const actor of actors) if (!previous.has(actor.actorId)) previous.set(actor.actorId, this.kindsByActor.get(actor.actorId));
     // Mutation begins only after every input and the resulting size have been validated.
     for (const actor of actors) this.observeTrusted(actor);
+    return () => {
+      this.conflicted = previousConflict;
+      for (const [actorId, kind] of previous) {
+        if (kind === undefined) this.kindsByActor.delete(actorId);
+        else this.kindsByActor.set(actorId, kind);
+      }
+    };
   }
 
   observationState(): 'consistent' | 'conflicted' {
@@ -162,7 +183,9 @@ export class CraigActorObservationLedger {
 
 export class CraigLifecycleV3Producer {
   private readonly emitted: Array<Readonly<{ eventId: string; occurredAt: string }>> = [];
+  private readonly emittedIds = new Set<string>();
   private readonly pendingOutbox: CraigLifecycleV3Event[] = [];
+  private readonly admissionRollbacks: Array<() => void> = [];
   private sealedReady: Extract<CraigLifecycleV3Event, { type: 'recording.authoritative_ready' }> | null = null;
   private readonly context: CraigLifecycleContext;
   private readonly ledger: CraigActorObservationLedger;
@@ -178,8 +201,8 @@ export class CraigLifecycleV3Producer {
   ): Extract<CraigLifecycleV3Event, { type: 'meeting.started' }> {
     this.assertMutable();
     this.assertCanEmit(envelope);
-    this.ledger.observeBatch(actors);
-    return this.emit({ ...this.envelope(envelope), type: 'meeting.started', actors: this.ledger.actors(), rosterState: 'unsealed' });
+    const rollback = this.ledger.observeBatch(actors);
+    return this.emit({ ...this.envelope(envelope), type: 'meeting.started', actors: this.ledger.actors(), rosterState: 'unsealed' }, rollback);
   }
 
   /** Records authenticated adapter evidence that does not itself imply a lifecycle transition. */
@@ -195,8 +218,8 @@ export class CraigLifecycleV3Producer {
   ): Extract<CraigLifecycleV3Event, { type: 'participant.joined' | 'participant.left' }> {
     this.assertMutable();
     this.assertCanEmit(envelope);
-    this.ledger.observeBatch([actor]);
-    return this.emit({ ...this.envelope(envelope), type, actor: deriveCraigActorFromDiscord(actor) });
+    const rollback = this.ledger.observeBatch([actor]);
+    return this.emit({ ...this.envelope(envelope), type, actor: deriveCraigActorFromDiscord(actor) }, rollback);
   }
 
   connection(
@@ -240,9 +263,9 @@ export class CraigLifecycleV3Producer {
     }
 
     this.assertCanEmit(envelope);
-    this.ledger.observeBatch(input.actors);
+    const rollback = this.ledger.observeBatch(input.actors);
     const ready = this.buildReadyCandidate(envelope, input, this.ledger.actors(), this.ledger.observationState());
-    this.sealedReady = this.emit(ready);
+    this.sealedReady = this.emit(ready, rollback);
     return deepFreeze(cloneEvent(this.sealedReady));
   }
 
@@ -259,14 +282,37 @@ export class CraigLifecycleV3Producer {
     });
   }
 
+  durableAdmission(): CraigLifecycleV3Admission {
+    return deepFreeze({
+      ...this.context,
+      producer: { ...this.ledger.producer },
+      actorObservationState: this.ledger.observationState(),
+      actors: this.ledger.actors(),
+      sealedReady: this.sealedReady === null ? null : cloneEvent(this.sealedReady)
+    });
+  }
+
+  /** Reverts only the most recently created, not-yet-admitted transition. */
+  rollbackAdmission(event: CraigLifecycleV3Event): void {
+    const last = this.pendingOutbox[this.pendingOutbox.length - 1];
+    if (last?.eventId !== event.eventId) throw new Error('Lifecycle rollback is not the latest admission');
+    this.pendingOutbox.pop();
+    const removed = this.emitted.pop();
+    if (removed !== undefined) this.emittedIds.delete(removed.eventId);
+    this.admissionRollbacks.pop()?.();
+    if (this.sealedReady?.eventId === event.eventId) this.sealedReady = null;
+  }
+
   private assertMutable(): void {
     if (this.sealedReady !== null) throw new Error('Craig lifecycle ledger is sealed');
   }
 
   private assertCanEmit(envelope: CraigLifecycleEnvelope): void {
+    if (this.pendingOutbox.length >= maximumCraigPendingLifecycleEvents)
+      throw new Error('Craig lifecycle durable outbox capacity is exhausted');
     assertEnvelope(envelope);
     assertContext(envelope, this.context);
-    if (this.emitted.some(({ eventId }) => eventId === envelope.eventId)) throw new Error('Craig lifecycle eventId was already emitted');
+    if (this.emittedIds.has(envelope.eventId)) throw new Error('Craig lifecycle eventId was already emitted');
     const last = this.emitted[this.emitted.length - 1];
     if (last !== undefined && Date.parse(envelope.occurredAt) < Date.parse(last.occurredAt))
       throw new Error('Craig lifecycle timestamps must be ordered');
@@ -283,16 +329,18 @@ export class CraigLifecycleV3Producer {
     };
   }
 
-  private emit<T extends CraigLifecycleV3Event>(event: T): T {
+  private emit<T extends CraigLifecycleV3Event>(event: T, rollback: () => void = () => undefined): T {
     if (this.pendingOutbox.length >= maximumCraigPendingLifecycleEvents)
       throw new Error('Craig lifecycle durable outbox capacity is exhausted');
-    if (this.emitted.some(({ eventId }) => eventId === event.eventId)) throw new Error('Craig lifecycle eventId was already emitted');
+    if (this.emittedIds.has(event.eventId)) throw new Error('Craig lifecycle eventId was already emitted');
     const last = this.emitted[this.emitted.length - 1];
     if (last !== undefined && Date.parse(event.occurredAt) < Date.parse(last.occurredAt))
       throw new Error('Craig lifecycle timestamps must be ordered');
     const frozen = deepFreeze(cloneEvent(event)) as T;
     this.emitted.push(Object.freeze({ eventId: event.eventId, occurredAt: event.occurredAt }));
+    this.emittedIds.add(event.eventId);
     this.pendingOutbox.push(frozen);
+    this.admissionRollbacks.push(rollback);
     return deepFreeze(cloneEvent(frozen)) as T;
   }
 
@@ -383,6 +431,7 @@ export class CraigLifecycleV3Producer {
     if (readyEvents.length > 1 || (readyEvents.length === 1 && events[events.length - 1]?.type !== 'recording.authoritative_ready'))
       throw new Error('Durable lifecycle snapshot has an invalid seal order');
     lifecycle.emitted.push(...emitted.map((item) => Object.freeze({ ...item })));
+    for (const { eventId } of emitted) lifecycle.emittedIds.add(eventId);
     lifecycle.pendingOutbox.push(...events.map((event) => deepFreeze(event)));
 
     if (value.sealedReady !== null) {

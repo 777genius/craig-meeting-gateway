@@ -22,6 +22,7 @@ import {
   type MeetingVoicePacket,
   type OriginalRecordingCooker,
   BoundedMeetingIntegrationSink,
+  dateMillisecondsToIsoOrThrow,
   HttpMeetingIntegrationTransport,
   isRetryableMeetingIntegrationStatus,
   MeetingIntegrationDeliveryError,
@@ -38,12 +39,37 @@ const logger: MeetingIntegrationLogger = {
 };
 
 const accepted: MeetingLifecyclePublishOutcome = { status: 'accepted' };
+const uploadAck = (metadata: AuthoritativeTrackMetadata) => ({
+  schemaVersion: 1 as const, uploadId: metadata.uploadId, recordingId: metadata.recordingId,
+  trackNumber: metadata.trackNumber, checksumSha256: metadata.checksumSha256, sizeBytes: metadata.sizeBytes,
+  durable: true as const, immutable: true as const,
+  object: { provider: 's3' as const, bucket: 'botik-final', key: `${metadata.recordingId}/${metadata.trackNumber}.ogg`, versionId: 'version-1' }
+});
+const proofReceipt = (proof: unknown, acknowledgement: ReturnType<typeof uploadAck>) => ({
+  schemaVersion: 1 as const,
+  proofId: createHash('sha256').update(JSON.stringify(proof)).digest('hex'),
+  object: acknowledgement.object,
+  sizeBytes: acknowledgement.sizeBytes,
+  checksumSha256: acknowledgement.checksumSha256
+});
 const lifecycleV3Config = {
   schemaVersion: 3 as const,
   actorSemanticsVersion,
   producerCapabilityId: sealedActorRosterCapabilityId,
   producerRevision: '0123456789abcdef0123456789abcdef01234567'
 };
+
+test('cancellation timestamp conversion accepts the exact Date maximum and rejects larger safe integers', () => {
+  assert.equal(dateMillisecondsToIsoOrThrow(8_640_000_000_000_000, 'cancellationObservedAtMs'), '+275760-09-13T00:00:00.000Z');
+  assert.throws(
+    () => dateMillisecondsToIsoOrThrow(8_640_000_000_000_001, 'cancellationObservedAtMs'),
+    /outside the JavaScript Date range/
+  );
+  assert.throws(
+    () => dateMillisecondsToIsoOrThrow(Number.MAX_SAFE_INTEGER, 'cancellationObservedAtMs'),
+    /outside the JavaScript Date range/
+  );
+});
 
 const event: MeetingStartedLifecycleEvent = {
   schemaVersion: 1,
@@ -616,6 +642,7 @@ test('HTTP original recording contract streams audio metadata and requires ready
   const audio = Buffer.from('OggS-authoritative-track');
   await writeFile(audioFilePath, audio);
   let readyStatus = 200;
+  let uploadAcknowledgementOverride: unknown;
   const requests: Array<{
     path: string;
     headers: IncomingHttpHeaders;
@@ -629,7 +656,10 @@ test('HTTP original recording contract streams audio metadata and requires ready
       headers: request.headers,
       body: Buffer.concat(chunks)
     });
-    response.writeHead(request.url === '/v1/craig/events' ? readyStatus : 202).end();
+    if (request.url === '/v1/craig/authoritative-tracks') {
+      const metadata = JSON.parse(Buffer.from(String(request.headers['x-craig-authoritative-track-metadata']), 'base64url').toString('utf8'));
+      response.writeHead(202, { 'content-type': 'application/json' }).end(JSON.stringify(uploadAcknowledgementOverride ?? uploadAck(metadata)));
+    } else response.writeHead(readyStatus).end();
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   context.after(async () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))));
@@ -654,6 +684,12 @@ test('HTTP original recording contract streams audio metadata and requires ready
   assert.equal(requests[0]?.headers['content-type'], 'audio/ogg');
   assert.deepEqual(requests[0]?.body, audio);
   assert.deepEqual(JSON.parse(Buffer.from(String(encodedMetadata), 'base64url').toString('utf8')), metadata);
+
+  uploadAcknowledgementOverride = {};
+  await assert.rejects(transport.postAuthoritativeTrack(metadata, audioFilePath), /acknowledgement is malformed/);
+  uploadAcknowledgementOverride = { ...uploadAck(metadata), checksumSha256: '0'.repeat(64) };
+  await assert.rejects(transport.postAuthoritativeTrack(metadata, audioFilePath), /does not match uploaded bytes/);
+  uploadAcknowledgementOverride = undefined;
 
   const ready: AuthoritativeRecordingReadyEvent = {
     schemaVersion: 1,
@@ -797,6 +833,7 @@ test('recovers the authoritative original after restart loses an incomplete live
       assert.equal((await readFile(audioFilePath)).subarray(0, 4).toString('ascii'), 'OggS');
       uploads.push(metadata);
       deliveryOrder.push(`track:${metadata.trackNumber}`);
+      return uploadAck(metadata);
     },
     async postAuthoritativeReady(ready) {
       readyAttempts++;
@@ -989,6 +1026,7 @@ test('rejects a corrupt first original job without blocking the next recording',
       post: async () => undefined,
       async postAuthoritativeTrack(metadata) {
         uploadedRecordings.push(metadata.recordingId);
+        return uploadAck(metadata);
       },
       async postAuthoritativeReady(ready) {
         readyRecordings.push(ready.recordingId);
@@ -1068,7 +1106,7 @@ test('permanently rejects malformed and truncated raw Ogg data without touching 
   const restored = new BoundedMeetingIntegrationSink(
     {
       post: async () => undefined,
-      postAuthoritativeTrack: async () => undefined,
+      postAuthoritativeTrack: async (metadata) => uploadAck(metadata),
       postAuthoritativeReady: async () => undefined
     },
     logger,
@@ -1333,6 +1371,8 @@ test('replays the exact ordered lifecycle v3 outbox and sealed ready event after
     })}\n`
   );
 
+  const syntheticTrack = Buffer.from('OggS-synthetic');
+  await writeFile(path.join(root, 'synthetic.ogg'), syntheticTrack);
   const delivered: MeetingLifecycleEvent[] = [];
   const readyEvents: AuthoritativeRecordingReadyEvent[] = [];
   const restored = new BoundedMeetingIntegrationSink(
@@ -1340,7 +1380,7 @@ test('replays the exact ordered lifecycle v3 outbox and sealed ready event after
       post: async (requestPath, body) => {
         if (requestPath === '/v1/craig/events') delivered.push(body as MeetingLifecycleEvent);
       },
-      postAuthoritativeTrack: async () => undefined,
+      postAuthoritativeTrack: async (metadata) => uploadAck(metadata),
       postAuthoritativeReady: async (readyEvent) => {
         readyEvents.push(readyEvent);
       }
@@ -1356,8 +1396,8 @@ test('replays the exact ordered lifecycle v3 outbox and sealed ready event after
         async cook() {
           return {
             filePath: path.join(root, 'synthetic.ogg'),
-            checksumSha256: 'd'.repeat(64),
-            sizeBytes: 1,
+            checksumSha256: createHash('sha256').update(syntheticTrack).digest('hex'),
+            sizeBytes: syntheticTrack.length,
             async dispose() {}
           };
         }
@@ -1443,6 +1483,31 @@ test('hard-crash recovery replays exact durable v3 identities and never fabricat
   await replay.restoreOriginalRecordingJobs();
   assert.equal(await replay.drain(1000), true);
   assert.deepEqual(replayed, [started, joined]);
+  assert.deepEqual(
+    await readdir(path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`)),
+    ['00000000.event.json', '00000001.event.json', 'cursor.json', 'manifest.json', 'snapshot-00000000.json'],
+    'the fsynced ack cursor pins its exact segment while compacting older acknowledged events'
+  );
+  const manifest = JSON.parse(
+    await readFile(path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`, 'manifest.json'), 'utf8')
+  );
+  assert.equal(manifest.current.generation, 0);
+  const cursorPath = path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`, 'cursor.json');
+  const compactedCursor = JSON.parse(await readFile(cursorPath, 'utf8'));
+  assert.equal(compactedCursor.ackedSequence, 1);
+
+  await writeFile(cursorPath, `${JSON.stringify({ ...compactedCursor, digestSha256: '0'.repeat(64) })}\n`);
+  const corruptRecovery = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, { recordingRoot, outboxRoot });
+  assert.throws(() => (corruptRecovery as any).readLifecycleV3Snapshot(event.recordingId), /cursor does not match/);
+  await writeFile(cursorPath, `${JSON.stringify(compactedCursor)}\n`);
+
+  const manifestPath = path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`, 'manifest.json');
+  await writeFile(manifestPath, '{"schemaVersion":');
+  const tornManifestRecovery = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined }, logger, 4, 2, 1024, { recordingRoot, outboxRoot }
+  );
+  assert.equal((tornManifestRecovery as any).readLifecycleV3Snapshot(event.recordingId).recordingId, event.recordingId);
+  assert.equal(JSON.parse(await readFile(manifestPath, 'utf8')).current.generation, 0);
 
   const recovery = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, {
     recordingRoot,
@@ -1460,7 +1525,11 @@ test('hard-crash recovery replays exact durable v3 identities and never fabricat
     true
   );
   const recovered = JSON.parse(await readFile(path.join(outboxRoot, 'pending', `${event.recordingId}.json`), 'utf8'));
-  assert.deepEqual(recovered.lifecycleV3Snapshot.pendingOutbox.slice(0, 2), [started, joined]);
+  assert.deepEqual(
+    recovered.lifecycleV3Snapshot.pendingOutbox,
+    [started, recovered.terminalEvent],
+    'acked compacted events are not replayed, while the pinned trusted start remains available for crash recovery'
+  );
   assert.equal(recovered.startedEvent.eventId, started.eventId);
   assert.deepEqual(recovered.lifecycleV3Snapshot.actors, [
     { actorId: event.participantIds[0], kind: 'human' },
@@ -1512,7 +1581,7 @@ test('restores pending v3 jobs using their immutable producer revision after a r
       post: async (_requestPath, body) => {
         delivered.push(body as MeetingLifecycleEvent);
       },
-      postAuthoritativeTrack: async () => undefined,
+      postAuthoritativeTrack: async (metadata) => uploadAck(metadata),
       postAuthoritativeReady: async () => undefined
     },
     logger,
@@ -1575,7 +1644,7 @@ test('restores pending v3 jobs while current admission has rolled back to v1', a
       post: async (_requestPath, body) => {
         delivered.push(body as MeetingLifecycleEvent);
       },
-      postAuthoritativeTrack: async () => undefined,
+      postAuthoritativeTrack: async (metadata) => uploadAck(metadata),
       postAuthoritativeReady: async () => undefined
     },
     logger,
@@ -1629,4 +1698,516 @@ test('poisons duplicate original admission when identical IDs hide a conflicting
   assert.equal(await sink.publishOriginalRecording(createAdmission(true)), false);
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), []);
   assert.deepEqual(await readdir(path.join(outboxRoot, 'rejected')), [`${event.recordingId}.json`]);
+});
+
+test('production original upload durably manifests and emits the exact trusted cancellation proof', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-cancellation-proof-production-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  const sourceFileBase = path.join(recordingRoot, `${event.recordingId}.ogg`);
+  const botId = '1533228054724346087';
+  await mkdir(recordingRoot, { recursive: true });
+  await Promise.all([
+    writeFile(`${sourceFileBase}.data`, rawOggPage(57_624, 1, 1, Buffer.from([0xf8, 0xff, 0xfe]))),
+    writeFile(`${sourceFileBase}.header1`, 'header-1'),
+    writeFile(`${sourceFileBase}.header2`, 'header-2'),
+    writeFile(`${sourceFileBase}.users`, `"0":{}\n,"1":{"id":"${botId}","bot":true}\n`),
+    writeFile(`${sourceFileBase}.info`, `{"format":1,"clientId":"${botId}"}`),
+    writeFile(`${sourceFileBase}.log`, 'closed\n'),
+    writeFile(
+      `${sourceFileBase}.playback-cancellation-fence.trusted.json`,
+      `${JSON.stringify({
+        schemaVersion: 2,
+        type: 'playback-cancel',
+        meetingId: 'meeting-trusted-1',
+        recordingId: event.recordingId,
+        turnId: 'turn-1',
+        attemptId: 'attempt-1',
+        cancellationObservedAtMs: Date.parse('2026-08-18T00:00:03.000Z'),
+        reason: 'barge-in',
+        playbackGeneration: 1,
+        attemptGenerationToken: 'attempt-generation-token-1',
+        postCancellationAttemptedPacketCount: 1,
+        postCancellationAcceptedPacketCount: 0
+      })}\n`
+    ),
+    writeFile(
+      `${sourceFileBase}.playback-cancellation-fence.legacy.json`,
+      '{"schemaVersion":1,"recordingId":"recording-1","turnId":"fabricated","attemptId":"fabricated"}\n'
+    )
+  ]);
+  const cookedBytes = Buffer.from('OggS-final-botik-track');
+  const cookedPath = path.join(root, 'botik.ogg');
+  await writeFile(cookedPath, cookedBytes);
+  const checksumSha256 = createHash('sha256').update(cookedBytes).digest('hex');
+  const proofs: unknown[] = [];
+  const sink = new BoundedMeetingIntegrationSink(
+    {
+      post: async () => undefined,
+      postAuthoritativeTrack: async (metadata) => uploadAck(metadata),
+      postAuthoritativeReady: async () => undefined,
+      postCancellationPcmFence: async (proof) => {
+        proofs.push(proof);
+        return proofReceipt(proof, uploadAck({
+          schemaVersion: 1, uploadId: `authoritative-track:v1:${event.recordingId}:1`, recordingId: event.recordingId,
+          guildId: event.guildId, channelId: event.channelId, trackNumber: 1, speakerId: botId, timelineOffsetMs: 0,
+          checksumSha256, sizeBytes: cookedBytes.length
+        }));
+      }
+    },
+    logger,
+    4,
+    2,
+    1024,
+    {
+      recordingRoot,
+      outboxRoot,
+      cooker: {
+        cook: async () => ({ filePath: cookedPath, checksumSha256, sizeBytes: cookedBytes.length, async dispose() {} })
+      }
+    }
+  );
+  assert.equal(await sink.publishOriginalRecording({ startedEvent: event, terminalEvent, sourceFileBase }), true);
+  assert.equal(await sink.drain(2000), true);
+  assert.equal(proofs.length, 1, 'legacy sidecars without trusted time/meeting identity are not promoted');
+  assert.deepEqual(proofs[0], {
+    acceptedPacketCountAfterCancellation: 0,
+    attemptedPacketCountAfterCancellation: 1,
+    attemptId: 'attempt-1',
+    cancellationObservedAt: '2026-08-18T00:00:03.000Z',
+    fenceObservedAt: '2026-08-18T00:00:03.000Z',
+    meetingId: 'meeting-trusted-1',
+    message: 'Craig authoritative cancellation PCM fence observed',
+    recordingId: event.recordingId,
+    source: 'craig-authoritative-playback-track',
+    trackSha256: checksumSha256,
+    turnId: 'turn-1'
+  });
+  const manifestRoot = path.join(outboxRoot, 'pending', 'cancellation-pcm-fence-manifests');
+  const [manifestName] = await readdir(manifestRoot);
+  const manifest = JSON.parse(await readFile(path.join(manifestRoot, manifestName), 'utf8'));
+  assert.equal(manifest.trackSha256, checksumSha256);
+  assert.equal(manifest.trackSizeBytes, cookedBytes.length);
+  assert.deepEqual(manifest.proof, proofs[0]);
+  assert.deepEqual(await readdir(path.join(outboxRoot, 'pending', 'cancellation-pcm-fence')), []);
+
+  const proofRoot = path.join(outboxRoot, 'pending', 'cancellation-pcm-fence');
+  await writeFile(path.join(proofRoot, manifestName), `${JSON.stringify(proofs[0])}\n`);
+  const missingReceipt = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined, postCancellationPcmFence: async () => ({} as any) },
+    logger, 4, 2, 1024, { recordingRoot, outboxRoot }
+  );
+  await assert.rejects(() => (missingReceipt as any).replayCancellationProofs(), /receipt is malformed/);
+  assert.deepEqual(await readdir(proofRoot), [manifestName], 'missing receipt preserves the proof outbox');
+
+  const mismatchedReceipt = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined, postCancellationPcmFence: async (proof) => ({
+      ...proofReceipt(proof, manifest.uploadAcknowledgement), checksumSha256: '0'.repeat(64)
+    }) },
+    logger, 4, 2, 1024, { recordingRoot, outboxRoot }
+  );
+  await assert.rejects(() => (mismatchedReceipt as any).replayCancellationProofs(), /does not match/);
+  assert.deepEqual(await readdir(proofRoot), [manifestName], 'mismatched receipt preserves the proof outbox');
+
+  const manifestPath = path.join(manifestRoot, manifestName);
+  await writeFile(manifestPath, `${JSON.stringify({
+    ...manifest, uploadAcknowledgement: { ...manifest.uploadAcknowledgement, checksumSha256: '0'.repeat(64) }
+  })}\n`);
+  await assert.rejects(() => (mismatchedReceipt as any).replayCancellationProofs(), /manifest is corrupt or mismatched|does not match/);
+  assert.deepEqual(await readdir(proofRoot), [manifestName], 'corrupt restart manifest fails closed');
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+  const replayedProofs: unknown[] = [];
+  const replay = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined, postCancellationPcmFence: async (proof) => {
+      replayedProofs.push(proof);
+      return proofReceipt(proof, manifest.uploadAcknowledgement);
+    } },
+    logger, 4, 2, 1024, { recordingRoot, outboxRoot }
+  );
+  await replay.restoreOriginalRecordingJobs();
+  assert.deepEqual(replayedProofs, proofs);
+  assert.deepEqual(await readdir(proofRoot), [], 'proof outbox is acknowledged only after successful crash replay');
+});
+
+test('lifecycle v3 COMPLETE and ACK hot paths have constant persistence for N=10 and N=5000', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-bounded-hot-path-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+
+  const canonical = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+    if (value !== null && typeof value === 'object') return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`;
+    return JSON.stringify(value) as string;
+  };
+  type Operation = 'ordinary-complete' | 'threshold-complete' | 'ordinary-ack' | 'threshold-ack';
+  const measure = async (actorCount: number, operation: Operation) => {
+    const recordingId = actorCount === 10 ? `hotpath-a-${operation}` : `hotpath-b-${operation}`;
+    const outboxRoot = path.join(root, recordingId);
+    const sink = new BoundedMeetingIntegrationSink(
+      { post: async () => undefined }, logger, 4, 2, 6000,
+      { recordingRoot: root, outboxRoot }, lifecycleV3Config
+    );
+    const actors = Array.from({ length: actorCount }, (_, index) => ({
+      actorId: String(10_000_000_000_000_000n + BigInt(index)), kind: 'human' as const
+    }));
+    const sequence = operation.startsWith('threshold') ? 128 : 127;
+    const lifecycleEvent = {
+      schemaVersion: 3 as const, eventId: `event-${operation}`, recordingId,
+      guildId: event.guildId, channelId: event.channelId,
+      occurredAt: '2026-08-18T00:00:00.000Z', type: 'participant.joined' as const,
+      actorSemanticsVersion, producerCapabilityId: sealedActorRosterCapabilityId,
+      producerRevision: lifecycleV3Config.producerRevision, actorObservationState: 'consistent' as const,
+      actor: { actorId: '19999999999999999', kind: 'human' as const }
+    };
+    const digest = createHash('sha256').update(canonical(lifecycleEvent)).digest('hex');
+    const journalRoot = path.join(outboxRoot, 'lifecycle-v3', 'pending', `${recordingId}.journal`);
+    await mkdir(journalRoot, { recursive: true });
+    const rosterMaterializationTrap = new Proxy(actors, {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator || property === 'length' || property === 'map' || property === 'filter' ||
+            property === 'slice' || property === 'sort')
+          throw new Error(`${operation} materialized the full actor roster`);
+        return Reflect.get(target, property, receiver);
+      }
+    });
+    const isAck = operation.endsWith('ack');
+    const state = {
+      snapshot: {
+        schemaVersion: 2, recordingId, guildId: event.guildId, channelId: event.channelId,
+        producer: lifecycleV3Config, actorObservationState: 'consistent', actors: rosterMaterializationTrap,
+        sealedReady: null, emitted: [], pendingOutbox: []
+      },
+      actorIndex: new Map(actors.map((actor) => [actor.actorId, actor])),
+      pendingEvents: isAck ? new Map([[sequence, lifecycleEvent]]) : new Map(),
+      eventDigests: isAck ? new Map([[lifecycleEvent.eventId, digest]]) : new Map(),
+      generation: 0, nextSequence: sequence + (isAck ? 1 : 0), ackedSequence: sequence - 1,
+      closed: false, lastOccurredAt: lifecycleEvent.occurredAt,
+      lastAcknowledgedEventId: null, lastAcknowledgedDigest: null, maintenanceNeeded: false
+    };
+    (sink as any).lifecycleV3JournalIndex.set(recordingId, state);
+    let calls = 0;
+    let bytes = 0;
+    (sink as any).writeDurableJson = (_filePath: string, value: unknown) => {
+      calls++;
+      bytes += Buffer.byteLength(`${JSON.stringify(value)}\n`);
+    };
+    (sink as any).runLifecycleV3MaintenanceJournalStep = () => {
+      throw new Error(`${operation} synchronously ran maintenance`);
+    };
+    if (isAck) {
+      (sink as any).acknowledgeLifecycleV3Event(lifecycleEvent);
+      assert.equal(state.pendingEvents.size, 0, `${operation} physically evicts the pending event`);
+      assert.equal(state.eventDigests.size, 0, `${operation} physically evicts the event digest`);
+      assert.equal(state.actorIndex.size, actorCount, `${operation} preserves the indexed roster`);
+    } else {
+      (sink as any).appendLifecycleV3Event(undefined, lifecycleEvent, sequence);
+      assert.equal(state.pendingEvents.size, 1, `${operation} indexes one pending event`);
+      assert.equal(state.eventDigests.size, 1, `${operation} indexes one event digest`);
+      assert.equal(state.actorIndex.size, actorCount + 1, `${operation} applies the participant delta once`);
+    }
+    const threshold = sequence === 128 && isAck;
+    assert.equal(state.maintenanceNeeded, threshold, `${operation} only marks the ACK maintenance boundary`);
+    assert.equal((sink as any).lifecycleV3MaintenanceQueue.size, threshold ? 1 : 0);
+    return { calls, bytes, pendingEvents: state.pendingEvents.size, eventDigests: state.eventDigests.size };
+  };
+
+  const evidence: Record<Operation, Awaited<ReturnType<typeof measure>>> = {} as any;
+  for (const operation of ['ordinary-complete', 'threshold-complete', 'ordinary-ack', 'threshold-ack'] as const) {
+    const small = await measure(10, operation);
+    const large = await measure(5000, operation);
+    assert.equal(small.calls, 1, `${operation} performs exactly one durable write`);
+    assert.deepEqual(large, small, `${operation} persistence and memory are independent of roster size`);
+    assert.ok(small.bytes <= 512, `${operation} durable bytes stay within a fixed 512-byte ceiling`);
+    evidence[operation] = small;
+  }
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(evidence).map(([operation, value]) => [operation, {
+      pendingEvents: value.pendingEvents, eventDigests: value.eventDigests
+    }])),
+    {
+      'ordinary-complete': { pendingEvents: 1, eventDigests: 1 },
+      'threshold-complete': { pendingEvents: 1, eventDigests: 1 },
+      'ordinary-ack': { pendingEvents: 0, eventDigests: 0 },
+      'threshold-ack': { pendingEvents: 0, eventDigests: 0 }
+    }
+  );
+  assert.ok(Math.abs(evidence['threshold-complete'].bytes - evidence['ordinary-complete'].bytes) <= 8,
+    'the COMPLETE maintenance boundary adds at most a constant-size delta');
+  assert.ok(Math.abs(evidence['threshold-ack'].bytes - evidence['ordinary-ack'].bytes) <= 8,
+    'the ACK maintenance boundary adds at most a constant-size delta');
+  context.diagnostic(`hot-path persistence evidence ${JSON.stringify(evidence)}`);
+});
+
+test('lifecycle v3 maintenance ticks are K-bounded for N=128 and N=5000 and eventually publish', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-maintenance-budget-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const results: Array<{ actorCount: number; maximumCalls: number; maximumBytes: number; ticks: number }> = [];
+
+  for (const actorCount of [128, 5000]) {
+    const recordingId = `maintenance-${actorCount}`;
+    const outboxRoot = path.join(root, recordingId);
+    const sink = new BoundedMeetingIntegrationSink(
+      { post: async () => undefined }, logger, 4, 2, 6000,
+      { recordingRoot: root, outboxRoot }, lifecycleV3Config
+    );
+    const journalRoot = path.join(outboxRoot, 'lifecycle-v3', 'pending', `${recordingId}.journal`);
+    await mkdir(journalRoot, { recursive: true });
+    const actors = Array.from({ length: actorCount }, (_, index) => ({
+      actorId: String(10_000_000_000_000_000n + BigInt(index)), kind: 'human' as const
+    }));
+    const base = {
+      schemaVersion: 2, generation: 0, baseSequence: 128, recordingId,
+      guildId: event.guildId, channelId: event.channelId, producer: lifecycleV3Config,
+      actorObservationState: 'consistent', actors, sealedReady: null
+    };
+    (sink as any).publishLifecycleV3Generation(journalRoot, base, 128);
+    const state = {
+      snapshot: { ...base, emitted: [], pendingOutbox: [] }, actorIndex: new Map(actors.map((actor) => [actor.actorId, actor])),
+      pendingEvents: new Map(), eventDigests: new Map(), generation: 0, nextSequence: 129, ackedSequence: 128,
+      closed: true, lastOccurredAt: '2026-08-18T00:00:00.000Z', lastAcknowledgedEventId: 'acked',
+      lastAcknowledgedDigest: 'a'.repeat(64), maintenanceNeeded: true
+    };
+    (sink as any).lifecycleV3JournalIndex.set(recordingId, state);
+    (sink as any).lifecycleV3MaintenanceQueue.add(recordingId);
+    const originalWrite = (sink as any).writeDurableJson.bind(sink);
+    let calls = 0;
+    let bytes = 0;
+    (sink as any).writeDurableJson = (filePath: string, value: unknown) => {
+      calls++;
+      bytes += Buffer.byteLength(`${JSON.stringify(value)}\n`);
+      originalWrite(filePath, value);
+    };
+    let maximumCalls = 0;
+    let maximumBytes = 0;
+    let ticks = 0;
+    do {
+      calls = 0;
+      bytes = 0;
+      const more = sink.runLifecycleV3MaintenanceStep();
+      maximumCalls = Math.max(maximumCalls, calls);
+      maximumBytes = Math.max(maximumBytes, bytes);
+      ticks++;
+      if (!more) break;
+      assert.ok(ticks < 2000, 'restartable maintenance must make progress');
+    } while (true);
+    assert.equal(state.generation, 1);
+    assert.equal(state.maintenanceNeeded, false);
+    const chunks = (await readdir(journalRoot)).filter((name) => /^generation-00000001-chunk-/.test(name));
+    for (const chunk of chunks) {
+      const durable = JSON.parse(await readFile(path.join(journalRoot, chunk), 'utf8'));
+      assert.ok(durable.records.length >= 1 && durable.records.length <= 8);
+    }
+    assert.ok(maximumCalls <= 4, `tick used ${maximumCalls} durable calls`);
+    results.push({ actorCount, maximumCalls, maximumBytes, ticks });
+  }
+  assert.ok(results[1].maximumBytes <= results[0].maximumBytes + 16,
+    `tick bytes grew with N: ${JSON.stringify(results)}`);
+  assert.ok(results[1].ticks > results[0].ticks, 'larger generations complete through more fixed-work ticks');
+});
+
+test('lifecycle v3 recovery rejects torn chunks and descriptors and falls back through manifests', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-generation-corruption-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const sink = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined }, logger, 4, 2, 1024,
+    { recordingRoot: root, outboxRoot: root }, lifecycleV3Config
+  );
+  const recordingId = 'corruption-fallback';
+  const journalRoot = path.join(root, 'lifecycle-v3', 'pending', `${recordingId}.journal`);
+  await mkdir(journalRoot, { recursive: true });
+  const base = {
+    schemaVersion: 2, generation: 0, baseSequence: 128, recordingId,
+    guildId: event.guildId, channelId: event.channelId, producer: lifecycleV3Config,
+    actorObservationState: 'consistent', actors: [{ actorId: event.participantIds[0], kind: 'human' }], sealedReady: null
+  };
+  (sink as any).publishLifecycleV3Generation(journalRoot, base, 128);
+  const state = {
+    snapshot: { ...base, emitted: [], pendingOutbox: [] }, actorIndex: new Map(), pendingEvents: new Map(), eventDigests: new Map(),
+    generation: 0, nextSequence: 129, ackedSequence: 128, closed: true,
+    lastOccurredAt: '2026-08-18T00:00:00.000Z', lastAcknowledgedEventId: 'acked',
+    lastAcknowledgedDigest: 'a'.repeat(64), maintenanceNeeded: true
+  };
+  (sink as any).lifecycleV3JournalIndex.set(recordingId, state);
+  (sink as any).lifecycleV3MaintenanceQueue.add(recordingId);
+  for (let ticks = 0; sink.runLifecycleV3MaintenanceStep(); ticks++) assert.ok(ticks < 100);
+  const manifestPath = path.join(journalRoot, 'manifest.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  const descriptorPath = path.join(journalRoot, manifest.current.file);
+  const descriptor = await readFile(descriptorPath, 'utf8');
+  const chunkPath = path.join(journalRoot, 'generation-00000001-chunk-00000000.json');
+  const chunk = await readFile(chunkPath, 'utf8');
+
+  await writeFile(chunkPath, '{"torn":');
+  assert.equal((sink as any).recoverLifecycleV3Generation(journalRoot).generation, 0);
+  await writeFile(chunkPath, chunk);
+  await writeFile(descriptorPath, '{"torn":');
+  assert.equal((sink as any).recoverLifecycleV3Generation(journalRoot).generation, 0);
+  await writeFile(descriptorPath, descriptor);
+  await writeFile(manifestPath, '{"torn":');
+  assert.equal((sink as any).recoverLifecycleV3Generation(journalRoot).generation, 0,
+    'a torn current manifest selects only the separately referenced previous generation');
+
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+  const corruptChunk = JSON.parse(chunk);
+  corruptChunk.checksumSha256 = '0'.repeat(64);
+  await writeFile(chunkPath, `${JSON.stringify(corruptChunk)}\n`);
+  assert.equal((sink as any).recoverLifecycleV3Generation(journalRoot).generation, 0,
+    'valid JSON with a corrupt chunk checksum falls back to previous');
+  await writeFile(chunkPath, chunk);
+  const corruptDescriptor = JSON.parse(descriptor);
+  corruptDescriptor.checksumSha256 = '0'.repeat(64);
+  await writeFile(descriptorPath, `${JSON.stringify(corruptDescriptor)}\n`);
+  assert.equal((sink as any).recoverLifecycleV3Generation(journalRoot).generation, 0,
+    'generation descriptor/final checksum corruption falls back to previous');
+
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+  await writeFile(descriptorPath, '{"torn":');
+  await writeFile(path.join(journalRoot, manifest.previous.file), '{"torn":');
+  await writeFile(path.join(journalRoot, 'manifest.previous.json'), '{"torn":');
+  assert.equal((sink as any).recoverLifecycleV3Generation(journalRoot), undefined,
+    'current and previous invalid fails closed without selecting an orphan generation');
+});
+
+test('lifecycle v3 table-driven crash matrix recovers every durable maintenance phase without selecting partial generations', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-crash-matrix-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const actors = Array.from({ length: 19 }, (_, index) => ({
+    actorId: String(10_000_000_000_000_000n + BigInt(index)), kind: 'human' as const
+  }));
+  const points = [
+    { name: 'capture-target', match: (file: string) => file.endsWith('maintenance.json'), occurrence: 1 },
+    { name: 'every-chunk-write-first', match: (file: string) => file.includes('-chunk-00000000.json'), occurrence: 1 },
+    { name: 'every-chunk-write-middle', match: (file: string) => file.includes('-chunk-00000001.json'), occurrence: 1 },
+    { name: 'every-chunk-write-last', match: (file: string) => file.includes('-chunk-00000002.json'), occurrence: 1 },
+    { name: 'generation-descriptor-final-checksum', match: (file: string) => file.endsWith('snapshot-00000001.json'), occurrence: 1 },
+    { name: 'previous-manifest-publication', match: (file: string) => file.endsWith('manifest.previous.json'), occurrence: 1 },
+    { name: 'current-manifest-publication', match: (file: string) => file.endsWith('manifest.json'), occurrence: 1 },
+    { name: 'delta-cleanup-cursor-and-steps', match: (file: string, value: any) => file.endsWith('maintenance.json') && value.phase === 'cleanup-deltas', occurrence: 1 },
+    { name: 'generation-cleanup-cursor-and-steps', match: (file: string, value: any) => file.endsWith('maintenance.json') && value.phase === 'cleanup-generations', occurrence: 1 }
+  ];
+
+  for (const point of points) for (const side of ['before', 'after'] as const) {
+    const recordingId = `${point.name}-${side}`.replace(/[^a-z0-9-]/g, '-');
+    const outboxRoot = path.join(root, recordingId);
+    const makeSink = () => new BoundedMeetingIntegrationSink(
+      { post: async () => undefined }, logger, 4, 2, 6000,
+      { recordingRoot: root, outboxRoot }, lifecycleV3Config
+    );
+    let sink = makeSink();
+    const journalRoot = path.join(outboxRoot, 'lifecycle-v3', 'pending', `${recordingId}.journal`);
+    await mkdir(journalRoot, { recursive: true });
+    const base = {
+      schemaVersion: 2, generation: 0, baseSequence: 0, recordingId,
+      guildId: event.guildId, channelId: event.channelId, producer: lifecycleV3Config,
+      actorObservationState: 'consistent', actors, sealedReady: null
+    };
+    (sink as any).publishLifecycleV3Generation(journalRoot, base, 0);
+    const started = {
+      schemaVersion: 3, eventId: `${recordingId}:start`, recordingId, guildId: event.guildId, channelId: event.channelId,
+      occurredAt: '2026-08-18T00:00:00.000Z', type: 'meeting.started', actorSemanticsVersion,
+      producerCapabilityId: sealedActorRosterCapabilityId, producerRevision: lifecycleV3Config.producerRevision,
+      actorObservationState: 'consistent', actors, rosterState: 'unsealed'
+    };
+    for (let sequence = 0; sequence <= 5; sequence++) await writeFile(
+      path.join(journalRoot, `${String(sequence).padStart(8, '0')}.event.json`),
+      `${JSON.stringify(sequence === 0 ? started : {
+        ...started, eventId: `${recordingId}:${sequence}`, occurredAt: `2026-08-18T00:00:0${sequence}.000Z`,
+        type: 'participant.joined', actor: actors[sequence], actors: undefined, rosterState: undefined
+      })}\n`
+    );
+    const digest = createHash('sha256').update(JSON.stringify(started)).digest('hex');
+    await writeFile(path.join(journalRoot, 'cursor.json'), `${JSON.stringify({
+      schemaVersion: 1, generation: 0, ackedSequence: 4, eventId: `${recordingId}:4`, digestSha256: 'a'.repeat(64)
+    })}\n`);
+    const state = {
+      snapshot: { ...base, emitted: [], pendingOutbox: [] }, actorIndex: new Map(actors.map((actor) => [actor.actorId, actor])),
+      pendingEvents: new Map(), eventDigests: new Map(), generation: 0, nextSequence: 6, ackedSequence: 4,
+      closed: false, lastOccurredAt: '2026-08-18T00:00:05.000Z', lastAcknowledgedEventId: `${recordingId}:4`,
+      lastAcknowledgedDigest: digest, maintenanceNeeded: true
+    };
+    (sink as any).lifecycleV3JournalIndex.set(recordingId, state);
+    (sink as any).lifecycleV3MaintenanceQueue.add(recordingId);
+    const durableWrite = (sink as any).writeDurableJson.bind(sink);
+    let seen = 0;
+    let crashed = false;
+    (sink as any).writeDurableJson = (file: string, value: unknown) => {
+      if (point.match(file, value) && ++seen === point.occurrence) {
+        if (side === 'before') throw new Error(`injected ${point.name} before`);
+        durableWrite(file, value);
+        crashed = true;
+        throw new Error(`injected ${point.name} after`);
+      }
+      durableWrite(file, value);
+    };
+    try { for (let ticks = 0; sink.runLifecycleV3MaintenanceStep(); ticks++) assert.ok(ticks < 100); }
+    catch (error) { assert.match(String(error), /injected/); crashed = true; }
+    assert.equal(crashed, true, `${point.name}/${side} was exercised`);
+
+    sink = makeSink();
+    const recovered = (sink as any).recoverLifecycleV3Generation(journalRoot);
+    assert.ok(recovered?.generation === 0 || recovered?.generation === 1, 'only a complete manifest-referenced generation is selected');
+    const recoveredActors = new Set(recovered.actors.map((actor: any) => actor.actorId));
+    assert.equal(recoveredActors.size, recovered.actors.length, 'no actor/event effect is applied twice');
+    assert.ok(await readFile(path.join(journalRoot, '00000005.event.json'), 'utf8'), 'post-capture delta is preserved');
+    const cursor = JSON.parse(await readFile(path.join(journalRoot, 'cursor.json'), 'utf8'));
+    assert.equal(cursor.ackedSequence, 4, 'acknowledged cursor survives every crash point');
+  }
+});
+
+test('lifecycle v3 long-run append ACK compaction and restart keeps physical indexes bounded and duplicate ACK idempotent', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-long-run-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingId = 'long-run-append-ack';
+  const makeSink = () => new BoundedMeetingIntegrationSink(
+    { post: async () => undefined }, logger, 4, 2, 6000,
+    { recordingRoot: root, outboxRoot: root }, lifecycleV3Config
+  );
+  let sink = makeSink();
+  const firstActor = { actorId: '10000000000000000', kind: 'human' as const };
+  const admission = {
+    schemaVersion: 2 as const, recordingId, guildId: event.guildId, channelId: event.channelId,
+    producer: {
+      actorSemanticsVersion, producerCapabilityId: sealedActorRosterCapabilityId,
+      producerRevision: lifecycleV3Config.producerRevision
+    },
+    actorObservationState: 'consistent' as const, actors: [firstActor], sealedReady: null
+  };
+  const started = {
+    schemaVersion: 3 as const, eventId: `${recordingId}:0`, recordingId, guildId: event.guildId, channelId: event.channelId,
+    occurredAt: '2026-08-18T00:00:00.000Z', type: 'meeting.started' as const, actorSemanticsVersion,
+    producerCapabilityId: sealedActorRosterCapabilityId, producerRevision: lifecycleV3Config.producerRevision,
+    actorObservationState: 'consistent' as const, actors: [firstActor], rosterState: 'unsealed' as const
+  };
+  (sink as any).appendLifecycleV3Event(admission, started, 0);
+  (sink as any).acknowledgeLifecycleV3Event(started);
+  let last: any = started;
+  for (let sequence = 1; sequence <= 1024; sequence++) {
+    last = {
+      schemaVersion: 3 as const, eventId: `${recordingId}:${sequence}`, recordingId,
+      guildId: event.guildId, channelId: event.channelId,
+      occurredAt: new Date(Date.parse('2026-08-18T00:00:00.000Z') + sequence).toISOString(),
+      type: 'participant.joined' as const, actorSemanticsVersion,
+      producerCapabilityId: sealedActorRosterCapabilityId, producerRevision: lifecycleV3Config.producerRevision,
+      actorObservationState: 'consistent' as const,
+      actor: { actorId: String(10_000_000_000_000_000n + BigInt(sequence)), kind: 'human' as const }
+    };
+    (sink as any).appendLifecycleV3Event(undefined, last, sequence);
+    (sink as any).acknowledgeLifecycleV3Event(last);
+    const indexed = (sink as any).lifecycleV3JournalIndex.get(recordingId);
+    assert.equal(indexed.pendingEvents.size, 0, `pendingEvents bounded after cycle ${sequence}`);
+    assert.equal(indexed.eventDigests.size, 0, `eventDigests bounded after cycle ${sequence}`);
+    if (sequence % 4 === 0) sink.runLifecycleV3MaintenanceStep();
+  }
+  for (let ticks = 0; sink.runLifecycleV3MaintenanceStep(); ticks++) assert.ok(ticks < 5000, 'compaction eventually completes');
+
+  sink = makeSink();
+  const recovered = (sink as any).readLifecycleV3Journal(recordingId);
+  assert.equal(recovered.ackedSequence, 1024);
+  assert.equal(recovered.pendingEvents.size, 0);
+  assert.equal(recovered.eventDigests.size, 0);
+  assert.equal(recovered.actorIndex.size, 1025, 'post-capture deltas survive interleaved compaction and restart');
+  (sink as any).acknowledgeLifecycleV3Event(last);
+  assert.equal(recovered.ackedSequence, 1024, 'duplicate ACK after restart is idempotent');
 });

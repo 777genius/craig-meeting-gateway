@@ -7,7 +7,7 @@ import dayjs from 'dayjs';
 import duration from 'dayjs/plugin/duration';
 import { DexareClient } from 'dexare';
 import Eris from 'eris';
-import { closeSync, fsyncSync, openSync, renameSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { access, writeFile } from 'fs/promises';
 import { customAlphabet, nanoid } from 'nanoid';
 import path from 'path';
@@ -41,9 +41,7 @@ import {
 import {
   type AuthenticatedDiscordActor,
   type CraigLifecycleV3Producer,
-  type DurableCraigLifecycleV3Snapshot,
-  createCraigLifecycleV3Producer,
-  restoreCraigLifecycleV3ProducerFromSnapshot
+  createCraigLifecycleV3Producer
 } from './meetingLifecycleV3';
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
@@ -192,7 +190,6 @@ export default class Recording {
   private readonly terminalMeetingLifecycle = new MeetingTerminalLifecycle();
   private meetingStartedLifecycle?: AnyMeetingStartedLifecycleEvent;
   private lifecycleV3?: CraigLifecycleV3Producer;
-  private lifecycleV3Checkpoint?: DurableCraigLifecycleV3Snapshot;
 
   constructor(recorder: RecorderModule<DexareClient<CraigBotConfig>>, channel: Eris.StageChannel | Eris.VoiceChannel, user: Eris.User, auto = false) {
     this.recorder = recorder;
@@ -649,6 +646,8 @@ export default class Recording {
       },
       onPacketDispatched: (opusPacket) => this.recordDispatchedConversationPacket(opusPacket),
       onCancellation: (cancellation) => this.persistConversationPlaybackFence(generation, cancellation),
+      isAttemptRevoked: (identity) => this.isConversationPlaybackAttemptRevoked(generation, identity),
+      onPostCancellationPacket: (identity) => this.recordPostCancellationPacketAttempt(generation, identity),
       onReady: () => this.conversationPlaybackReconnect.connected(),
       onClosed: (reason) => {
         if (this.conversationPlayback?.isClosed) this.conversationPlayback = undefined;
@@ -693,15 +692,35 @@ export default class Recording {
 
   private persistConversationPlaybackFence(
     generation: number,
-    cancellation: Readonly<{ recordingId: string; turnId: string; attemptId: string; cancellationObservedAt?: string }>
+    cancellation: Readonly<{
+      schemaVersion: 1 | 2; type: 'playback-cancel'; meetingId?: string; recordingId: string;
+      turnId: string; attemptId: string; cancellationObservedAtMs?: number; cancellationObservedAt?: string; reason: string;
+    }>
   ): boolean {
     const writer = this.writer;
     if (!writer || cancellation.recordingId !== this.id || generation !== this.conversationPlaybackGeneration) return false;
+    if (cancellation.schemaVersion === 2 &&
+        (!Number.isSafeInteger(cancellation.cancellationObservedAtMs) || cancellation.cancellationObservedAtMs! < 0 ||
+         cancellation.cancellationObservedAtMs! > 8_640_000_000_000_000)) return false;
     const attemptKey = createHash('sha256')
       .update(`${cancellation.turnId}\0${cancellation.attemptId}`)
       .digest('hex')
       .slice(0, 32);
     const filePath = `${writer.fileBase}.playback-cancellation-fence.${attemptKey}.json`;
+    if (existsSync(filePath)) {
+      try {
+        const fence = this.readConversationPlaybackFence(filePath, cancellation);
+        if (fence.schemaVersion !== cancellation.schemaVersion || fence.type !== cancellation.type ||
+            fence.meetingId !== cancellation.meetingId || fence.reason !== cancellation.reason ||
+            fence.cancellationObservedAtMs !== cancellation.cancellationObservedAtMs ||
+            fence.cancellationObservedAt !== cancellation.cancellationObservedAt)
+          throw new Error('Cancellation fence retry conflicts with durable cancellation identity');
+        return true;
+      } catch (error) {
+        this.recorder.logger.error(`Failed to validate durable playback cancellation fence for recording ${this.id}`, error);
+        return false;
+      }
+    }
     const temporaryPath = `${filePath}.${process.pid}.${nanoid(8)}.tmp`;
     let descriptor: number | undefined;
     try {
@@ -709,13 +728,12 @@ export default class Recording {
       writeFileSync(
         descriptor,
         `${JSON.stringify({
-          schemaVersion: 1,
-          recordingId: this.id,
-          turnId: cancellation.turnId,
-          attemptId: cancellation.attemptId,
-          cancellationObservedAt: cancellation.cancellationObservedAt ?? null,
-          fenceObservedAt: cancellation.cancellationObservedAt ?? null,
-          playbackGeneration: generation
+          ...cancellation,
+          playbackGeneration: generation,
+          attemptGenerationToken: nanoid(24),
+          fenceObservedAtMs: Math.max(Date.now(), cancellation.cancellationObservedAtMs ?? 0),
+          postCancellationAttemptedPacketCount: 0,
+          postCancellationAcceptedPacketCount: 0
         })}\n`,
         'utf8'
       );
@@ -735,6 +753,67 @@ export default class Recording {
       this.recorder.logger.error(`Failed to durably persist playback cancellation fence for recording ${this.id}`, error);
       return false;
     }
+  }
+
+  private recordPostCancellationPacketAttempt(
+    generation: number,
+    identity: Readonly<{ recordingId: string; turnId: string; attemptId: string }>
+  ): boolean {
+    const writer = this.writer;
+    if (!writer || identity.recordingId !== this.id || generation !== this.conversationPlaybackGeneration)
+      throw new Error('Playback cancellation counter cannot be persisted outside the active recording generation');
+    const attemptKey = createHash('sha256').update(`${identity.turnId}\0${identity.attemptId}`).digest('hex').slice(0, 32);
+    const filePath = `${writer.fileBase}.playback-cancellation-fence.${attemptKey}.json`;
+    const fence = this.readConversationPlaybackFence(filePath, identity);
+    const attempted = fence.postCancellationAttemptedPacketCount;
+    if (!Number.isSafeInteger(attempted) || (attempted as number) < 0 || attempted === Number.MAX_SAFE_INTEGER)
+      throw new Error('Cancellation fence counter is invalid');
+    this.writeConversationPlaybackFence(filePath, { ...fence, postCancellationAttemptedPacketCount: (attempted as number) + 1 });
+    return true;
+  }
+
+  private isConversationPlaybackAttemptRevoked(
+    generation: number,
+    identity: Readonly<{ recordingId: string; turnId: string; attemptId: string }>
+  ): boolean {
+    const writer = this.writer;
+    if (!writer || identity.recordingId !== this.id || generation !== this.conversationPlaybackGeneration) return true;
+    const attemptKey = createHash('sha256').update(`${identity.turnId}\0${identity.attemptId}`).digest('hex').slice(0, 32);
+    const filePath = `${writer.fileBase}.playback-cancellation-fence.${attemptKey}.json`;
+    try {
+      this.readConversationPlaybackFence(filePath, identity);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      // A file at the deterministic identity path is relevant. Corruption,
+      // token loss, or an identity mismatch therefore fails admission closed.
+      this.recorder.logger.error(`Failed to validate playback cancellation fence for recording ${this.id}`, error);
+      return true;
+    }
+  }
+
+  private readConversationPlaybackFence(
+    filePath: string,
+    identity: Readonly<{ recordingId: string; turnId: string; attemptId: string }>
+  ): Record<string, unknown> {
+    const fence = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+    if (fence.recordingId !== identity.recordingId || fence.turnId !== identity.turnId || fence.attemptId !== identity.attemptId)
+      throw new Error('Cancellation fence identity mismatch');
+    if (typeof fence.attemptGenerationToken !== 'string' || fence.attemptGenerationToken.length === 0)
+      throw new Error('Cancellation fence generation token is missing');
+    if (!Number.isSafeInteger(fence.postCancellationAcceptedPacketCount) || fence.postCancellationAcceptedPacketCount !== 0)
+      throw new Error('Cancellation fence accepted counter is invalid');
+    return fence;
+  }
+
+  private writeConversationPlaybackFence(filePath: string, fence: unknown): void {
+    const temporaryPath = `${filePath}.${process.pid}.${nanoid(8)}.tmp`;
+    const descriptor = openSync(temporaryPath, 'wx', 0o600);
+    try { writeFileSync(descriptor, `${JSON.stringify(fence)}\n`, 'utf8'); fsyncSync(descriptor); }
+    finally { closeSync(descriptor); }
+    renameSync(temporaryPath, filePath);
+    const directory = openSync(path.dirname(filePath), 'r');
+    try { fsyncSync(directory); } finally { closeSync(directory); }
   }
 
   /**
@@ -1188,27 +1267,15 @@ export default class Recording {
   private publishMeetingLifecycleEvent(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome {
     const outcome = this.recorder.meetingIntegration.publishLifecycle(
       event,
-      this.lifecycleV3 === undefined ? undefined : this.lifecycleV3.durableSnapshot()
+      this.lifecycleV3 === undefined || event.type !== 'meeting.started' ? undefined : this.lifecycleV3.durableAdmission()
     );
-    if (event.schemaVersion === 3) {
-      if (outcome.status !== 'accepted' && this.lifecycleV3Checkpoint !== undefined)
-        this.lifecycleV3 = restoreCraigLifecycleV3ProducerFromSnapshot(this.lifecycleV3Checkpoint);
-      this.lifecycleV3Checkpoint = undefined;
-    }
+    if (event.schemaVersion === 3 && outcome.status !== 'accepted') this.lifecycleV3!.rollbackAdmission(event);
     reportMeetingLifecyclePublishOutcome(this.recorder.logger, this.id, event.type, outcome);
     return outcome;
   }
 
   private createLifecycleV3Event<T extends MeetingLifecycleEvent>(create: () => T): T {
-    const checkpoint = this.lifecycleV3!.durableSnapshot();
-    this.lifecycleV3Checkpoint = checkpoint;
-    try {
-      return create();
-    } catch (error) {
-      this.lifecycleV3 = restoreCraigLifecycleV3ProducerFromSnapshot(checkpoint);
-      this.lifecycleV3Checkpoint = undefined;
-      throw error;
-    }
+    return create();
   }
 
   private markConnectionLost(reason: string) {

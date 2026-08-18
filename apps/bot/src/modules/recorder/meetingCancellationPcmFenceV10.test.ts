@@ -157,6 +157,7 @@ test('shared meeting-verifier fixture matches the final-upload proof adapter byt
   const fixtureFile = JSON.parse(await readFile(path.join(root, 'canonical-fixture.json'), 'utf8')) as { proof: unknown };
   assert.deepEqual(
     createAuthoritativeCancellationPcmFenceLog({
+      attemptedPacketCountAfterCancellation: 0,
       attemptId: 'attempt-1',
       cancellationObservedAt: at(3),
       fenceObservedAt: at(3),

@@ -4,7 +4,7 @@ import test from 'node:test';
 
 import type { MeetingLifecycleEvent, MeetingLifecyclePublishOutcome } from './meetingIntegration';
 import {
-  type DurableCraigLifecycleV3Snapshot,
+  type CraigLifecycleV3Admission,
   actorSemanticsVersion,
   createCraigLifecycleV3Producer,
   sealedActorRosterCapabilityId
@@ -46,7 +46,7 @@ interface RecordingLifecycleInternals {
 async function createRecordingHarness(...outcomes: MeetingLifecyclePublishOutcome[]) {
   await recordingLoaded;
   const events: MeetingLifecycleEvent[] = [];
-  const snapshots: Array<DurableCraigLifecycleV3Snapshot | undefined> = [];
+  const admissions: Array<CraigLifecycleV3Admission | undefined> = [];
   const participants = new MeetingParticipantLifecycle();
   participants.begin([], botId);
 
@@ -68,16 +68,16 @@ async function createRecordingHarness(...outcomes: MeetingLifecyclePublishOutcom
         warn() {}
       },
       meetingIntegration: {
-        publishLifecycle(event: MeetingLifecycleEvent, snapshot?: DurableCraigLifecycleV3Snapshot): MeetingLifecyclePublishOutcome {
+        publishLifecycle(event: MeetingLifecycleEvent, admission?: CraigLifecycleV3Admission): MeetingLifecyclePublishOutcome {
           events.push(event);
-          snapshots.push(snapshot);
+          admissions.push(admission);
           return outcomes.shift() ?? { status: 'accepted' };
         }
       }
     }
   });
 
-  return { recording, events, snapshots };
+  return { recording, events, admissions };
 }
 
 function participantMember(isPresent: boolean): Parameters<RecordingType['onVoiceStateUpdate']>[0] {
@@ -194,7 +194,7 @@ test('the Recording Discord adapter derives fail-closed bot, system, and webhook
 });
 
 test('rolls back rejected v3 producer evidence before the next accepted transition', async () => {
-  const { recording, events, snapshots } = await createRecordingHarness({ status: 'capacity-exhausted' }, { status: 'accepted' });
+  const { recording, events, admissions } = await createRecordingHarness({ status: 'capacity-exhausted' }, { status: 'accepted' });
   const lifecycle = createCraigLifecycleV3Producer(
     {
       schemaVersion: 3,
@@ -223,8 +223,34 @@ test('rolls back rejected v3 producer evidence before the next accepted transiti
     events.map(({ eventId }) => eventId),
     ['recording-1:1', 'recording-1:2']
   );
-  assert.deepEqual(
-    snapshots[1]?.pendingOutbox.map(({ eventId }) => eventId),
-    [started.eventId, 'recording-1:2']
+  assert.equal(admissions[1]?.recordingId, started.recordingId);
+  assert.deepEqual(admissions[1]?.actors, [{ actorId: participantId, kind: 'human' }]);
+});
+
+test('admits a transition without materializing growing producer history', async () => {
+  const { recording, events } = await createRecordingHarness({ status: 'accepted' });
+  const lifecycle = createCraigLifecycleV3Producer(
+    {
+      schemaVersion: 3,
+      actorSemanticsVersion,
+      producerCapabilityId: sealedActorRosterCapabilityId,
+      producerRevision: '0123456789abcdef0123456789abcdef01234567'
+    },
+    { recordingId: 'recording-1', guildId: '1533232836297011436', channelId }
   );
+  lifecycle.started(
+    { eventId: 'history:0', recordingId: 'recording-1', guildId: '1533232836297011436', channelId, occurredAt: '2026-08-18T00:00:00.000Z' },
+    []
+  );
+  for (let index = 1; index <= 500; index++)
+    lifecycle.connection(
+      { eventId: `history:${index}`, recordingId: 'recording-1', guildId: '1533232836297011436', channelId, occurredAt: `2026-08-18T00:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}.000Z` },
+      index % 2 === 0 ? 'meeting.connection_recovered' : 'meeting.connection_lost',
+      null
+    );
+  lifecycle.durableSnapshot = () => { throw new Error('full history snapshot created during admission'); };
+  Object.assign(recording, { lifecycleV3: lifecycle });
+
+  await recording.onVoiceStateUpdate(participantMember(true), oldVoiceState);
+  assert.equal(events.at(-1)?.type, 'participant.joined');
 });
