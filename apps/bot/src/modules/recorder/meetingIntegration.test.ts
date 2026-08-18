@@ -398,6 +398,32 @@ test('classifies a second terminal lifecycle as duplicate without delivering it'
   );
 });
 
+test('bounds closed lifecycle history and evicts the oldest recording deterministically', async () => {
+  const sink = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 8, 2, 2);
+  const started = (recordingId: string): MeetingStartedLifecycleEvent => ({
+    ...event,
+    eventId: `${recordingId}:1`,
+    recordingId
+  });
+  const ended = (recordingId: string): MeetingTerminalLifecycleEvent => ({
+    ...terminalEvent,
+    eventId: `${recordingId}:2`,
+    recordingId
+  });
+
+  for (const recordingId of ['recording-1', 'recording-2', 'recording-3']) {
+    assert.deepEqual(sink.publishLifecycle(started(recordingId)), accepted);
+    assert.deepEqual(sink.publishLifecycle(ended(recordingId)), accepted);
+    assert.equal(await sink.drain(1000), true);
+  }
+
+  assert.deepEqual(sink.publishLifecycle(ended('recording-2')), { status: 'duplicate' });
+  assert.deepEqual(sink.publishLifecycle(ended('recording-1')), { status: 'missing-start' });
+  assert.deepEqual(sink.publishLifecycle(started('recording-1')), accepted);
+  assert.deepEqual(sink.publishLifecycle(ended('recording-1')), accepted);
+  assert.equal(await sink.drain(1000), true);
+});
+
 test('reports lifecycle admission telemetry by outcome classification', () => {
   const messages: Array<{ level: string; message: string }> = [];
   const telemetryLogger: MeetingIntegrationLogger = {

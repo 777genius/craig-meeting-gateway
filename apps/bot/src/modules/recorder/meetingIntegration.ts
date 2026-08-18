@@ -380,7 +380,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private readonly originalJobs: PendingOriginalRecordingJob[] = [];
   private readonly drainWaiters = new Set<() => void>();
   private readonly openRecordings = new Set<string>();
-  private readonly closedRecordings = new Set<string>();
+  private readonly closedRecordings = new Map<string, true>();
   private processing = false;
   private retryTimer: NodeJS.Timeout | null = null;
   private processingOriginal = false;
@@ -431,10 +431,18 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     this.queue.push({ type: 'lifecycle', event });
     if (isTerminal) {
       this.openRecordings.delete(event.recordingId);
-      this.closedRecordings.add(event.recordingId);
+      this.rememberClosedRecording(event.recordingId);
     }
     this.scheduleProcessing();
     return acceptedLifecycleOutcome;
+  }
+
+  private rememberClosedRecording(recordingId: string): void {
+    this.closedRecordings.set(recordingId, true);
+    if (this.closedRecordings.size <= this.maxQueuedLifecycleEvents) return;
+
+    const oldestRecordingId = this.closedRecordings.keys().next().value;
+    if (oldestRecordingId !== undefined) this.closedRecordings.delete(oldestRecordingId);
   }
 
   publishPacket(packet: MeetingVoicePacket, opus: Buffer): boolean {
