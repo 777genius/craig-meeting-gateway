@@ -8,7 +8,8 @@ import {
   type CancellationPcmFenceDurability,
   type DurableBotikTrackProof,
   MeetingCancellationPcmFenceV10,
-  cancellationReceiptDigest
+  cancellationReceiptDigest,
+  createAuthoritativeCancellationPcmFenceLog
 } from './meetingCancellationPcmFenceV10';
 
 const track = Object.freeze({ speakerId: '1533228054724346087', trackNumber: 7, packetCursor: 8 });
@@ -151,12 +152,19 @@ test('replays a durably persisted receipt after restart without reflushing', asy
   assert.equal(replayed.length, 1);
 });
 
-test('shared meeting-verifier fixture matches the producer byte-for-byte', async () => {
+test('shared meeting-verifier fixture matches the final-upload proof adapter byte-for-byte', async () => {
   const root = path.resolve(__dirname, '../../../contracts/meeting-cancellation-pcm-fence-v10');
-  const fixtureFile = JSON.parse(await readFile(path.join(root, 'canonical-fixture.json'), 'utf8')) as { receipt: unknown };
-  const { fence } = fixture();
-  fence.acceptFactualPcm(0, at(1));
-  fence.acceptFactualPcm(1, at(2));
-  fence.cancel('barge-in', at(3));
-  assert.deepEqual(await fence.finalize(), fixtureFile.receipt);
+  const fixtureFile = JSON.parse(await readFile(path.join(root, 'canonical-fixture.json'), 'utf8')) as { proof: unknown };
+  assert.deepEqual(
+    createAuthoritativeCancellationPcmFenceLog({
+      attemptId: 'attempt-1',
+      cancellationObservedAt: at(3),
+      fenceObservedAt: at(3),
+      meetingId: 'meeting-1',
+      recordingId: 'recording-1',
+      trackSha256: 'a'.repeat(64),
+      turnId: 'turn-1'
+    }),
+    fixtureFile.proof
+  );
 });

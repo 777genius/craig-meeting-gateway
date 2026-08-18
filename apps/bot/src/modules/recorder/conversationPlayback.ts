@@ -11,7 +11,7 @@ export const CRAIG_PLAYBACK_MAX_PCM_CHUNK_BYTES = 19_200;
 
 type CraigPlaybackFailureCode = 'backpressure' | 'connection-unavailable' | 'invalid-audio' | 'playback-error' | 'transport-disconnected';
 
-interface PlaybackIdentity {
+export interface PlaybackIdentity {
   recordingId: string;
   turnId: string;
   attemptId: string;
@@ -33,6 +33,8 @@ interface PlaybackFinishCommand extends PlaybackIdentity {
 
 interface PlaybackCancelCommand extends PlaybackIdentity {
   type: 'playback-cancel';
+  /** Exact Meeting logger observation time. Optional until Meeting's v1 producer propagates it. */
+  cancellationObservedAt?: string;
 }
 
 type CraigPlaybackCommand = PlaybackStartCommand | PlaybackAudioChunkCommand | PlaybackFinishCommand | PlaybackCancelCommand;
@@ -88,6 +90,12 @@ export interface CraigPlaybackControllerOptions {
   arbiter: CraigPlaybackArbiter;
   onEvent(event: CraigPlaybackEvent): void;
   onPacketDispatched?(opusPacket: Buffer): void;
+  /**
+   * Synchronously establishes the durable admission fence before the active
+   * generation is revoked. Returning false fails closed and leaves playback
+   * active so the command can be retried after durability recovers.
+   */
+  onCancellation?(cancellation: Readonly<PlaybackIdentity & { cancellationObservedAt?: string }>): boolean;
   createOpusEncoder?: () => CraigPlaybackOpusEncoder;
   now?: () => number;
   timer?: CraigPlaybackTimer;
@@ -470,6 +478,19 @@ export class CraigPlaybackController {
     if (!active) return true;
     if (!this.matches(active, command)) return true;
 
+    // Meeting v1 historically omitted its logger's observedAt. Never invent a
+    // Craig timestamp: without that trusted value the verifier's exact-time
+    // proof cannot be produced, although local playback cancellation remains
+    // backward compatible.
+    if (
+      this.options.onCancellation?.({
+        recordingId: command.recordingId,
+        turnId: command.turnId,
+        attemptId: command.attemptId,
+        ...(command.cancellationObservedAt === undefined ? {} : { cancellationObservedAt: command.cancellationObservedAt })
+      }) === false
+    )
+      return true;
     this.cancel(active);
     return true;
   }
@@ -634,7 +655,9 @@ function parseCraigPlaybackCommand(value: unknown): CraigPlaybackCommand {
       return { ...identity, type };
     }
     case 'playback-cancel': {
-      const identity = parseEnvelope(value, ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'reason']);
+      const baseKeys = ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'reason'];
+      const keys = value.cancellationObservedAt === undefined ? baseKeys : [...baseKeys, 'cancellationObservedAt'];
+      const identity = parseEnvelope(value, keys);
       if (
         value.reason !== 'barge-in' &&
         value.reason !== 'meeting-ended' &&
@@ -643,11 +666,25 @@ function parseCraigPlaybackCommand(value: unknown): CraigPlaybackCommand {
         value.reason !== 'superseded'
       )
         throw new Error('Playback cancel reason is invalid');
-      return { ...identity, type };
+      if (value.cancellationObservedAt !== undefined && !isCanonicalInstant(value.cancellationObservedAt))
+        throw new Error('Playback cancellation observation time is invalid');
+      return {
+        ...identity,
+        type,
+        ...(value.cancellationObservedAt === undefined ? {} : { cancellationObservedAt: value.cancellationObservedAt })
+      };
     }
     default:
       throw new Error('Playback command type is unsupported');
   }
+}
+
+function isCanonicalInstant(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) &&
+    new Date(value).toISOString() === value
+  );
 }
 
 function parseEnvelope(value: Record<string, unknown>, expectedKeys: readonly string[]): PlaybackIdentity {

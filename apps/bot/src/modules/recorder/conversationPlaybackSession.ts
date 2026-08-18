@@ -51,6 +51,7 @@ export interface ConversationPlaybackSessionOptions {
   createOpusEncoder?: () => CraigPlaybackOpusEncoder;
   now?: () => number;
   onPacketDispatched?: (opusPacket: Buffer) => void;
+  onCancellation?: ConstructorParameters<typeof CraigPlaybackController>[0]['onCancellation'];
   onReady?: () => void;
   onClosed?: (reason: ConversationPlaybackCloseReason) => void;
 }
@@ -219,6 +220,7 @@ export async function createConversationPlaybackSession(
     createOpusEncoder: options.createOpusEncoder,
     now: options.now,
     onPacketDispatched: options.onPacketDispatched,
+    onCancellation: options.onCancellation,
     onEvent: (event) => sendEvent(event)
   });
   const gatewaySessionId = options.createGatewaySessionId?.() ?? randomUUID();

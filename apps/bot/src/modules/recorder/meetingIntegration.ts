@@ -691,6 +691,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private persistLifecycleV3Admission(event: CraigLifecycleV3Event, snapshot: DurableCraigLifecycleV3Snapshot | undefined): void {
     if (snapshot === undefined) throw new Error('Lifecycle v3 admission requires its durable producer snapshot');
     const normalized = restoreCraigLifecycleV3ProducerFromSnapshot(snapshot).durableSnapshot();
+    if (normalized.pendingOutbox.length > this.maxQueuedLifecycleEvents)
+      throw new Error('Lifecycle v3 durable outbox capacity is exhausted');
     const admitted = normalized.pendingOutbox[normalized.pendingOutbox.length - 1];
     if (admitted === undefined || canonicalJson(admitted) !== canonicalJson(event))
       throw new Error('Lifecycle v3 admission event is not the latest event in its durable snapshot');
@@ -762,6 +764,13 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       try {
         const snapshot = restoreCraigLifecycleV3ProducerFromSnapshot(JSON.parse(readFileSync(filePath, 'utf8')) as unknown).durableSnapshot();
         if (entry !== `${snapshot.recordingId}.json`) throw new Error('Lifecycle v3 durable snapshot filename does not match its recording');
+        const queuedLifecycleEvents = this.queue.length - this.queuedPackets;
+        if (queuedLifecycleEvents + snapshot.pendingOutbox.length > this.maxQueuedLifecycleEvents) {
+          this.logger.warn(
+            `Lifecycle v3 recovery capacity is exhausted; leaving durable snapshot ${entry} pending for a later restart`
+          );
+          continue;
+        }
         for (const event of snapshot.pendingOutbox) {
           if (!this.queue.some((item) => item.type === 'lifecycle' && item.event.eventId === event.eventId))
             this.queue.push({ type: 'lifecycle', event });

@@ -90,7 +90,13 @@ class FakeVoiceConnection implements CraigPlaybackVoiceConnection {
   }
 }
 
-function createFixture(onPacketDispatched?: (packet: Buffer) => void) {
+function createFixture(
+  hooks?:
+    | ((packet: Buffer) => void)
+    | {
+        onCancellation(cancellation: Readonly<{ attemptId: string; cancellationObservedAt?: string }>): boolean;
+      }
+) {
   const connection = new FakeVoiceConnection();
   const encoder = new FakeEncoder();
   const events: CraigPlaybackEvent[] = [];
@@ -106,8 +112,9 @@ function createFixture(onPacketDispatched?: (packet: Buffer) => void) {
     onPacketDispatched: (packet) => {
       dispatchedPackets.push(Buffer.from(packet));
       connection.order.push('authoritative');
-      onPacketDispatched?.(packet);
+      if (typeof hooks === 'function') hooks(packet);
     },
+    ...(typeof hooks === 'object' ? { onCancellation: hooks.onCancellation } : {}),
     onEvent: (event) => {
       events.push(event);
       connection.order.push(event.type);
@@ -276,6 +283,31 @@ test('cancellation records only the packet already accepted by the direct sender
     events.map(({ type }) => type),
     ['playback-started', 'playback-finished']
   );
+});
+
+test('persists the trusted cancellation fence before revoking the exact playback attempt', () => {
+  const order: string[] = [];
+  const fixture = createFixture({
+    onCancellation: (cancellation) => {
+      order.push(`fence:${cancellation.attemptId}:${cancellation.cancellationObservedAt}`);
+      return true;
+    }
+  });
+  assert.equal(fixture.controller.handleCommand(start()), true);
+  assert.equal(
+    fixture.controller.handleCommand({
+      schemaVersion: 1,
+      recordingId,
+      turnId,
+      attemptId,
+      type: 'playback-cancel',
+      reason: 'barge-in',
+      cancellationObservedAt: '2026-08-18T00:00:03.000Z'
+    }),
+    true
+  );
+  assert.deepEqual(order, ['fence:attempt-1:2026-08-18T00:00:03.000Z']);
+  assert.equal(fixture.controller.handleCommand(audio(0, frame(1))), true);
 });
 
 test('does not record a packet when direct Discord playback rejects it', () => {

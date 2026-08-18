@@ -8,6 +8,7 @@ import {
   actorSemanticsVersion,
   createCraigLifecycleV3Producer,
   deriveCraigActorFromDiscord,
+  maximumCraigPendingLifecycleEvents,
   parseMeetingLifecycleProducerConfiguration,
   restoreCraigLifecycleV3ProducerFromSnapshot,
   selectCraigKnowledgeEligibleActorIds,
@@ -153,6 +154,24 @@ test('rejects producer and envelope unknown keys exactly', () => {
   const lifecycle = createCraigLifecycleV3Producer(config, context);
   assert.throws(() => lifecycle.started({ ...envelope, extra: true } as never, [human]), /unknown fields/);
   assert.deepEqual(lifecycle.durableSnapshot().actors, []);
+});
+
+test('fails closed at the explicit durable journal bound without dropping unacknowledged evidence', () => {
+  const lifecycle = createCraigLifecycleV3Producer(config, context);
+  lifecycle.started(envelope, [human]);
+  for (let index = 1; index < maximumCraigPendingLifecycleEvents; index++)
+    lifecycle.connection(
+      { ...envelope, eventId: `recording-1:${index + 1}` },
+      index % 2 === 0 ? 'meeting.connection_recovered' : 'meeting.connection_lost',
+      null
+    );
+  const before = lifecycle.durableSnapshot();
+  assert.equal(before.pendingOutbox.length, maximumCraigPendingLifecycleEvents);
+  assert.throws(
+    () => lifecycle.connection({ ...envelope, eventId: 'recording-1:overflow' }, 'meeting.connection_lost', null),
+    /capacity is exhausted/
+  );
+  assert.deepEqual(lifecycle.durableSnapshot(), before);
 });
 
 test('producer-owned canonical bundle has the exact bytes pinned by the Meeting consumer', async () => {

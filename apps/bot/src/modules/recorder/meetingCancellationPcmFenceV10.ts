@@ -19,6 +19,54 @@ export interface DurableBotikTrackProof {
   sizeBytes: number;
 }
 
+/** Exact Meeting HEAD 6b06b1d verifier/logger boundary. */
+export interface CraigAuthoritativeCancellationPcmFenceLog {
+  acceptedPacketCountAfterCancellation: 0;
+  attemptId: string;
+  cancellationObservedAt: string;
+  fenceObservedAt: string;
+  meetingId: string;
+  message: 'Craig authoritative cancellation PCM fence observed';
+  recordingId: string;
+  source: 'craig-authoritative-playback-track';
+  trackSha256: string;
+  turnId: string;
+}
+
+export function createAuthoritativeCancellationPcmFenceLog(input: {
+  attemptId: string;
+  cancellationObservedAt: string;
+  fenceObservedAt: string;
+  meetingId: string;
+  recordingId: string;
+  trackSha256: string;
+  turnId: string;
+}): CraigAuthoritativeCancellationPcmFenceLog {
+  for (const [name, value] of [
+    ['attemptId', input.attemptId],
+    ['meetingId', input.meetingId],
+    ['recordingId', input.recordingId],
+    ['turnId', input.turnId]
+  ] as const)
+    assertIdentifier(value, name);
+  const cancellationObservedAt = canonicalTimestamp(input.cancellationObservedAt, 'cancellationObservedAt');
+  const fenceObservedAt = canonicalTimestamp(input.fenceObservedAt, 'fenceObservedAt');
+  if (fenceObservedAt < cancellationObservedAt) throw new Error('Cancellation PCM fence precedes Meeting cancellation observation');
+  if (!/^[a-f0-9]{64}$/.test(input.trackSha256)) throw new Error('Final uploaded Botik track checksum is invalid');
+  return deepFreeze({
+    acceptedPacketCountAfterCancellation: 0 as const,
+    attemptId: input.attemptId,
+    cancellationObservedAt,
+    fenceObservedAt,
+    meetingId: input.meetingId,
+    message: 'Craig authoritative cancellation PCM fence observed' as const,
+    recordingId: input.recordingId,
+    source: 'craig-authoritative-playback-track' as const,
+    trackSha256: input.trackSha256,
+    turnId: input.turnId
+  });
+}
+
 export interface MeetingCancellationPcmFenceReceiptV10 {
   schemaVersion: 10;
   type: typeof meetingCancellationPcmFenceEventType;

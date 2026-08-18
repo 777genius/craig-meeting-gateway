@@ -2,6 +2,8 @@ export const sealedActorRosterCapabilityId = 'meeting.lifecycle.sealed-actor-ros
 export const actorSemanticsVersion = 1 as const;
 export const meetingLifecycleV3SchemaVersion = 3 as const;
 export const maximumCraigActorRosterSize = 1_000 as const;
+/** Hard fail-closed bound for one recording's unacknowledged durable journal. */
+export const maximumCraigPendingLifecycleEvents = 1_024 as const;
 
 const discordSnowflake = /^\d{17,20}$/;
 const immutableRevision = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -282,6 +284,8 @@ export class CraigLifecycleV3Producer {
   }
 
   private emit<T extends CraigLifecycleV3Event>(event: T): T {
+    if (this.pendingOutbox.length >= maximumCraigPendingLifecycleEvents)
+      throw new Error('Craig lifecycle durable outbox capacity is exhausted');
     if (this.emitted.some(({ eventId }) => eventId === event.eventId)) throw new Error('Craig lifecycle eventId was already emitted');
     const last = this.emitted[this.emitted.length - 1];
     if (last !== undefined && Date.parse(event.occurredAt) < Date.parse(last.occurredAt))

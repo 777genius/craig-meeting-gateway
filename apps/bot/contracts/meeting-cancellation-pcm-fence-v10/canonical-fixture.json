@@ -1,23 +1,15 @@
 {
   "contract": "meeting-cancellation-pcm-fence-v10",
-  "receipt": {
-    "schemaVersion": 10,
-    "type": "meeting.playback_cancelled",
-    "capabilityId": "meeting.cancellation.pcm-fence.v10",
+  "proof": {
+    "acceptedPacketCountAfterCancellation": 0,
+    "attemptId": "attempt-1",
+    "cancellationObservedAt": "2026-08-18T00:00:03.000Z",
+    "fenceObservedAt": "2026-08-18T00:00:03.000Z",
     "meetingId": "meeting-1",
-    "turnId": "turn-1",
-    "cancelReason": "barge-in",
-    "cancelledAt": "2026-08-18T00:00:03.000Z",
-    "lastAcceptedFactualPcmSequence": 1,
-    "lastAcceptedFactualPcmAt": "2026-08-18T00:00:02.000Z",
-    "noFactualPcmAcceptedAfterFence": true,
-    "botikTrack": {
-      "speakerId": "1533228054724346087",
-      "trackNumber": 7,
-      "packetCursor": 8
-    },
-    "botikTrackChecksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "botikTrackSizeBytes": 4096,
-    "playbackGeneration": 3
+    "message": "Craig authoritative cancellation PCM fence observed",
+    "recordingId": "recording-1",
+    "source": "craig-authoritative-playback-track",
+    "trackSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "turnId": "turn-1"
   }
 }

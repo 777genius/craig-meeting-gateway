@@ -1,4 +1,5 @@
 import { OpusEncoder } from '@discordjs/opus';
+import { createHash } from 'node:crypto';
 import type { DAVESession } from '@snazzah/davey';
 import axios from 'axios';
 import { stripIndents } from 'common-tags';
@@ -6,6 +7,7 @@ import dayjs from 'dayjs';
 import duration from 'dayjs/plugin/duration';
 import { DexareClient } from 'dexare';
 import Eris from 'eris';
+import { closeSync, fsyncSync, openSync, renameSync, writeFileSync } from 'fs';
 import { access, writeFile } from 'fs/promises';
 import { customAlphabet, nanoid } from 'nanoid';
 import path from 'path';
@@ -646,6 +648,7 @@ export default class Recording {
         warn: (message, error) => this.recorder.logger.warn(message, error)
       },
       onPacketDispatched: (opusPacket) => this.recordDispatchedConversationPacket(opusPacket),
+      onCancellation: (cancellation) => this.persistConversationPlaybackFence(generation, cancellation),
       onReady: () => this.conversationPlaybackReconnect.connected(),
       onClosed: (reason) => {
         if (this.conversationPlayback?.isClosed) this.conversationPlayback = undefined;
@@ -686,6 +689,52 @@ export default class Recording {
     const session = this.conversationPlayback;
     this.conversationPlayback = undefined;
     session?.close(reason);
+  }
+
+  private persistConversationPlaybackFence(
+    generation: number,
+    cancellation: Readonly<{ recordingId: string; turnId: string; attemptId: string; cancellationObservedAt?: string }>
+  ): boolean {
+    const writer = this.writer;
+    if (!writer || cancellation.recordingId !== this.id || generation !== this.conversationPlaybackGeneration) return false;
+    const attemptKey = createHash('sha256')
+      .update(`${cancellation.turnId}\0${cancellation.attemptId}`)
+      .digest('hex')
+      .slice(0, 32);
+    const filePath = `${writer.fileBase}.playback-cancellation-fence.${attemptKey}.json`;
+    const temporaryPath = `${filePath}.${process.pid}.${nanoid(8)}.tmp`;
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(temporaryPath, 'wx', 0o600);
+      writeFileSync(
+        descriptor,
+        `${JSON.stringify({
+          schemaVersion: 1,
+          recordingId: this.id,
+          turnId: cancellation.turnId,
+          attemptId: cancellation.attemptId,
+          cancellationObservedAt: cancellation.cancellationObservedAt ?? null,
+          fenceObservedAt: cancellation.cancellationObservedAt ?? null,
+          playbackGeneration: generation
+        })}\n`,
+        'utf8'
+      );
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = undefined;
+      renameSync(temporaryPath, filePath);
+      const directory = openSync(path.dirname(filePath), 'r');
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
+      return true;
+    } catch (error) {
+      if (descriptor !== undefined) closeSync(descriptor);
+      this.recorder.logger.error(`Failed to durably persist playback cancellation fence for recording ${this.id}`, error);
+      return false;
+    }
   }
 
   /**
