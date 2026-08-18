@@ -52,7 +52,9 @@ services:
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
     networks:
-      - data
+      data:
+        aliases:
+          - craig-redis
     volumes:
       - ${CRAIG_DATA_ROOT:?set CRAIG_DATA_ROOT}/redis:/data
     tmpfs:
@@ -150,7 +152,7 @@ services:
       MEETING_AUTO_RECORD_START_DELAY_MS: ${MEETING_AUTO_RECORD_START_DELAY_MS:-500}
       MEETING_AUTO_RECORD_EMPTY_GRACE_MS: ${MEETING_AUTO_RECORD_EMPTY_GRACE_MS:-5000}
       MEETING_AUTO_RECORD_CONFIGURATION_POLL_MS: ${MEETING_AUTO_RECORD_CONFIGURATION_POLL_MS:-5000}
-      REDIS_HOST: redis
+      REDIS_HOST: craig-redis
       REDIS_PORT: 6379
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-craig-meeting:}
       POSTGRES_HOST: db
