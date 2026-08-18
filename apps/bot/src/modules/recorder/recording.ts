@@ -716,7 +716,11 @@ export default class Recording {
 
     const isPresent = member.voiceState.channelID === this.channel.id;
     const transition = this.meetingParticipants.observe(member.id, isPresent);
-    if (transition !== null) this.publishMeetingLifecycle(transition, { participantId: member.id });
+    if (transition === null) return;
+
+    const event = this.createMeetingLifecycleEvent(transition, { participantId: member.id });
+    const outcome = this.publishMeetingLifecycleEvent(event);
+    if (outcome.status !== 'accepted') this.meetingParticipants.observe(member.id, !isPresent);
   }
 
   async onConnectionConnect() {
@@ -1077,14 +1081,16 @@ export default class Recording {
 
   private markConnectionLost(reason: string) {
     if (this.connectionLossOpen) return;
-    this.connectionLossOpen = true;
-    this.publishMeetingLifecycle('meeting.connection_lost', { reason });
+    const event = this.createMeetingLifecycleEvent('meeting.connection_lost', { reason });
+    const outcome = this.publishMeetingLifecycleEvent(event);
+    if (outcome.status === 'accepted') this.connectionLossOpen = true;
   }
 
   private markConnectionRecovered() {
     if (!this.connectionLossOpen) return;
-    this.connectionLossOpen = false;
-    this.publishMeetingLifecycle('meeting.connection_recovered', { reason: null });
+    const event = this.createMeetingLifecycleEvent('meeting.connection_recovered', { reason: null });
+    const outcome = this.publishMeetingLifecycleEvent(event);
+    if (outcome.status === 'accepted') this.connectionLossOpen = false;
   }
 
   // Message handling //
