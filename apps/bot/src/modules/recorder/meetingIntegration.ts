@@ -940,7 +940,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     eventDigests.set(event.eventId, createHash('sha256').update(canonicalJson(event)).digest('hex'));
     const priorSnapshot = previous?.snapshot;
     const actorIndex = previous?.actorIndex ?? new Map(admission!.actors.map((actor) => [actor.actorId, actor]));
-    if (event.type === 'participant.joined') actorIndex.set(event.actor.actorId, event.actor);
+    if (event.type === 'participant.joined' || event.type === 'participant.left')
+      observeLifecycleV3Actor(actorIndex, event.actor);
     this.lifecycleV3JournalIndex.set(event.recordingId, {
       snapshot: {
         schemaVersion: 2,
@@ -1041,7 +1042,9 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
             if (pendingEvent.type === 'meeting.started' || pendingEvent.type === 'recording.authoritative_ready') actorIndex.clear();
             if (pendingEvent.type === 'recording.authoritative_ready') payload.sealedReady = pendingEvent;
           } else if (record.kind === 'event-actor') {
-            actorIndex.set(record.value.actorId, record.value);
+            if (pendingEvent?.type === 'participant.joined' || pendingEvent?.type === 'participant.left')
+              observeLifecycleV3Actor(actorIndex, record.value);
+            else actorIndex.set(record.value.actorId, record.value);
             if (pendingEvent?.type === 'recording.authoritative_ready') payload.sealedReady.actors.push(record.value);
           }
         }
@@ -1165,7 +1168,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       if (event.type === 'meeting.started' || event.type === 'recording.authoritative_ready') {
         actorIndex.clear();
         for (const actor of event.actors) actorIndex.set(actor.actorId, actor);
-      } else if (event.type === 'participant.joined') actorIndex.set(event.actor.actorId, event.actor);
+      } else if (event.type === 'participant.joined' || event.type === 'participant.left')
+        observeLifecycleV3Actor(actorIndex, event.actor);
     }
     const actors = [...actorIndex.values()].sort((left, right) => left.actorId.localeCompare(right.actorId));
     const last = retained[retained.length - 1].event;
@@ -1383,13 +1387,13 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
         if (!existsSync(deltaPath)) throw new Error('Lifecycle v3 maintenance delta is missing');
         const delta = JSON.parse(readFileSync(deltaPath, 'utf8')) as any;
         const actors: unknown[] = delta.type === 'recording.authoritative_ready' || delta.type === 'meeting.started'
-          ? delta.actors : delta.type === 'participant.joined' ? [delta.actor] : [];
+          ? delta.actors : delta.type === 'participant.joined' || delta.type === 'participant.left' ? [delta.actor] : [];
         const records: unknown[] = [];
         if (state.deltaActorCursor === 0) {
           let value = delta;
           if (delta.type === 'recording.authoritative_ready' || delta.type === 'meeting.started')
             value = { ...delta, actors: [] };
-          else if (delta.type === 'participant.joined') {
+          else if (delta.type === 'participant.joined' || delta.type === 'participant.left') {
             const { actor: _capturedSeparately, ...eventWithoutActor } = delta;
             value = eventWithoutActor;
           }
@@ -1815,10 +1819,19 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
         !Number.isSafeInteger(sidecar.cancellationObservedAtMs) || sidecar.cancellationObservedAtMs < 0 ||
         typeof sidecar.reason !== 'string' || sidecar.reason.length === 0
       ) continue;
-      const observedAt = dateMillisecondsToIsoOrThrow(sidecar.cancellationObservedAtMs, 'cancellationObservedAtMs');
-      const fenceObservedAt = Number.isSafeInteger(sidecar.fenceObservedAtMs) && sidecar.fenceObservedAtMs >= sidecar.cancellationObservedAtMs
-        ? dateMillisecondsToIsoOrThrow(sidecar.fenceObservedAtMs, 'fenceObservedAtMs')
-        : observedAt;
+      let observedAt: string;
+      let fenceObservedAt: string;
+      try {
+        observedAt = dateMillisecondsToIsoOrThrow(sidecar.cancellationObservedAtMs, 'cancellationObservedAtMs');
+        fenceObservedAt = Number.isSafeInteger(sidecar.fenceObservedAtMs) && sidecar.fenceObservedAtMs >= sidecar.cancellationObservedAtMs
+          ? dateMillisecondsToIsoOrThrow(sidecar.fenceObservedAtMs, 'fenceObservedAtMs')
+          : observedAt;
+      } catch {
+        // Legacy sidecars may contain JavaScript expanded-year timestamps that
+        // schema v10 cannot represent. Retain them as durable revocations, but
+        // do not poison this or unrelated original-publication jobs.
+        continue;
+      }
       const acceptedPacketCountAfterCancellation = sidecar.postCancellationAcceptedPacketCount;
       const attemptedPacketCountAfterCancellation = sidecar.postCancellationAttemptedPacketCount;
       if (!Number.isSafeInteger(acceptedPacketCountAfterCancellation) || acceptedPacketCountAfterCancellation < 0 ||
@@ -2246,7 +2259,22 @@ export function dateMillisecondsToIsoOrThrow(value: number, field: string): stri
   const date = new Date(value);
   if (!Number.isSafeInteger(value) || value < 0 || !Number.isFinite(date.valueOf()))
     throw new Error(`Durable cancellation ${field} is outside the JavaScript Date range`);
-  return date.toISOString();
+  const timestamp = date.toISOString();
+  if (!/^\d{4}-/.test(timestamp))
+    throw new Error(`Durable cancellation ${field} is outside the canonical four-digit year range`);
+  return timestamp;
+}
+
+function observeLifecycleV3Actor(
+  actors: Map<string, DurableCraigLifecycleV3Snapshot['actors'][number]>,
+  actor: DurableCraigLifecycleV3Snapshot['actors'][number]
+): void {
+  const existing = actors.get(actor.actorId);
+  if (actor.kind === 'unknown') {
+    if (existing === undefined) actors.set(actor.actorId, actor);
+  } else if (existing === undefined || existing.kind === 'unknown') actors.set(actor.actorId, actor);
+  // Conflicting trusted evidence retains the first trusted kind. The event's
+  // actorObservationState independently persists that the ledger conflicted.
 }
 
 function createOriginalRecordingJob(input: OriginalRecordingPublicationInput, recordingRoot: string): OriginalRecordingOutboxJob {

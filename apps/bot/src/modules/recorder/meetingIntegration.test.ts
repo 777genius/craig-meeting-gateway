@@ -59,11 +59,11 @@ const lifecycleV3Config = {
   producerRevision: '0123456789abcdef0123456789abcdef01234567'
 };
 
-test('cancellation timestamp conversion accepts the exact Date maximum and rejects larger safe integers', () => {
-  assert.equal(dateMillisecondsToIsoOrThrow(8_640_000_000_000_000, 'cancellationObservedAtMs'), '+275760-09-13T00:00:00.000Z');
+test('cancellation timestamp conversion accepts the four-digit year maximum and rejects expanded years', () => {
+  assert.equal(dateMillisecondsToIsoOrThrow(253_402_300_799_999, 'cancellationObservedAtMs'), '9999-12-31T23:59:59.999Z');
   assert.throws(
-    () => dateMillisecondsToIsoOrThrow(8_640_000_000_000_001, 'cancellationObservedAtMs'),
-    /outside the JavaScript Date range/
+    () => dateMillisecondsToIsoOrThrow(253_402_300_800_000, 'cancellationObservedAtMs'),
+    /outside the canonical four-digit year range/
   );
   assert.throws(
     () => dateMillisecondsToIsoOrThrow(Number.MAX_SAFE_INTEGER, 'cancellationObservedAtMs'),
@@ -1466,6 +1466,25 @@ test('hard-crash recovery replays exact durable v3 identities and never fabricat
     { id: '1533228054724346087', bot: true, system: false, webhook: false }
   );
   assert.equal(staging.publishLifecycle(joined, lifecycle.durableSnapshot()).status, 'accepted');
+  const leftOnlyActorId = '1533228054724346099';
+  const left = lifecycle.participant(
+    {
+      eventId: 'original:v3:left', recordingId: event.recordingId, guildId: event.guildId,
+      channelId: event.channelId, occurredAt: '2026-08-02T00:00:31.000Z'
+    },
+    'participant.left',
+    { id: leftOnlyActorId, bot: false, system: false, webhook: false }
+  );
+  assert.equal(staging.publishLifecycle(left, lifecycle.durableSnapshot()).status, 'accepted');
+  const conflictingJoin = lifecycle.participant(
+    {
+      eventId: 'original:v3:conflict', recordingId: event.recordingId, guildId: event.guildId,
+      channelId: event.channelId, occurredAt: '2026-08-02T00:00:32.000Z'
+    },
+    'participant.joined',
+    { id: leftOnlyActorId, bot: true, system: false, webhook: false }
+  );
+  assert.equal(staging.publishLifecycle(conflictingJoin, lifecycle.durableSnapshot()).status, 'accepted');
 
   const replayed: MeetingLifecycleEvent[] = [];
   const replay = new BoundedMeetingIntegrationSink(
@@ -1482,10 +1501,13 @@ test('hard-crash recovery replays exact durable v3 identities and never fabricat
   );
   await replay.restoreOriginalRecordingJobs();
   assert.equal(await replay.drain(1000), true);
-  assert.deepEqual(replayed, [started, joined]);
+  assert.deepEqual(replayed, [started, joined, left, conflictingJoin]);
   assert.deepEqual(
     await readdir(path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`)),
-    ['00000000.event.json', '00000001.event.json', 'cursor.json', 'manifest.json', 'manifest.previous.json', 'snapshot-00000000.json'],
+    [
+      '00000000.event.json', '00000001.event.json', '00000002.event.json', '00000003.event.json',
+      'cursor.json', 'manifest.json', 'manifest.previous.json', 'snapshot-00000000.json'
+    ],
     'the fsynced ack cursor pins its exact segment while compacting older acknowledged events'
   );
   const manifest = JSON.parse(
@@ -1498,7 +1520,7 @@ test('hard-crash recovery replays exact durable v3 identities and never fabricat
   assert.deepEqual(initialFallback, manifest, 'initial current publication has an independently fsynced valid fallback');
   const cursorPath = path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`, 'cursor.json');
   const compactedCursor = JSON.parse(await readFile(cursorPath, 'utf8'));
-  assert.equal(compactedCursor.ackedSequence, 1);
+  assert.equal(compactedCursor.ackedSequence, 3);
 
   await writeFile(cursorPath, `${JSON.stringify({ ...compactedCursor, digestSha256: '0'.repeat(64) })}\n`);
   const corruptRecovery = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, { recordingRoot, outboxRoot });
@@ -1537,8 +1559,10 @@ test('hard-crash recovery replays exact durable v3 identities and never fabricat
   assert.equal(recovered.startedEvent.eventId, started.eventId);
   assert.deepEqual(recovered.lifecycleV3Snapshot.actors, [
     { actorId: event.participantIds[0], kind: 'human' },
-    { actorId: '1533228054724346087', kind: 'automation' }
+    { actorId: '1533228054724346087', kind: 'automation' },
+    { actorId: leftOnlyActorId, kind: 'human' }
   ]);
+  assert.equal(recovered.lifecycleV3Snapshot.actorObservationState, 'conflicted');
 });
 
 test('restores pending v3 jobs using their immutable producer revision after a rolling revision', async (context) => {
@@ -1739,6 +1763,16 @@ test('production original upload durably manifests and emits the exact trusted c
     writeFile(
       `${sourceFileBase}.playback-cancellation-fence.legacy.json`,
       '{"schemaVersion":1,"recordingId":"recording-1","turnId":"fabricated","attemptId":"fabricated"}\n'
+    ),
+    writeFile(
+      `${sourceFileBase}.playback-cancellation-fence.expanded-year.json`,
+      `${JSON.stringify({
+        schemaVersion: 2, type: 'playback-cancel', meetingId: 'meeting-legacy-expanded-year',
+        recordingId: event.recordingId, turnId: 'turn-expanded', attemptId: 'attempt-expanded',
+        cancellationObservedAtMs: 253_402_300_800_000, reason: 'barge-in', playbackGeneration: 1,
+        attemptGenerationToken: 'attempt-generation-token-expanded',
+        postCancellationAttemptedPacketCount: 1, postCancellationAcceptedPacketCount: 0
+      })}\n`
     )
   ]);
   const cookedBytes = Buffer.from('OggS-final-botik-track');
@@ -1774,7 +1808,7 @@ test('production original upload durably manifests and emits the exact trusted c
   );
   assert.equal(await sink.publishOriginalRecording({ startedEvent: event, terminalEvent, sourceFileBase }), true);
   assert.equal(await sink.drain(2000), true);
-  assert.equal(proofs.length, 1, 'legacy sidecars without trusted time/meeting identity are not promoted');
+  assert.equal(proofs.length, 1, 'legacy or expanded-year sidecars are retained without blocking trusted proof publication');
   assert.deepEqual(proofs[0], {
     acceptedPacketCountAfterCancellation: 0,
     attemptedPacketCountAfterCancellation: 1,
@@ -2157,6 +2191,49 @@ test('production lifecycle maintenance scheduler fairly compacts two interleaved
   ], 'failed and unfinished journals rotate to the tail after every K-bounded tick');
   for (const recordingId of recordingIds)
     assert.equal((sink as any).lifecycleV3JournalIndex.get(recordingId).generation, 1);
+});
+
+test('lifecycle v3 restart and compaction preserve left-only actors and first trusted conflict kind', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-actor-reducer-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingId = 'actor-reducer-recording';
+  const producer = createCraigLifecycleV3Producer(lifecycleV3Config, {
+    recordingId, guildId: event.guildId, channelId: event.channelId
+  });
+  const envelope = (eventId: string, occurredAt: string) => ({
+    eventId, recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt
+  });
+  const sink = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined }, logger, 8, 2, 1024,
+    { recordingRoot: root, outboxRoot: root }, lifecycleV3Config
+  );
+  const started = producer.started(envelope('actor:start', '2026-08-18T00:00:00.000Z'), [
+    { id: event.participantIds[0], bot: false, system: false, webhook: false }
+  ]);
+  assert.equal(sink.publishLifecycle(started, producer.durableSnapshot()).status, 'accepted');
+  const leftOnlyActorId = '1533228054724346099';
+  const left = producer.participant(envelope('actor:left', '2026-08-18T00:00:01.000Z'), 'participant.left',
+    { id: leftOnlyActorId, bot: false, system: false, webhook: false });
+  assert.equal(sink.publishLifecycle(left, producer.durableSnapshot()).status, 'accepted');
+  const conflict = producer.participant(envelope('actor:conflict', '2026-08-18T00:00:02.000Z'), 'participant.joined',
+    { id: leftOnlyActorId, bot: true, system: false, webhook: false });
+  assert.equal(sink.publishLifecycle(conflict, producer.durableSnapshot()).status, 'accepted');
+  assert.equal(await sink.drain(2000), true);
+  const state = (sink as any).lifecycleV3JournalIndex.get(recordingId);
+  state.maintenanceNeeded = true;
+  (sink as any).lifecycleV3MaintenanceQueue.add(recordingId);
+  for (let ticks = 0; sink.runLifecycleV3MaintenanceStep(); ticks++) assert.ok(ticks < 100);
+
+  const restored = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined }, logger, 8, 2, 1024,
+    { recordingRoot: root, outboxRoot: root }, lifecycleV3Config
+  );
+  const snapshot = (restored as any).readLifecycleV3Snapshot(recordingId);
+  assert.deepEqual(snapshot.actors, [
+    { actorId: event.participantIds[0], kind: 'human' },
+    { actorId: leftOnlyActorId, kind: 'human' }
+  ]);
+  assert.equal(snapshot.actorObservationState, 'conflicted');
 });
 
 test('lifecycle v3 recovery rejects torn chunks and descriptors and falls back through manifests', async (context) => {
