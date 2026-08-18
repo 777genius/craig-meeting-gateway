@@ -199,6 +199,10 @@ export default class Recording {
     this.sizeLimit = this.recorder.client.config.craig.sizeLimit;
   }
 
+  acknowledgeMeetingLifecycleV3(eventId: string): void {
+    this.lifecycleV3?.acknowledgeDelivered(eventId);
+  }
+
   async sanityCheckIdClashing() {
     // Realistically, this should never happen, but just in case
     if (await prisma.recording.count({ where: { id: this.id } })) {

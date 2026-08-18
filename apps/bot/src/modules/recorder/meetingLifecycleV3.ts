@@ -200,7 +200,7 @@ export class CraigLifecycleV3Producer {
     actors: readonly AuthenticatedDiscordActor[]
   ): Extract<CraigLifecycleV3Event, { type: 'meeting.started' }> {
     this.assertMutable();
-    this.assertCanEmit(envelope);
+    this.assertCanEmit(envelope, 2);
     const rollback = this.ledger.observeBatch(actors);
     return this.emit({ ...this.envelope(envelope), type: 'meeting.started', actors: this.ledger.actors(), rosterState: 'unsealed' }, rollback);
   }
@@ -217,7 +217,7 @@ export class CraigLifecycleV3Producer {
     actor: AuthenticatedDiscordActor
   ): Extract<CraigLifecycleV3Event, { type: 'participant.joined' | 'participant.left' }> {
     this.assertMutable();
-    this.assertCanEmit(envelope);
+    this.assertCanEmit(envelope, 2);
     const rollback = this.ledger.observeBatch([actor]);
     return this.emit({ ...this.envelope(envelope), type, actor: deriveCraigActorFromDiscord(actor) }, rollback);
   }
@@ -229,6 +229,7 @@ export class CraigLifecycleV3Producer {
   ): Extract<CraigLifecycleV3Event, { type: 'meeting.connection_lost' | 'meeting.connection_recovered' }> {
     this.assertMutable();
     assertReason(reason);
+    this.assertCanEmit(envelope, 2);
     return this.emit({ ...this.envelope(envelope), type, reason });
   }
 
@@ -239,6 +240,7 @@ export class CraigLifecycleV3Producer {
   ): Extract<CraigLifecycleV3Event, { type: 'meeting.ended' | 'meeting.aborted' }> {
     this.assertMutable();
     assertReason(reason);
+    this.assertCanEmit(envelope, 1);
     return this.emit({ ...this.envelope(envelope), type, reason });
   }
 
@@ -303,12 +305,27 @@ export class CraigLifecycleV3Producer {
     if (this.sealedReady?.eventId === event.eventId) this.sealedReady = null;
   }
 
+  /**
+   * Evicts payloads only after the integration sink has durably acknowledged
+   * their delivery. Start, terminal, and ready evidence stay pinned because the
+   * authoritative original-publication contract binds those exact events.
+   */
+  acknowledgeDelivered(eventId: string): void {
+    const index = this.pendingOutbox.findIndex((event) => event.eventId === eventId);
+    if (index < 0) return;
+    const event = this.pendingOutbox[index];
+    if (event.type === 'meeting.started' || event.type === 'meeting.ended' || event.type === 'meeting.aborted' || event.type === 'recording.authoritative_ready')
+      return;
+    this.pendingOutbox.splice(index, 1);
+    this.admissionRollbacks.splice(index, 1);
+  }
+
   private assertMutable(): void {
     if (this.sealedReady !== null) throw new Error('Craig lifecycle ledger is sealed');
   }
 
-  private assertCanEmit(envelope: CraigLifecycleEnvelope): void {
-    if (this.pendingOutbox.length >= maximumCraigPendingLifecycleEvents)
+  private assertCanEmit(envelope: CraigLifecycleEnvelope, reservedFinalSlots = 0): void {
+    if (this.pendingOutbox.length >= maximumCraigPendingLifecycleEvents - reservedFinalSlots)
       throw new Error('Craig lifecycle durable outbox capacity is exhausted');
     assertEnvelope(envelope);
     assertContext(envelope, this.context);
@@ -422,11 +439,8 @@ export class CraigLifecycleV3Producer {
       if (emittedIndex <= previousEmittedIndex) throw new Error('Durable lifecycle pending outbox is unordered');
       previousEmittedIndex = emittedIndex;
     }
-    if (
-      events.length !== emitted.length ||
-      events.some((event, index) => event.eventId !== emitted[index].eventId || event.occurredAt !== emitted[index].occurredAt)
-    )
-      throw new Error('Durable lifecycle pending outbox is incomplete');
+    if (events.some((event) => !emittedById.has(event.eventId)))
+      throw new Error('Durable lifecycle pending outbox is not emitted evidence');
     const readyEvents = events.filter(({ type }) => type === 'recording.authoritative_ready');
     if (readyEvents.length > 1 || (readyEvents.length === 1 && events[events.length - 1]?.type !== 'recording.authoritative_ready'))
       throw new Error('Durable lifecycle snapshot has an invalid seal order');
@@ -624,8 +638,7 @@ function assertEnvelope(value: CraigLifecycleEnvelope): void {
 }
 
 function assertEventIdentity(eventId: string, occurredAt: string): void {
-  const parsedAt = Date.parse(occurredAt);
-  if (eventId.length < 1 || eventId.length > 128 || !Number.isFinite(parsedAt) || new Date(parsedAt).toISOString() !== occurredAt)
+  if (eventId.length < 1 || eventId.length > 128 || !isCanonicalLifecycleTimestamp(occurredAt))
     throw new Error('Craig lifecycle event identity is invalid');
 }
 
@@ -638,16 +651,19 @@ function assertReason(value: string | null): void {
 }
 
 function assertAuthoritativeReady(value: Readonly<{ endedAt: string; sourceFilesChecksumSha256: string; trackCount: number }>): void {
-  const endedAt = Date.parse(value.endedAt);
   if (
-    !Number.isFinite(endedAt) ||
-    new Date(endedAt).toISOString() !== value.endedAt ||
+    !isCanonicalLifecycleTimestamp(value.endedAt) ||
     !/^[0-9a-f]{64}$/.test(value.sourceFilesChecksumSha256) ||
     !Number.isSafeInteger(value.trackCount) ||
     value.trackCount < 1 ||
     value.trackCount > 64
   )
     throw new Error('Craig authoritative-ready evidence is invalid');
+}
+
+function isCanonicalLifecycleTimestamp(value: string): boolean {
+  const parsedAt = Date.parse(value);
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && Number.isFinite(parsedAt) && new Date(parsedAt).toISOString() === value;
 }
 
 function sameProducer(left: CraigProducerIdentity, right: CraigProducerIdentity): boolean {

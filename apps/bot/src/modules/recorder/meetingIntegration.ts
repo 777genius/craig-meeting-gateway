@@ -538,7 +538,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     private readonly batchSize = 128,
     private readonly maxQueuedLifecycleEvents = 1024,
     originalRecording?: OriginalRecordingOutboxOptions,
-    lifecycleProducerConfiguration: unknown = { schemaVersion: 1 }
+    lifecycleProducerConfiguration: unknown = { schemaVersion: 1 },
+    private readonly onLifecycleV3Acknowledged: (recordingId: string, eventId: string) => void = () => undefined
   ) {
     this.lifecycleProducerConfiguration = parseMeetingLifecycleProducerConfiguration(lifecycleProducerConfiguration);
     if (!Number.isSafeInteger(maxQueuedPackets) || maxQueuedPackets < 1) throw new Error('maxQueuedPackets must be a positive integer');
@@ -1297,6 +1298,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     if (indexed.lastAcknowledgedEventId === event.eventId) {
       if (indexed.lastAcknowledgedDigest !== eventDigest)
         throw new Error('Lifecycle v3 duplicate acknowledgement conflicts with its durable cursor');
+      this.onLifecycleV3Acknowledged(event.recordingId, event.eventId);
       return;
     }
     const sequence = currentSequence + 1;
@@ -1311,6 +1313,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       digestSha256: eventDigest
     });
     this.reconcileLifecycleV3AcknowledgementMemory(event, sequence);
+    this.onLifecycleV3Acknowledged(event.recordingId, event.eventId);
   }
 
   private lifecycleV3MaintenancePath(root: string): string { return path.join(root, 'maintenance.json'); }
@@ -2075,7 +2078,8 @@ function readCancellationProofManifest(
 export async function createMeetingIntegrationSink(
   config: MeetingIntegrationConfig | undefined,
   logger: MeetingIntegrationLogger,
-  recordingRoot?: string
+  recordingRoot?: string,
+  onLifecycleV3Acknowledged: (recordingId: string, eventId: string) => void = () => undefined
 ): Promise<MeetingIntegrationSink> {
   if (!config?.enabled) return new NoopMeetingIntegrationSink();
   const transport = await createHttpMeetingIntegrationTransport(config, logger);
@@ -2088,7 +2092,8 @@ export async function createMeetingIntegrationSink(
     config.batchSize,
     1024,
     recordingRoot === undefined ? undefined : { recordingRoot },
-    config.lifecycleProducer ?? { schemaVersion: 1 }
+    config.lifecycleProducer ?? { schemaVersion: 1 },
+    onLifecycleV3Acknowledged
   );
   await sink.restoreOriginalRecordingJobs();
   return sink;

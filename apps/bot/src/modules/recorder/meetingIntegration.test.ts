@@ -1199,6 +1199,12 @@ test('keeps lifecycle v1 compatibility by default and admits v3 only behind the 
   const legacy = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2);
   assert.deepEqual(legacy.lifecycleProducerConfiguration, { schemaVersion: 1 });
 
+  const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId
+  });
+  const acknowledged: string[] = [];
   const sink = new BoundedMeetingIntegrationSink(
     {
       post: async (requestPath, body) => {
@@ -1210,19 +1216,30 @@ test('keeps lifecycle v1 compatibility by default and admits v3 only behind the 
     2,
     1024,
     { recordingRoot, outboxRoot: path.join(root, 'outbox') },
-    lifecycleV3Config
+    lifecycleV3Config,
+    (_recordingId, eventId) => {
+      acknowledged.push(eventId);
+      lifecycle.acknowledgeDelivered(eventId);
+    }
   );
   assert.deepEqual(sink.lifecycleProducerConfiguration, lifecycleV3Config);
-  const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
-    recordingId: event.recordingId,
-    guildId: event.guildId,
-    channelId: event.channelId
-  });
   const started = lifecycle.started(
     { eventId: 'recording-1:v3:1', recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: event.occurredAt },
     [{ id: event.participantIds[0], bot: false, system: false, webhook: false }]
   );
   assert.equal(sink.publishLifecycle(started, lifecycle.durableSnapshot()).status, 'accepted');
+  const participant = lifecycle.participant(
+    {
+      eventId: 'recording-1:v3:participant',
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: event.occurredAt
+    },
+    'participant.joined',
+    { id: event.participantIds[0], bot: false, system: false, webhook: false }
+  );
+  assert.equal(sink.publishLifecycle(participant).status, 'accepted');
   const terminal = lifecycle.terminal(
     {
       eventId: 'recording-1:v3:2',
@@ -1236,7 +1253,12 @@ test('keeps lifecycle v1 compatibility by default and admits v3 only behind the 
   );
   assert.equal(sink.publishLifecycle(terminal, lifecycle.durableSnapshot()).status, 'accepted');
   assert.equal(await sink.drain(1000), true);
-  assert.deepEqual(delivered, [started, terminal]);
+  assert.deepEqual(delivered, [started, participant, terminal]);
+  assert.deepEqual(acknowledged, [started.eventId, participant.eventId, terminal.eventId]);
+  assert.deepEqual(
+    lifecycle.durableSnapshot().pendingOutbox.map(({ type }) => type),
+    ['meeting.started', 'meeting.ended']
+  );
 });
 
 test('persists lifecycle v3 context, producer, event order, and pending outbox across restart', async (context) => {

@@ -144,9 +144,9 @@ test('snapshot binds producer, recording context, event order, and pending exact
     () => createCraigLifecycleV3Producer({ ...config, producerRevision: 'f'.repeat(40) }, context, snapshot),
     /another producer revision/
   );
-  const incomplete = JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
-  incomplete.pendingOutbox.pop();
-  assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(incomplete), /incomplete/);
+  const unbound = JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
+  unbound.emitted.pop();
+  assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(unbound), /not bound/);
   snapshot.pendingOutbox[0].recordingId = 'other-recording';
   assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(snapshot), /another recording context/);
 });
@@ -158,22 +158,75 @@ test('rejects producer and envelope unknown keys exactly', () => {
   assert.deepEqual(lifecycle.durableSnapshot().actors, []);
 });
 
-test('fails closed at the explicit durable journal bound without dropping unacknowledged evidence', () => {
+test('rejects expanded-year lifecycle timestamps before durable evidence is admitted', () => {
+  const expandedYear = '+010000-01-01T00:00:00.000Z';
+  const lifecycle = createCraigLifecycleV3Producer(config, context);
+  assert.throws(() => lifecycle.started({ ...envelope, occurredAt: expandedYear }, [human]), /event identity/);
+  assert.deepEqual(lifecycle.durableSnapshot().pendingOutbox, []);
+
+  lifecycle.started(envelope, [human]);
+  assert.throws(
+    () =>
+      lifecycle.authoritativeReady(
+        { ...envelope, eventId: 'recording-1:ready', occurredAt: '2026-08-13T00:01:00.000Z' },
+        { actors: [human], endedAt: expandedYear, sourceFilesChecksumSha256: 'a'.repeat(64), trackCount: 1 }
+      ),
+    /authoritative-ready evidence/
+  );
+  assert.equal(lifecycle.durableSnapshot().pendingOutbox.length, 1);
+});
+
+test('reserves terminal and authoritative-ready capacity at the durable journal bound', () => {
   const lifecycle = createCraigLifecycleV3Producer(config, context);
   lifecycle.started(envelope, [human]);
-  for (let index = 1; index < maximumCraigPendingLifecycleEvents; index++)
+  for (let index = 1; index < maximumCraigPendingLifecycleEvents - 2; index++)
     lifecycle.connection(
       { ...envelope, eventId: `recording-1:${index + 1}` },
       index % 2 === 0 ? 'meeting.connection_recovered' : 'meeting.connection_lost',
       null
     );
   const before = lifecycle.durableSnapshot();
-  assert.equal(before.pendingOutbox.length, maximumCraigPendingLifecycleEvents);
+  assert.equal(before.pendingOutbox.length, maximumCraigPendingLifecycleEvents - 2);
   assert.throws(
     () => lifecycle.connection({ ...envelope, eventId: 'recording-1:overflow' }, 'meeting.connection_lost', null),
     /capacity is exhausted/
   );
   assert.deepEqual(lifecycle.durableSnapshot(), before);
+  lifecycle.terminal({ ...envelope, eventId: 'recording-1:terminal' }, 'meeting.ended', null);
+  lifecycle.authoritativeReady(
+    { ...envelope, eventId: 'recording-1:ready' },
+    { actors: [human], endedAt: envelope.occurredAt, sourceFilesChecksumSha256: 'a'.repeat(64), trackCount: 1 }
+  );
+  assert.equal(lifecycle.durableSnapshot().pendingOutbox.length, maximumCraigPendingLifecycleEvents);
+});
+
+test('evicts acknowledged payloads and survives restart beyond 5,000 production transitions', () => {
+  let lifecycle = createCraigLifecycleV3Producer(config, context);
+  const started = lifecycle.started(envelope, [human]);
+  lifecycle.acknowledgeDelivered(started.eventId);
+
+  for (let index = 1; index <= 5_000; index++) {
+    const event = lifecycle.connection(
+      { ...envelope, eventId: `recording-1:connection:${index}` },
+      index % 2 === 0 ? 'meeting.connection_recovered' : 'meeting.connection_lost',
+      null
+    );
+    lifecycle.acknowledgeDelivered(event.eventId);
+    if (index % 1_000 === 0) lifecycle = restoreCraigLifecycleV3ProducerFromSnapshot(lifecycle.durableSnapshot());
+  }
+
+  const terminal = lifecycle.terminal({ ...envelope, eventId: 'recording-1:terminal' }, 'meeting.ended', null);
+  lifecycle.acknowledgeDelivered(terminal.eventId);
+  lifecycle = restoreCraigLifecycleV3ProducerFromSnapshot(lifecycle.durableSnapshot());
+  lifecycle.authoritativeReady(
+    { ...envelope, eventId: 'recording-1:ready' },
+    { actors: [human], endedAt: envelope.occurredAt, sourceFilesChecksumSha256: 'a'.repeat(64), trackCount: 1 }
+  );
+  assert.deepEqual(
+    lifecycle.durableSnapshot().pendingOutbox.map(({ type }) => type),
+    ['meeting.started', 'meeting.ended', 'recording.authoritative_ready']
+  );
+  assert.equal(lifecycle.durableSnapshot().emitted.length, 5_003);
 });
 
 test('producer-owned canonical bundle has the exact bytes pinned by the Meeting consumer', async () => {
