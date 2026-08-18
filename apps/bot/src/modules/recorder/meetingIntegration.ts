@@ -1365,7 +1365,7 @@ async function inspectOriginalRecordingData(
   const tracksWithAudio = new Set<number>();
   let timelineOffsetMs: number | undefined;
   const checksum = createHash('sha256');
-  let buffered = Buffer.alloc(0);
+  let buffered: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let sizeBytes = 0;
   let pageNumber = 0;
 
