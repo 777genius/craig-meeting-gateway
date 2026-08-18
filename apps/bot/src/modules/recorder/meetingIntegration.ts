@@ -189,7 +189,7 @@ export interface MeetingIntegrationTransport {
 }
 
 export interface MeetingIntegrationSink {
-  publishLifecycle(event: MeetingLifecycleEvent): boolean;
+  publishLifecycle(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome;
   publishPacket(packet: MeetingVoicePacket, opus: Buffer): boolean;
   publishOriginalRecording(input: OriginalRecordingPublicationInput): Promise<boolean>;
   recoverInterruptedOriginalRecording(input: InterruptedOriginalRecordingRecoveryInput): Promise<boolean>;
@@ -217,8 +217,43 @@ export function isRetryableMeetingIntegrationStatus(status: number): boolean {
 
 export type MeetingTerminalLifecycleType = Extract<MeetingLifecycleEvent['type'], 'meeting.ended' | 'meeting.aborted'>;
 
+export type MeetingLifecyclePublishOutcome =
+  | Readonly<{ status: 'accepted' }>
+  | Readonly<{ status: 'missing-start' }>
+  | Readonly<{ status: 'duplicate' }>
+  | Readonly<{ status: 'capacity-exhausted' }>;
+
+const acceptedLifecycleOutcome: MeetingLifecyclePublishOutcome = Object.freeze({ status: 'accepted' });
+
+export function reportMeetingLifecyclePublishOutcome(
+  logger: MeetingIntegrationLogger,
+  recordingId: string,
+  eventType: MeetingLifecycleEvent['type'],
+  outcome: MeetingLifecyclePublishOutcome
+): void {
+  switch (outcome.status) {
+    case 'accepted':
+      return;
+    case 'capacity-exhausted':
+      logger.error(`Meeting integration lifecycle queue is full for recording ${recordingId} (${eventType})`);
+      return;
+    case 'missing-start':
+      logger.warn(`Meeting integration rejected lifecycle event without an accepted start for recording ${recordingId} (${eventType})`);
+      return;
+    case 'duplicate':
+      logger.debug(`Meeting integration ignored duplicate lifecycle event for recording ${recordingId} (${eventType})`);
+  }
+}
+
 export class MeetingTerminalLifecycle {
+  private started = false;
   private published = false;
+
+  acceptStart(outcome: MeetingLifecyclePublishOutcome): boolean {
+    if (outcome.status !== 'accepted') return false;
+    this.started = true;
+    return true;
+  }
 
   async complete(
     expectedType: MeetingTerminalLifecycleType,
@@ -240,15 +275,15 @@ export class MeetingTerminalLifecycle {
   }
 
   private publishOnce(type: MeetingTerminalLifecycleType, publish: (type: MeetingTerminalLifecycleType) => void): void {
-    if (this.published) return;
+    if (!this.started || this.published) return;
     this.published = true;
     publish(type);
   }
 }
 
 export class NoopMeetingIntegrationSink implements MeetingIntegrationSink {
-  publishLifecycle(): boolean {
-    return true;
+  publishLifecycle(): MeetingLifecyclePublishOutcome {
+    return acceptedLifecycleOutcome;
   }
 
   publishPacket(): boolean {
@@ -345,6 +380,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private readonly originalJobs: PendingOriginalRecordingJob[] = [];
   private readonly drainWaiters = new Set<() => void>();
   private readonly openRecordings = new Set<string>();
+  private readonly closedRecordings = new Set<string>();
   private processing = false;
   private retryTimer: NodeJS.Timeout | null = null;
   private processingOriginal = false;
@@ -379,21 +415,26 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     }
   }
 
-  publishLifecycle(event: MeetingLifecycleEvent): boolean {
+  publishLifecycle(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome {
     // Lifecycle traffic is tiny and must remain ordered with the accepted audio.
     const queuedLifecycleEvents = this.queue.length - this.queuedPackets;
     const isTerminal = event.type === 'meeting.ended' || event.type === 'meeting.aborted';
     if (event.type === 'meeting.started') {
-      if (this.openRecordings.has(event.recordingId)) return false;
-      if (queuedLifecycleEvents + this.openRecordings.size + 2 > this.maxQueuedLifecycleEvents) return false;
+      if (this.openRecordings.has(event.recordingId) || this.closedRecordings.has(event.recordingId)) return { status: 'duplicate' };
+      if (queuedLifecycleEvents + this.openRecordings.size + 2 > this.maxQueuedLifecycleEvents) return { status: 'capacity-exhausted' };
       this.openRecordings.add(event.recordingId);
-    } else if (!this.openRecordings.has(event.recordingId)) return false;
-    else if (!isTerminal && queuedLifecycleEvents + this.openRecordings.size + 1 > this.maxQueuedLifecycleEvents) return false;
+    } else if (!this.openRecordings.has(event.recordingId))
+      return { status: isTerminal && this.closedRecordings.has(event.recordingId) ? 'duplicate' : 'missing-start' };
+    else if (!isTerminal && queuedLifecycleEvents + this.openRecordings.size + 1 > this.maxQueuedLifecycleEvents)
+      return { status: 'capacity-exhausted' };
 
     this.queue.push({ type: 'lifecycle', event });
-    if (isTerminal) this.openRecordings.delete(event.recordingId);
+    if (isTerminal) {
+      this.openRecordings.delete(event.recordingId);
+      this.closedRecordings.add(event.recordingId);
+    }
     this.scheduleProcessing();
-    return true;
+    return acceptedLifecycleOutcome;
   }
 
   publishPacket(packet: MeetingVoicePacket, opus: Buffer): boolean {

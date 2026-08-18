@@ -20,12 +20,14 @@ import {
   MeetingIntegrationLogger,
   MeetingIntegrationTransport,
   MeetingLifecycleEvent,
+  MeetingLifecyclePublishOutcome,
   MeetingStartedLifecycleEvent,
   MeetingTerminalLifecycle,
   MeetingTerminalLifecycleEvent,
   MeetingVoicePacket,
   OriginalRecordingCooker,
-  parseMeetingPlatformConfiguration
+  parseMeetingPlatformConfiguration,
+  reportMeetingLifecyclePublishOutcome
 } from './meetingIntegration';
 
 const logger: MeetingIntegrationLogger = {
@@ -33,6 +35,8 @@ const logger: MeetingIntegrationLogger = {
   error: () => {},
   warn: () => {}
 };
+
+const accepted: MeetingLifecyclePublishOutcome = { status: 'accepted' };
 
 const event: MeetingStartedLifecycleEvent = {
   schemaVersion: 1,
@@ -236,17 +240,17 @@ test('preserves lifecycle and accepted voice ordering while batching packets', a
   };
   const sink = new BoundedMeetingIntegrationSink(transport, logger, 8, 2);
 
-  assert.equal(sink.publishLifecycle(event), true);
+  assert.deepEqual(sink.publishLifecycle(event), accepted);
   assert.equal(sink.publishPacket(packet, Buffer.from([1, 2, 3])), true);
   assert.equal(sink.publishPacket({ ...packet, rtpSequence: 13 }, Buffer.from([4, 5])), true);
-  assert.equal(
+  assert.deepEqual(
     sink.publishLifecycle({
       ...event,
       eventId: 'recording-1:2',
       type: 'meeting.ended',
       reason: null
     }),
-    true
+    accepted
   );
   assert.equal(await sink.drain(1000), true);
 
@@ -275,20 +279,20 @@ test('rejects derived traffic outside an open meeting lifecycle', async () => {
   };
 
   assert.equal(sink.publishPacket(packet, Buffer.from([1])), false);
-  assert.equal(sink.publishLifecycle(participantJoined), false);
-  assert.equal(sink.publishLifecycle(event), true);
+  assert.deepEqual(sink.publishLifecycle(participantJoined), { status: 'missing-start' });
+  assert.deepEqual(sink.publishLifecycle(event), accepted);
   assert.equal(sink.publishPacket(packet, Buffer.from([2])), true);
-  assert.equal(
+  assert.deepEqual(
     sink.publishLifecycle({
       ...event,
       eventId: 'recording-1:3',
       type: 'meeting.ended',
       reason: null
     }),
-    true
+    accepted
   );
   assert.equal(sink.publishPacket({ ...packet, rtpSequence: 13 }, Buffer.from([3])), false);
-  assert.equal(sink.publishLifecycle({ ...participantJoined, eventId: 'recording-1:4' }), false);
+  assert.deepEqual(sink.publishLifecycle({ ...participantJoined, eventId: 'recording-1:4' }), { status: 'missing-start' });
   assert.equal(await sink.drain(1000), true);
   assert.deepEqual(calls, ['/v1/craig/events', '/v1/craig/voice-packets', '/v1/craig/events']);
 });
@@ -314,16 +318,16 @@ test('reserves terminal capacity when lifecycle traffic reaches its bound', asyn
     type: 'participant.joined'
   };
 
-  assert.equal(sink.publishLifecycle(event), true);
-  assert.equal(sink.publishLifecycle(joined), true);
-  assert.equal(sink.publishLifecycle({ ...joined, eventId: 'recording-1:3' }), false);
-  assert.equal(
+  assert.deepEqual(sink.publishLifecycle(event), accepted);
+  assert.deepEqual(sink.publishLifecycle(joined), accepted);
+  assert.deepEqual(sink.publishLifecycle({ ...joined, eventId: 'recording-1:3' }), { status: 'capacity-exhausted' });
+  assert.deepEqual(
     sink.publishLifecycle({
       ...event,
       eventId: 'recording-1:4',
       type: 'meeting.ended'
     }),
-    true
+    accepted
   );
   release!();
   assert.equal(await sink.drain(1000), true);
@@ -331,6 +335,89 @@ test('reserves terminal capacity when lifecycle traffic reaches its bound', asyn
     calls.map(({ type }) => type),
     ['meeting.started', 'participant.joined', 'meeting.ended']
   );
+});
+
+test('classifies true lifecycle capacity exhaustion separately from duplicates and missing starts', async () => {
+  let release: (() => void) | undefined;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const sink = new BoundedMeetingIntegrationSink(
+    {
+      async post() {
+        await blocked;
+      }
+    },
+    logger,
+    8,
+    2,
+    2
+  );
+  const secondStart: MeetingStartedLifecycleEvent = {
+    ...event,
+    eventId: 'recording-2:1',
+    recordingId: 'recording-2'
+  };
+
+  assert.deepEqual(sink.publishLifecycle(event), accepted);
+  assert.deepEqual(sink.publishLifecycle(event), { status: 'duplicate' });
+  assert.deepEqual(sink.publishLifecycle(secondStart), { status: 'capacity-exhausted' });
+  assert.deepEqual(sink.publishLifecycle({ ...secondStart, eventId: 'recording-2:2', type: 'meeting.aborted', reason: 'not started' }), {
+    status: 'missing-start'
+  });
+  assert.deepEqual(sink.publishLifecycle({ ...event, eventId: 'recording-1:2', type: 'meeting.aborted', reason: 'voice timeout' }), accepted);
+  release!();
+  assert.equal(await sink.drain(1000), true);
+});
+
+test('classifies a second terminal lifecycle as duplicate without delivering it', async () => {
+  const delivered: MeetingLifecycleEvent[] = [];
+  const sink = new BoundedMeetingIntegrationSink(
+    {
+      async post(path, body) {
+        if (path === '/v1/craig/events') delivered.push(body as MeetingLifecycleEvent);
+      }
+    },
+    logger,
+    8,
+    2
+  );
+  const aborted: MeetingTerminalLifecycleEvent = {
+    ...terminalEvent,
+    type: 'meeting.aborted',
+    reason: 'voice timeout'
+  };
+
+  assert.deepEqual(sink.publishLifecycle(event), accepted);
+  assert.deepEqual(sink.publishLifecycle(aborted), accepted);
+  assert.deepEqual(sink.publishLifecycle({ ...aborted, eventId: 'recording-1:3' }), { status: 'duplicate' });
+  assert.equal(await sink.drain(1000), true);
+  assert.deepEqual(
+    delivered.map(({ type }) => type),
+    ['meeting.started', 'meeting.aborted']
+  );
+});
+
+test('reports lifecycle admission telemetry by outcome classification', () => {
+  const messages: Array<{ level: string; message: string }> = [];
+  const telemetryLogger: MeetingIntegrationLogger = {
+    debug: (message) => messages.push({ level: 'debug', message }),
+    error: (message) => messages.push({ level: 'error', message }),
+    warn: (message) => messages.push({ level: 'warn', message })
+  };
+
+  reportMeetingLifecyclePublishOutcome(telemetryLogger, event.recordingId, event.type, accepted);
+  reportMeetingLifecyclePublishOutcome(telemetryLogger, event.recordingId, event.type, { status: 'capacity-exhausted' });
+  reportMeetingLifecyclePublishOutcome(telemetryLogger, event.recordingId, 'meeting.aborted', { status: 'missing-start' });
+  reportMeetingLifecyclePublishOutcome(telemetryLogger, event.recordingId, 'meeting.ended', { status: 'duplicate' });
+
+  assert.deepEqual(
+    messages.map(({ level }) => level),
+    ['error', 'warn', 'debug']
+  );
+  assert.match(messages[0]?.message ?? '', /queue is full/);
+  assert.match(messages[1]?.message ?? '', /without an accepted start/);
+  assert.match(messages[2]?.message ?? '', /duplicate/);
 });
 
 test('tracks interleaved recording lifecycles independently', async () => {
@@ -344,25 +431,25 @@ test('tracks interleaved recording lifecycles independently', async () => {
     recordingId: 'recording-2'
   };
 
-  assert.equal(sink.publishLifecycle(event), true);
-  assert.equal(sink.publishLifecycle(secondStart), true);
-  assert.equal(
+  assert.deepEqual(sink.publishLifecycle(event), accepted);
+  assert.deepEqual(sink.publishLifecycle(secondStart), accepted);
+  assert.deepEqual(
     sink.publishLifecycle({
       ...event,
       eventId: 'recording-1:2',
       type: 'meeting.ended'
     }),
-    true
+    accepted
   );
   assert.equal(sink.publishPacket({ ...packet, recordingId: 'recording-2' }, Buffer.from([1])), true);
   assert.equal(sink.publishPacket(packet, Buffer.from([2])), false);
-  assert.equal(
+  assert.deepEqual(
     sink.publishLifecycle({
       ...secondStart,
       eventId: 'recording-2:2',
       type: 'meeting.ended'
     }),
-    true
+    accepted
   );
   assert.equal(await sink.drain(1000), true);
 });
@@ -382,7 +469,7 @@ test('admits packets synchronously, clones after admission, and rejects overflow
   const sink = new BoundedMeetingIntegrationSink(transport, logger, 1, 1);
   const opus = Buffer.from([7, 8, 9]);
 
-  assert.equal(sink.publishLifecycle(event), true);
+  assert.deepEqual(sink.publishLifecycle(event), accepted);
   assert.equal(sink.publishPacket(packet, opus), true);
   opus[0] = 99;
   assert.equal(sink.publishPacket({ ...packet, rtpSequence: 13 }, Buffer.from([1])), false);
@@ -591,7 +678,7 @@ test('recovers the authoritative original after restart loses an incomplete live
     1,
     1
   );
-  assert.equal(activeBeforeRestart.publishLifecycle(event), true);
+  assert.deepEqual(activeBeforeRestart.publishLifecycle(event), accepted);
   assert.equal(activeBeforeRestart.publishPacket(packet, Buffer.from([1, 2, 3])), true);
   assert.equal(await activeBeforeRestart.drain(1000), true);
   assert.deepEqual(liveDelivery, ['/v1/craig/events', '/v1/craig/voice-packets']);
@@ -972,6 +1059,7 @@ test('permanently rejects malformed and truncated raw Ogg data without touching 
 test('publishes one aborted terminal lifecycle when recording finalization fails', async () => {
   const terminal = new MeetingTerminalLifecycle();
   const published: string[] = [];
+  terminal.acceptStart(accepted);
 
   await assert.rejects(
     terminal.complete(
@@ -991,6 +1079,7 @@ test('publishes one aborted terminal lifecycle when recording finalization fails
 test('never replaces a published ended lifecycle with a later abort', async () => {
   const terminal = new MeetingTerminalLifecycle();
   const published: string[] = [];
+  terminal.acceptStart(accepted);
 
   await terminal.complete(
     'meeting.ended',
@@ -1000,4 +1089,25 @@ test('never replaces a published ended lifecycle with a later abort', async () =
   terminal.abort((type) => published.push(type));
 
   assert.deepEqual(published, ['meeting.ended']);
+});
+
+test('does not publish a phantom abort before a meeting start was accepted', () => {
+  const terminal = new MeetingTerminalLifecycle();
+  const published: string[] = [];
+
+  assert.equal(terminal.acceptStart({ status: 'capacity-exhausted' }), false);
+  terminal.abort((type) => published.push(type));
+
+  assert.deepEqual(published, []);
+});
+
+test('publishes one abort after an accepted meeting start', () => {
+  const terminal = new MeetingTerminalLifecycle();
+  const published: string[] = [];
+  assert.equal(terminal.acceptStart(accepted), true);
+
+  terminal.abort((type) => published.push(type));
+  terminal.abort((type) => published.push(type));
+
+  assert.deepEqual(published, ['meeting.aborted']);
 });

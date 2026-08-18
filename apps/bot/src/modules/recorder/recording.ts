@@ -27,9 +27,11 @@ import { ConversationPlaybackReconnect } from './conversationPlaybackReconnect';
 import { CraigConversationPlaybackSession, createConversationPlaybackSession } from './conversationPlaybackSession';
 import {
   type MeetingLifecycleEvent,
+  type MeetingLifecyclePublishOutcome,
   type MeetingStartedLifecycleEvent,
   type MeetingTerminalLifecycleEvent,
-  MeetingTerminalLifecycle
+  MeetingTerminalLifecycle,
+  reportMeetingLifecyclePublishOutcome
 } from './meetingIntegration';
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
@@ -276,8 +278,10 @@ export default class Recording {
 
     const participantIds = this.meetingParticipants.begin(this.channel.voiceMembers.keys(), this.recorder.client.bot.user.id);
     const startedEvent = this.createMeetingLifecycleEvent('meeting.started', { participantIds }) as MeetingStartedLifecycleEvent;
-    this.meetingStartedLifecycle = startedEvent;
-    this.publishMeetingLifecycleEvent(startedEvent);
+    const startedOutcome = this.publishMeetingLifecycleEvent(startedEvent);
+    if (this.terminalMeetingLifecycle.acceptStart(startedOutcome)) {
+      this.meetingStartedLifecycle = startedEvent;
+    }
 
     this.timeout = setTimeout(async () => {
       if (this.state !== RecordingState.RECORDING) return;
@@ -1065,9 +1069,10 @@ export default class Recording {
     };
   }
 
-  private publishMeetingLifecycleEvent(event: MeetingLifecycleEvent): void {
-    const accepted = this.recorder.meetingIntegration.publishLifecycle(event);
-    if (!accepted) this.recorder.logger.error(`Meeting integration lifecycle queue is full for recording ${this.id} (${event.type})`);
+  private publishMeetingLifecycleEvent(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome {
+    const outcome = this.recorder.meetingIntegration.publishLifecycle(event);
+    reportMeetingLifecyclePublishOutcome(this.recorder.logger, this.id, event.type, outcome);
+    return outcome;
   }
 
   private markConnectionLost(reason: string) {
