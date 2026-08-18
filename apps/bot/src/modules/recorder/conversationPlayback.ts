@@ -8,6 +8,7 @@ export const CRAIG_PLAYBACK_STEREO_FRAME_BYTES = CRAIG_PLAYBACK_MONO_FRAME_BYTES
 export const CRAIG_PLAYBACK_MAX_BUFFERED_FRAMES = 100;
 export const CRAIG_PLAYBACK_MAX_BUFFERED_PCM_BYTES = CRAIG_PLAYBACK_MAX_BUFFERED_FRAMES * CRAIG_PLAYBACK_MONO_FRAME_BYTES;
 export const CRAIG_PLAYBACK_MAX_PCM_CHUNK_BYTES = 19_200;
+export const CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS = 253_402_300_799_999;
 
 type CraigPlaybackFailureCode = 'backpressure' | 'connection-unavailable' | 'invalid-audio' | 'playback-error' | 'transport-disconnected';
 
@@ -352,7 +353,6 @@ export class CraigPlaybackController {
   private readonly timer: CraigPlaybackTimer;
   private active: ActivePlayback | undefined;
   private lastTerminal: PlaybackIdentity | undefined;
-  private readonly revokedAttempts = new Set<string>();
   private closed = false;
 
   constructor(private readonly options: CraigPlaybackControllerOptions) {
@@ -502,17 +502,12 @@ export class CraigPlaybackController {
     // or be replayed after restart; durability must win all of those races.
     if (this.options.onCancellation(Object.freeze({ ...command })) !== true)
       return false;
-    this.revokedAttempts.add(this.identityKey(command));
     if (active && this.matches(active, command)) this.cancel(active);
     return true;
   }
 
   private isRevoked(identity: PlaybackIdentity): boolean {
-    return this.revokedAttempts.has(this.identityKey(identity)) || this.options.isAttemptRevoked(identity) === true;
-  }
-
-  private identityKey(identity: PlaybackIdentity): string {
-    return `${identity.recordingId}\0${identity.turnId}\0${identity.attemptId}`;
+    return this.options.isAttemptRevoked(identity) === true;
   }
 
   private enqueueFrame(active: ActivePlayback, monoFrame: Buffer): boolean {
@@ -686,7 +681,7 @@ function parseCraigPlaybackCommand(value: unknown): CraigPlaybackCommand {
         const meetingId = parseIdentifier(value.meetingId);
         const reason = parseIdentifier(value.reason);
         if (!Number.isSafeInteger(value.cancellationObservedAtMs) || (value.cancellationObservedAtMs as number) < 0 ||
-            (value.cancellationObservedAtMs as number) > 8_640_000_000_000_000)
+            (value.cancellationObservedAtMs as number) > CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS)
           throw new Error('Playback cancellation observation time is invalid');
         return { ...identity, schemaVersion: 2, type, meetingId, cancellationObservedAtMs: value.cancellationObservedAtMs as number, reason };
       }

@@ -4,6 +4,7 @@ import { test } from 'node:test';
 
 import { appendAuthoritativeBotikPlaybackPacket, createAuthoritativeBotikPlaybackTrack } from './authoritativePlaybackTrack';
 import {
+  CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS,
   CRAIG_PLAYBACK_MONO_FRAME_BYTES,
   CraigPlaybackArbiter,
   CraigPlaybackController,
@@ -94,7 +95,13 @@ function createFixture(
   hooks?:
     | ((packet: Buffer) => void)
     | {
-        onCancellation(cancellation: Readonly<{ recordingId: string; turnId: string; attemptId: string; cancellationObservedAt?: string }>): boolean;
+        onCancellation(cancellation: Readonly<{
+          recordingId: string;
+          turnId: string;
+          attemptId: string;
+          cancellationObservedAt?: string;
+          cancellationObservedAtMs?: number;
+        }>): boolean;
         isAttemptRevoked?(identity: Readonly<{ turnId: string; attemptId: string }>): boolean;
         onPostCancellationPacket?(identity: Readonly<{ turnId: string; attemptId: string }>): boolean;
       }
@@ -327,11 +334,14 @@ test('cancellation records only the packet already accepted by the direct sender
 test('persists the trusted cancellation fence before revoking the exact playback attempt', () => {
   const cancellations: unknown[] = [];
   const latePackets: unknown[] = [];
+  const revoked = new Set<string>();
   const fixture = createFixture({
     onCancellation: (cancellation) => {
       cancellations.push(cancellation);
+      revoked.add(`${cancellation.turnId}/${cancellation.attemptId}`);
       return true;
     },
+    isAttemptRevoked: (identity) => revoked.has(`${identity.turnId}/${identity.attemptId}`),
     onPostCancellationPacket: (identity) => { latePackets.push(identity); return true; }
   });
   assert.equal(fixture.controller.handleCommand(start()), true);
@@ -356,7 +366,7 @@ test('persists the trusted cancellation fence before revoking the exact playback
   assert.deepEqual(latePackets, [{ recordingId, turnId, attemptId }]);
   assert.equal(fixture.controller.handleCommand(start({ turnId: 'turn-2', attemptId: 'attempt-2' })), true);
   assert.equal(fixture.controller.handleCommand(audio(0, frame(2), { turnId: 'turn-2', attemptId: 'attempt-2' })), true);
-  assert.deepEqual(fixture.connection.packets, [Buffer.from([2])], 'a new attempt generation remains admissible');
+  assert.deepEqual(fixture.connection.packets, [Buffer.from([1])], 'a new attempt generation remains admissible');
 });
 
 test('durably revokes cancellation before playback starts', () => {
@@ -442,7 +452,8 @@ test('fails closed when the durable attempted-counter callback declines persiste
 test('fails closed for malformed or non-integer playback cancellation v2 fields', () => {
   for (const overrides of [
     { meetingId: '' }, { reason: '' }, { cancellationObservedAtMs: -1 },
-    { cancellationObservedAtMs: 1.5 }, { cancellationObservedAtMs: 8_640_000_000_000_001 },
+    { cancellationObservedAtMs: 1.5 },
+    { cancellationObservedAtMs: CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS + 1 },
     { cancellationObservedAtMs: Number.MAX_SAFE_INTEGER }, { cancellationObservedAtMs: Number.MAX_SAFE_INTEGER + 1 },
     { unexpected: true }
   ]) {
@@ -455,7 +466,7 @@ test('fails closed for malformed or non-integer playback cancellation v2 fields'
   }
 });
 
-test('accepts and preserves the exact maximum ECMAScript Date cancellation millisecond', () => {
+test('accepts and preserves the maximum four-digit canonical cancellation timestamp', () => {
   let observed: number | undefined;
   const fixture = createFixture({ onCancellation: (command) => {
     observed = command.cancellationObservedAtMs;
@@ -464,10 +475,26 @@ test('accepts and preserves the exact maximum ECMAScript Date cancellation milli
   fixture.controller.handleCommand(start());
   assert.equal(fixture.controller.handleCommand({
     schemaVersion: 2, type: 'playback-cancel', meetingId: 'meeting-1', recordingId, turnId, attemptId,
-    cancellationObservedAtMs: 8_640_000_000_000_000, reason: 'barge-in'
+    cancellationObservedAtMs: CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS, reason: 'barge-in'
   }), true);
-  assert.equal(observed, 8_640_000_000_000_000);
-  assert.equal(new Date(observed!).toISOString(), '+275760-09-13T00:00:00.000Z');
+  assert.equal(observed, CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS);
+  assert.equal(new Date(observed!).toISOString(), '9999-12-31T23:59:59.999Z');
+});
+
+test('rejects an expanded-year cancellation timestamp before durable admission', () => {
+  let durabilityCalls = 0;
+  const fixture = createFixture({
+    onCancellation: () => {
+      durabilityCalls++;
+      return true;
+    }
+  });
+  fixture.controller.handleCommand(start());
+  assert.equal(fixture.controller.handleCommand({
+    schemaVersion: 2, type: 'playback-cancel', meetingId: 'meeting-1', recordingId, turnId, attemptId,
+    cancellationObservedAtMs: CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS + 1, reason: 'barge-in'
+  }), false);
+  assert.equal(durabilityCalls, 0);
 });
 
 test('does not record a packet when direct Discord playback rejects it', () => {

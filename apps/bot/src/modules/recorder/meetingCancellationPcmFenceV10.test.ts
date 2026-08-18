@@ -93,6 +93,20 @@ test('rejects gaps, reordered time, and conflicting retries without moving the b
   assert.equal(fence.cancel('disconnect', at(3)), 'conflict');
 });
 
+test('rejects expanded-year timestamps before durable proof work', () => {
+  const { fence, order } = fixture();
+  assert.throws(
+    () => fence.acceptFactualPcm(0, '+010000-01-01T00:00:00.000Z'),
+    /canonical timestamp/
+  );
+  assert.throws(
+    () => fence.cancel('disconnect', '+010000-01-01T00:00:00.000Z'),
+    /canonical timestamp/
+  );
+  assert.deepEqual(order, []);
+  assert.equal(fence.snapshot().fence, null);
+});
+
 for (const failure of ['unknown', 'interrupted', 'failed', 'lost'] as const) {
   test(`fails closed when the durable flush is ${failure}`, async () => {
     const { events, fence, order, snapshots } = fixture({

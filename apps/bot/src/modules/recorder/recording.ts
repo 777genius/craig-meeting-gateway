@@ -24,7 +24,7 @@ import {
   appendAuthoritativeBotikPlaybackPacket,
   createAuthoritativeBotikPlaybackTrack
 } from './authoritativePlaybackTrack';
-import { CraigPlaybackArbiter } from './conversationPlayback';
+import { CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS, CraigPlaybackArbiter } from './conversationPlayback';
 import { ConversationPlaybackReconnect } from './conversationPlaybackReconnect';
 import { CraigConversationPlaybackSession, createConversationPlaybackSession } from './conversationPlaybackSession';
 import {
@@ -701,7 +701,7 @@ export default class Recording {
     if (!writer || cancellation.recordingId !== this.id || generation !== this.conversationPlaybackGeneration) return false;
     if (cancellation.schemaVersion === 2 &&
         (!Number.isSafeInteger(cancellation.cancellationObservedAtMs) || cancellation.cancellationObservedAtMs! < 0 ||
-         cancellation.cancellationObservedAtMs! > 8_640_000_000_000_000)) return false;
+         cancellation.cancellationObservedAtMs! > CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS)) return false;
     const attemptKey = createHash('sha256')
       .update(`${cancellation.turnId}\0${cancellation.attemptId}`)
       .digest('hex')

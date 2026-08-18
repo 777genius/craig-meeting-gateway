@@ -127,7 +127,14 @@ export class CraigConversationPlaybackSession {
       return this.closeForProtocolViolation();
     }
 
-    if (!this.controller.handleCommand(parsed)) this.closeForProtocolViolation();
+    let handled: boolean;
+    try {
+      handled = this.controller.handleCommand(parsed);
+    } catch (error) {
+      this.onError(error instanceof Error ? error : new Error('Unknown playback controller failure'));
+      return;
+    }
+    if (!handled) this.closeForProtocolViolation();
   }
 
   private onRemoteClose(): void {
