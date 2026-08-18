@@ -143,8 +143,12 @@ test('restores a fenced pre-flush snapshot and safely completes recovery', async
   const recoveredFixture = fixture();
   const recovered = MeetingCancellationPcmFenceV10.restore(initial.fence.snapshot(), track, {
     flushAndChecksum: async () => proof,
-    persist: async (snapshot) => recoveredFixture.snapshots.push(snapshot)
-  }, { emit: (event) => recoveredFixture.events.push(event) });
+    persist: async (snapshot) => {
+      recoveredFixture.snapshots.push(snapshot);
+    }
+  }, { emit: (event) => {
+    recoveredFixture.events.push(event);
+  } });
   assert.equal(recovered.acceptFactualPcm(1, at(3)), 'late');
   const receipt = await recovered.finalize();
   assert.equal(receipt.playbackGeneration, 3);
@@ -159,7 +163,9 @@ test('replays a durably persisted receipt after restart without reflushing', asy
   const recovered = MeetingCancellationPcmFenceV10.restore(initial.fence.snapshot(), track, {
     flushAndChecksum: async () => { throw new Error('must not flush'); },
     persist: async () => { throw new Error('must not persist'); }
-  }, { emit: (event) => replayed.push(event) });
+  }, { emit: (event) => {
+    replayed.push(event);
+  } });
   assert.deepEqual(await recovered.finalize(), receipt);
   assert.deepEqual(replayed, [receipt]);
   assert.deepEqual(await recovered.finalize(), receipt);
