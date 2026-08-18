@@ -97,7 +97,10 @@ module.exports = {
         tokenFile: '/run/secrets/meeting_integration_token',
         maxQueuedPackets: 8192,
         batchSize: 128,
-        requestTimeoutMs: 5000
+        requestTimeoutMs: 5000,
+        // Safe rollout gate. Schema v3 additionally requires the sealed-roster
+        // capability ID, actor semantics version, and an immutable build SHA.
+        lifecycleProducer: { schemaVersion: 1 }
       },
       // Optional recording-scoped outbound playback channel. This shares the
       // Meeting Platform service token and has no public Craig endpoint.

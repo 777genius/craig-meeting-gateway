@@ -3,6 +3,12 @@ import Module from 'node:module';
 import test from 'node:test';
 
 import type { MeetingLifecycleEvent, MeetingLifecyclePublishOutcome } from './meetingIntegration';
+import {
+  type DurableCraigLifecycleV3Snapshot,
+  actorSemanticsVersion,
+  createCraigLifecycleV3Producer,
+  sealedActorRosterCapabilityId
+} from './meetingLifecycleV3';
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import type RecordingType from './recording';
 
@@ -40,6 +46,7 @@ interface RecordingLifecycleInternals {
 async function createRecordingHarness(...outcomes: MeetingLifecyclePublishOutcome[]) {
   await recordingLoaded;
   const events: MeetingLifecycleEvent[] = [];
+  const snapshots: Array<DurableCraigLifecycleV3Snapshot | undefined> = [];
   const participants = new MeetingParticipantLifecycle();
   participants.begin([], botId);
 
@@ -61,15 +68,16 @@ async function createRecordingHarness(...outcomes: MeetingLifecyclePublishOutcom
         warn() {}
       },
       meetingIntegration: {
-        publishLifecycle(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome {
+        publishLifecycle(event: MeetingLifecycleEvent, snapshot?: DurableCraigLifecycleV3Snapshot): MeetingLifecyclePublishOutcome {
           events.push(event);
+          snapshots.push(snapshot);
           return outcomes.shift() ?? { status: 'accepted' };
         }
       }
     }
   });
 
-  return { recording, events };
+  return { recording, events, snapshots };
 }
 
 function participantMember(isPresent: boolean): Parameters<RecordingType['onVoiceStateUpdate']>[0] {
@@ -154,5 +162,69 @@ test('keeps a loss open when capacity rejects recovery', async () => {
   assert.deepEqual(
     events.map(({ type }) => type),
     ['meeting.connection_lost', 'meeting.connection_recovered', 'meeting.connection_recovered']
+  );
+});
+
+test('the Recording Discord adapter derives fail-closed bot, system, and webhook actor evidence', async () => {
+  for (const [signals, expectedKind] of [
+    [{ bot: true }, 'automation'],
+    [{ system: true }, 'automation'],
+    [{ webhookID: '1533230920645308428' }, 'automation'],
+    [{ bot: false, system: false, webhookID: null }, 'human']
+  ] as const) {
+    const { recording, events } = await createRecordingHarness({ status: 'accepted' });
+    Object.assign(recording, {
+      lifecycleV3: createCraigLifecycleV3Producer(
+        {
+          schemaVersion: 3,
+          actorSemanticsVersion,
+          producerCapabilityId: sealedActorRosterCapabilityId,
+          producerRevision: '0123456789abcdef0123456789abcdef01234567'
+        },
+        { recordingId: 'recording-1', guildId: '1533232836297011436', channelId }
+      )
+    });
+    await recording.onVoiceStateUpdate(
+      { id: participantId, ...signals, voiceState: { channelID: channelId } } as Parameters<RecordingType['onVoiceStateUpdate']>[0],
+      oldVoiceState
+    );
+    assert.equal(events[0]?.schemaVersion, 3);
+    assert.deepEqual((events[0] as any).actor, { actorId: participantId, kind: expectedKind });
+  }
+});
+
+test('rolls back rejected v3 producer evidence before the next accepted transition', async () => {
+  const { recording, events, snapshots } = await createRecordingHarness({ status: 'capacity-exhausted' }, { status: 'accepted' });
+  const lifecycle = createCraigLifecycleV3Producer(
+    {
+      schemaVersion: 3,
+      actorSemanticsVersion,
+      producerCapabilityId: sealedActorRosterCapabilityId,
+      producerRevision: '0123456789abcdef0123456789abcdef01234567'
+    },
+    { recordingId: 'recording-1', guildId: '1533232836297011436', channelId }
+  );
+  const started = lifecycle.started(
+    {
+      eventId: 'recording-1:started',
+      recordingId: 'recording-1',
+      guildId: '1533232836297011436',
+      channelId,
+      occurredAt: '2026-08-18T00:00:00.000Z'
+    },
+    []
+  );
+  Object.assign(recording, { lifecycleV3: lifecycle });
+
+  await recording.onVoiceStateUpdate(participantMember(true), oldVoiceState);
+  await recording.onVoiceStateUpdate(participantMember(true), oldVoiceState);
+
+  assert.deepEqual(
+    events.map(({ eventId }) => eventId),
+    ['recording-1:1', 'recording-1:2']
+  );
+  assert.deepEqual(
+    snapshots[1]?.pendingOutbox.map(({ eventId }) => eventId),
+    [started.eventId, 'recording-1:2']
   );
 });

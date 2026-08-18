@@ -10,25 +10,26 @@ import { test } from 'node:test';
 
 import crc32 from './crc32';
 import {
-  AuthoritativeRecordingReadyEvent,
-  AuthoritativeTrackMetadata,
+  type AuthoritativeRecordingReadyEvent,
+  type AuthoritativeTrackMetadata,
+  type CookedAuthoritativeTrack,
+  type MeetingIntegrationLogger,
+  type MeetingIntegrationTransport,
+  type MeetingLifecycleEvent,
+  type MeetingLifecyclePublishOutcome,
+  type MeetingStartedLifecycleEvent,
+  type MeetingTerminalLifecycleEvent,
+  type MeetingVoicePacket,
+  type OriginalRecordingCooker,
   BoundedMeetingIntegrationSink,
-  CookedAuthoritativeTrack,
   HttpMeetingIntegrationTransport,
   isRetryableMeetingIntegrationStatus,
   MeetingIntegrationDeliveryError,
-  MeetingIntegrationLogger,
-  MeetingIntegrationTransport,
-  MeetingLifecycleEvent,
-  MeetingLifecyclePublishOutcome,
-  MeetingStartedLifecycleEvent,
   MeetingTerminalLifecycle,
-  MeetingTerminalLifecycleEvent,
-  MeetingVoicePacket,
-  OriginalRecordingCooker,
   parseMeetingPlatformConfiguration,
   reportMeetingLifecyclePublishOutcome
 } from './meetingIntegration';
+import { actorSemanticsVersion, createCraigLifecycleV3Producer, sealedActorRosterCapabilityId } from './meetingLifecycleV3';
 
 const logger: MeetingIntegrationLogger = {
   debug: () => {},
@@ -37,6 +38,12 @@ const logger: MeetingIntegrationLogger = {
 };
 
 const accepted: MeetingLifecyclePublishOutcome = { status: 'accepted' };
+const lifecycleV3Config = {
+  schemaVersion: 3 as const,
+  actorSemanticsVersion,
+  producerCapabilityId: sealedActorRosterCapabilityId,
+  producerRevision: '0123456789abcdef0123456789abcdef01234567'
+};
 
 const event: MeetingStartedLifecycleEvent = {
   schemaVersion: 1,
@@ -709,10 +716,15 @@ test('recovers the authoritative original after restart loses an incomplete live
   assert.equal(await activeBeforeRestart.drain(1000), true);
   assert.deepEqual(liveDelivery, ['/v1/craig/events', '/v1/craig/voice-packets']);
 
-  const firstAfterRestart = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, {
-    recordingRoot,
-    outboxRoot
-  });
+  const firstAfterRestart = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined },
+    logger,
+    4,
+    2,
+    1024,
+    { recordingRoot, outboxRoot },
+    lifecycleV3Config
+  );
   assert.equal(
     await firstAfterRestart.recoverInterruptedOriginalRecording({
       recordingId: event.recordingId,
@@ -727,11 +739,13 @@ test('recovers the authoritative original after restart loses an incomplete live
   assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), ['recording-1.json']);
   const pendingJobPath = path.join(outboxRoot, 'pending', 'recording-1.json');
   const recoveredJob = JSON.parse(await readFile(pendingJobPath, 'utf8')) as {
+    schemaVersion: number;
     startedEvent: MeetingStartedLifecycleEvent;
     terminalEvent: MeetingTerminalLifecycleEvent;
     sourceFiles: Array<{ kind: string; relativePath: string }>;
     authoritativeTracks?: Array<Pick<AuthoritativeTrackMetadata, 'speakerId' | 'trackNumber' | 'timelineOffsetMs'>>;
   };
+  assert.equal(recoveredJob.schemaVersion, 2, 'raw track identities must not be promoted to trusted lifecycle v3 evidence');
   assert.deepEqual(recoveredJob.startedEvent.participantIds, ['1533227577286852649']);
   assert.equal(recoveredJob.terminalEvent.type, 'meeting.ended');
   assert.match(recoveredJob.terminalEvent.reason ?? '', /restarted during an active recording/);
@@ -1136,4 +1150,483 @@ test('publishes one abort after an accepted meeting start', () => {
   terminal.abort((type) => published.push(type));
 
   assert.deepEqual(published, ['meeting.aborted']);
+});
+
+test('keeps lifecycle v1 compatibility by default and admits v3 only behind the explicit producer capability', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-admission-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  await mkdir(recordingRoot, { recursive: true });
+  const delivered: MeetingLifecycleEvent[] = [];
+  const legacy = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2);
+  assert.deepEqual(legacy.lifecycleProducerConfiguration, { schemaVersion: 1 });
+
+  const sink = new BoundedMeetingIntegrationSink(
+    {
+      post: async (requestPath, body) => {
+        if (requestPath === '/v1/craig/events') delivered.push(body as MeetingLifecycleEvent);
+      }
+    },
+    logger,
+    4,
+    2,
+    1024,
+    { recordingRoot, outboxRoot: path.join(root, 'outbox') },
+    lifecycleV3Config
+  );
+  assert.deepEqual(sink.lifecycleProducerConfiguration, lifecycleV3Config);
+  const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId
+  });
+  const started = lifecycle.started(
+    { eventId: 'recording-1:v3:1', recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: event.occurredAt },
+    [{ id: event.participantIds[0], bot: false, system: false, webhook: false }]
+  );
+  assert.equal(sink.publishLifecycle(started, lifecycle.durableSnapshot()).status, 'accepted');
+  const terminal = lifecycle.terminal(
+    {
+      eventId: 'recording-1:v3:2',
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: terminalEvent.occurredAt
+    },
+    'meeting.ended',
+    null
+  );
+  assert.equal(sink.publishLifecycle(terminal, lifecycle.durableSnapshot()).status, 'accepted');
+  assert.equal(await sink.drain(1000), true);
+  assert.deepEqual(delivered, [started, terminal]);
+});
+
+test('persists lifecycle v3 context, producer, event order, and pending outbox across restart', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-outbox-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  await mkdir(recordingRoot, { recursive: true });
+  const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId
+  });
+  const startedEvent = lifecycle.started(
+    { eventId: 'recording-1:v3:1', recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: event.occurredAt },
+    [{ id: event.participantIds[0], bot: false, system: false, webhook: false }]
+  );
+  const endedEvent = lifecycle.terminal(
+    {
+      eventId: 'recording-1:v3:2',
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: terminalEvent.occurredAt
+    },
+    'meeting.ended',
+    null
+  );
+  const staging = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined },
+    logger,
+    4,
+    2,
+    1024,
+    {
+      recordingRoot,
+      outboxRoot
+    },
+    lifecycleV3Config
+  );
+  assert.equal(
+    await staging.publishOriginalRecording({
+      startedEvent,
+      terminalEvent: endedEvent,
+      sourceFileBase: path.join(recordingRoot, `${event.recordingId}.ogg`),
+      lifecycleV3Snapshot: lifecycle.durableSnapshot()
+    }),
+    true
+  );
+  const persisted = JSON.parse(await readFile(path.join(outboxRoot, 'pending', `${event.recordingId}.json`), 'utf8'));
+  assert.equal(persisted.schemaVersion, 3);
+  assert.deepEqual(
+    persisted.lifecycleV3Snapshot.emitted,
+    [startedEvent, endedEvent].map(({ eventId, occurredAt }) => ({ eventId, occurredAt }))
+  );
+  assert.deepEqual(persisted.lifecycleV3Snapshot.pendingOutbox, [startedEvent, endedEvent]);
+
+  const restored = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined },
+    logger,
+    4,
+    2,
+    1024,
+    {
+      recordingRoot,
+      outboxRoot
+    },
+    lifecycleV3Config
+  );
+  await restored.restoreOriginalRecordingJobs();
+  assert.equal(await restored.drain(0), false);
+});
+
+test('replays the exact ordered lifecycle v3 outbox and sealed ready event after a crash', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-replay-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const pendingRoot = path.join(root, 'outbox', 'pending');
+  await Promise.all([mkdir(recordingRoot, { recursive: true }), mkdir(pendingRoot, { recursive: true })]);
+  const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId
+  });
+  const envelope = (eventId: string, occurredAt: string) => ({
+    eventId,
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId,
+    occurredAt
+  });
+  const started = lifecycle.started(envelope('recording-1:v3:1', event.occurredAt), [
+    { id: event.participantIds[0], bot: false, system: false, webhook: false }
+  ]);
+  const joined = lifecycle.participant(envelope('recording-1:v3:2', '2026-08-02T00:00:30.000Z'), 'participant.joined', {
+    id: '1533228054724346087',
+    bot: true,
+    system: false,
+    webhook: false
+  });
+  const ended = lifecycle.terminal(envelope('recording-1:v3:3', terminalEvent.occurredAt), 'meeting.ended', null);
+  const sourceFiles = (['data', 'header1', 'header2', 'users', 'info', 'log'] as const).map((kind) => ({
+    kind,
+    relativePath: `${event.recordingId}.ogg.${kind}`,
+    checksumSha256: createHash('sha256').update(kind).digest('hex'),
+    sizeBytes: kind.length
+  }));
+  const sourceFilesChecksumSha256 = createHash('sha256').update(JSON.stringify(sourceFiles), 'utf8').digest('hex');
+  const ready = lifecycle.authoritativeReady(envelope('recording-1:authoritative-ready:v3', terminalEvent.occurredAt), {
+    actors: [
+      { id: event.participantIds[0], bot: false, system: false, webhook: false },
+      { id: '1533228054724346087', bot: true, system: false, webhook: false }
+    ],
+    endedAt: terminalEvent.occurredAt,
+    trackCount: 1,
+    sourceFilesChecksumSha256
+  });
+  await writeFile(
+    path.join(pendingRoot, `${event.recordingId}.json`),
+    `${JSON.stringify({
+      schemaVersion: 3,
+      publicationId: `authoritative-recording:v3:${event.recordingId}`,
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      startedEvent: started,
+      terminalEvent: ended,
+      sourceFiles,
+      authoritativeTracks: [{ speakerId: event.participantIds[0], trackNumber: 1, timelineOffsetMs: 0 }],
+      authoritativeTimelineBasis: 'craig-cook-shared-origin-v1',
+      lifecycleV3Snapshot: lifecycle.durableSnapshot()
+    })}\n`
+  );
+
+  const delivered: MeetingLifecycleEvent[] = [];
+  const readyEvents: AuthoritativeRecordingReadyEvent[] = [];
+  const restored = new BoundedMeetingIntegrationSink(
+    {
+      post: async (requestPath, body) => {
+        if (requestPath === '/v1/craig/events') delivered.push(body as MeetingLifecycleEvent);
+      },
+      postAuthoritativeTrack: async () => undefined,
+      postAuthoritativeReady: async (readyEvent) => {
+        readyEvents.push(readyEvent);
+      }
+    },
+    logger,
+    4,
+    2,
+    1024,
+    {
+      recordingRoot,
+      outboxRoot: path.join(root, 'outbox'),
+      cooker: {
+        async cook() {
+          return {
+            filePath: path.join(root, 'synthetic.ogg'),
+            checksumSha256: 'd'.repeat(64),
+            sizeBytes: 1,
+            async dispose() {}
+          };
+        }
+      }
+    },
+    lifecycleV3Config
+  );
+  await restored.restoreOriginalRecordingJobs();
+  assert.equal(await restored.drain(2000), true);
+  assert.deepEqual(delivered, [started, joined, ended]);
+  assert.deepEqual(readyEvents, [ready]);
+  assert.deepEqual(await readdir(pendingRoot), []);
+});
+
+test('hard-crash recovery replays exact durable v3 identities and never fabricates actor evidence', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-hard-crash-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  const sourceFileBase = path.join(recordingRoot, `${event.recordingId}.ogg`);
+  await mkdir(recordingRoot, { recursive: true });
+  const sources: Record<string, string | Buffer> = {
+    data: Buffer.concat([rawOggPage(57_624, 1, 1, Buffer.from([0xf8, 0xff, 0xfe]))]),
+    header1: Buffer.from('header-1'),
+    header2: Buffer.from('header-2'),
+    users: `"0":{}\n,"1":{"id":"${event.participantIds[0]}"}\n`,
+    info: '{"format":1,"clientId":"1533228054724346087"}',
+    log: 'interrupted\n'
+  };
+  await Promise.all(Object.entries(sources).map(([kind, contents]) => writeFile(`${sourceFileBase}.${kind}`, contents)));
+
+  const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId
+  });
+  const staging = new BoundedMeetingIntegrationSink(
+    { post: async () => await new Promise<void>(() => {}) },
+    logger,
+    4,
+    2,
+    1024,
+    { recordingRoot, outboxRoot },
+    lifecycleV3Config
+  );
+  const started = lifecycle.started(
+    {
+      eventId: 'original:v3:start',
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: event.occurredAt
+    },
+    [{ id: event.participantIds[0], bot: false, system: false, webhook: false }]
+  );
+  assert.equal(staging.publishLifecycle(started, lifecycle.durableSnapshot()).status, 'accepted');
+  const joined = lifecycle.participant(
+    {
+      eventId: 'original:v3:join',
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: '2026-08-02T00:00:30.000Z'
+    },
+    'participant.joined',
+    { id: '1533228054724346087', bot: true, system: false, webhook: false }
+  );
+  assert.equal(staging.publishLifecycle(joined, lifecycle.durableSnapshot()).status, 'accepted');
+
+  const replayed: MeetingLifecycleEvent[] = [];
+  const replay = new BoundedMeetingIntegrationSink(
+    {
+      post: async (requestPath, body) => {
+        if (requestPath === '/v1/craig/events') replayed.push(body as MeetingLifecycleEvent);
+      }
+    },
+    logger,
+    4,
+    2,
+    1024,
+    { recordingRoot, outboxRoot }
+  );
+  await replay.restoreOriginalRecordingJobs();
+  assert.equal(await replay.drain(1000), true);
+  assert.deepEqual(replayed, [started, joined]);
+
+  const recovery = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, {
+    recordingRoot,
+    outboxRoot
+  });
+  assert.equal(
+    await recovery.recoverInterruptedOriginalRecording({
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      startedAt: event.occurredAt,
+      recoveredAt: terminalEvent.occurredAt,
+      sourceFileBase
+    }),
+    true
+  );
+  const recovered = JSON.parse(await readFile(path.join(outboxRoot, 'pending', `${event.recordingId}.json`), 'utf8'));
+  assert.deepEqual(recovered.lifecycleV3Snapshot.pendingOutbox.slice(0, 2), [started, joined]);
+  assert.equal(recovered.startedEvent.eventId, started.eventId);
+  assert.deepEqual(recovered.lifecycleV3Snapshot.actors, [
+    { actorId: event.participantIds[0], kind: 'human' },
+    { actorId: '1533228054724346087', kind: 'automation' }
+  ]);
+});
+
+test('restores pending v3 jobs using their immutable producer revision after a rolling revision', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-rolling-revision-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  await mkdir(recordingRoot, { recursive: true });
+  const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId
+  });
+  const started = lifecycle.started(
+    { eventId: 'rolling:v3:start', recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: event.occurredAt },
+    []
+  );
+  const aborted = lifecycle.terminal(
+    {
+      eventId: 'rolling:v3:abort',
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: terminalEvent.occurredAt
+    },
+    'meeting.aborted',
+    'crash'
+  );
+  const staging = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, { recordingRoot, outboxRoot });
+  assert.equal(
+    await staging.publishOriginalRecording({
+      startedEvent: started,
+      terminalEvent: aborted,
+      lifecycleV3Snapshot: lifecycle.durableSnapshot(),
+      sourceFileBase: path.join(recordingRoot, `${event.recordingId}.ogg`)
+    }),
+    true
+  );
+
+  const delivered: MeetingLifecycleEvent[] = [];
+  const changedRevision = { ...lifecycleV3Config, producerRevision: 'f'.repeat(40) };
+  const restored = new BoundedMeetingIntegrationSink(
+    {
+      post: async (_requestPath, body) => {
+        delivered.push(body as MeetingLifecycleEvent);
+      },
+      postAuthoritativeTrack: async () => undefined,
+      postAuthoritativeReady: async () => undefined
+    },
+    logger,
+    4,
+    2,
+    1024,
+    { recordingRoot, outboxRoot, cooker: { cook: async () => assert.fail('aborted recording must not be cooked') } },
+    changedRevision
+  );
+  await restored.restoreOriginalRecordingJobs();
+  assert.equal(await restored.drain(1000), true);
+  assert.deepEqual(delivered, [started, aborted]);
+});
+
+test('restores pending v3 jobs while current admission has rolled back to v1', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-to-v1-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  await mkdir(recordingRoot, { recursive: true });
+  const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId
+  });
+  const started = lifecycle.started(
+    {
+      eventId: 'rollback:v3:start',
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: event.occurredAt
+    },
+    []
+  );
+  const aborted = lifecycle.terminal(
+    {
+      eventId: 'rollback:v3:abort',
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: terminalEvent.occurredAt
+    },
+    'meeting.aborted',
+    'rollback'
+  );
+  const staging = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, { recordingRoot, outboxRoot });
+  assert.equal(
+    await staging.publishOriginalRecording({
+      startedEvent: started,
+      terminalEvent: aborted,
+      lifecycleV3Snapshot: lifecycle.durableSnapshot(),
+      sourceFileBase: path.join(recordingRoot, `${event.recordingId}.ogg`)
+    }),
+    true
+  );
+  const delivered: MeetingLifecycleEvent[] = [];
+  const restored = new BoundedMeetingIntegrationSink(
+    {
+      post: async (_requestPath, body) => {
+        delivered.push(body as MeetingLifecycleEvent);
+      },
+      postAuthoritativeTrack: async () => undefined,
+      postAuthoritativeReady: async () => undefined
+    },
+    logger,
+    4,
+    2,
+    1024,
+    { recordingRoot, outboxRoot, cooker: { cook: async () => assert.fail('aborted recording must not be cooked') } }
+  );
+  await restored.restoreOriginalRecordingJobs();
+  assert.equal(await restored.drain(1000), true);
+  assert.deepEqual(delivered, [started, aborted]);
+});
+
+test('poisons duplicate original admission when identical IDs hide a conflicting v3 snapshot', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-conflicting-admission-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  await mkdir(recordingRoot, { recursive: true });
+  const createAdmission = (bot: boolean) => {
+    const lifecycle = createCraigLifecycleV3Producer(lifecycleV3Config, {
+      recordingId: event.recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId
+    });
+    const startedEvent = lifecycle.started(
+      { eventId: 'same:v3:start', recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: event.occurredAt },
+      [{ id: event.participantIds[0], bot, system: false, webhook: false }]
+    );
+    const terminalEvent = lifecycle.terminal(
+      {
+        eventId: 'same:v3:abort',
+        recordingId: event.recordingId,
+        guildId: event.guildId,
+        channelId: event.channelId,
+        occurredAt: terminalEventTime
+      },
+      'meeting.aborted',
+      'same ids'
+    );
+    return {
+      startedEvent,
+      terminalEvent,
+      lifecycleV3Snapshot: lifecycle.durableSnapshot(),
+      sourceFileBase: path.join(recordingRoot, `${event.recordingId}.ogg`)
+    };
+  };
+  const terminalEventTime = terminalEvent.occurredAt;
+  const sink = new BoundedMeetingIntegrationSink({ post: async () => undefined }, logger, 4, 2, 1024, { recordingRoot, outboxRoot });
+  assert.equal(await sink.publishOriginalRecording(createAdmission(false)), true);
+  assert.equal(await sink.publishOriginalRecording(createAdmission(true)), false);
+  assert.deepEqual(await readdir(path.join(outboxRoot, 'pending')), []);
+  assert.deepEqual(await readdir(path.join(outboxRoot, 'rejected')), [`${event.recordingId}.json`]);
 });

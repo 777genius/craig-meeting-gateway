@@ -1,12 +1,32 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { type Stats, createReadStream } from 'node:fs';
+import {
+  type Stats,
+  closeSync,
+  createReadStream,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync
+} from 'node:fs';
 import { mkdir, mkdtemp, open, readdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import fetch, { type Response } from 'node-fetch';
 
 import crc32 from './crc32';
+import {
+  type CraigLifecycleV3Event,
+  type DurableCraigLifecycleV3Snapshot,
+  type MeetingLifecycleProducerConfiguration,
+  parseMeetingLifecycleProducerConfiguration,
+  restoreCraigLifecycleV3ProducerFromSnapshot
+} from './meetingLifecycleV3';
 
 const sourceFileKinds = ['data', 'header1', 'header2', 'users', 'info', 'log'] as const;
 const maximumCookedTrackBytes = 64 * 1024 * 1024;
@@ -23,6 +43,8 @@ export interface MeetingIntegrationConfig {
   maxQueuedPackets?: number;
   batchSize?: number;
   requestTimeoutMs?: number;
+  /** Explicit capability rollout. Omit for schema-v1 compatible behavior. */
+  lifecycleProducer?: unknown;
 }
 
 export interface MeetingPlatformConfigurationChannel {
@@ -39,7 +61,7 @@ export interface MeetingPlatformConfigurationClient {
   getConfiguration(): Promise<MeetingPlatformConfiguration>;
 }
 
-export interface MeetingLifecycleEvent {
+export interface LegacyMeetingLifecycleEvent {
   schemaVersion: 1;
   eventId: string;
   recordingId: string;
@@ -59,15 +81,21 @@ export interface MeetingLifecycleEvent {
   reason?: string | null;
 }
 
-export interface MeetingStartedLifecycleEvent extends MeetingLifecycleEvent {
+export interface MeetingStartedLifecycleEvent extends LegacyMeetingLifecycleEvent {
   type: 'meeting.started';
   participantIds: string[];
 }
 
-export interface MeetingTerminalLifecycleEvent extends MeetingLifecycleEvent {
+export interface MeetingTerminalLifecycleEvent extends LegacyMeetingLifecycleEvent {
   type: 'meeting.ended' | 'meeting.aborted';
   reason: string | null;
 }
+
+export type MeetingLifecycleEvent = LegacyMeetingLifecycleEvent | CraigLifecycleV3Event;
+export type AnyMeetingStartedLifecycleEvent = MeetingStartedLifecycleEvent | Extract<CraigLifecycleV3Event, { type: 'meeting.started' }>;
+export type AnyMeetingTerminalLifecycleEvent =
+  | MeetingTerminalLifecycleEvent
+  | Extract<CraigLifecycleV3Event, { type: 'meeting.ended' | 'meeting.aborted' }>;
 
 export interface MeetingVoicePacket {
   schemaVersion: 1;
@@ -88,9 +116,10 @@ interface WireVoicePacket extends MeetingVoicePacket {
 type QueueItem = { type: 'lifecycle'; event: MeetingLifecycleEvent } | { type: 'voice'; packet: WireVoicePacket };
 
 export interface OriginalRecordingPublicationInput {
-  startedEvent: MeetingStartedLifecycleEvent;
-  terminalEvent: MeetingTerminalLifecycleEvent;
+  startedEvent: AnyMeetingStartedLifecycleEvent;
+  terminalEvent: AnyMeetingTerminalLifecycleEvent;
   sourceFileBase: string;
+  lifecycleV3Snapshot?: DurableCraigLifecycleV3Snapshot;
 }
 
 export interface InterruptedOriginalRecordingRecoveryInput {
@@ -116,13 +145,15 @@ interface PreparedAuthoritativeTrack {
 }
 
 interface OriginalRecordingOutboxJob {
-  schemaVersion: 2;
+  schemaVersion: 2 | 3;
   publicationId: string;
   recordingId: string;
   guildId: string;
   channelId: string;
-  startedEvent: MeetingStartedLifecycleEvent;
-  terminalEvent: MeetingTerminalLifecycleEvent;
+  startedEvent: AnyMeetingStartedLifecycleEvent;
+  terminalEvent: AnyMeetingTerminalLifecycleEvent;
+  lifecycleV3Snapshot?: DurableCraigLifecycleV3Snapshot;
+  admissionDigestSha256?: string;
   sourceFiles: OriginalRecordingSourceFileReference[];
   authoritativeTracks?: PreparedAuthoritativeTrack[];
   authoritativeTimelineBasis?: typeof authoritativeTimelineBasis;
@@ -147,7 +178,7 @@ export interface AuthoritativeTrackMetadata {
 }
 
 export interface AuthoritativeRecordingReadyEvent {
-  schemaVersion: 1;
+  schemaVersion: 1 | 3;
   eventId: string;
   recordingId: string;
   guildId: string;
@@ -157,6 +188,12 @@ export interface AuthoritativeRecordingReadyEvent {
   endedAt: string;
   trackCount: number;
   sourceFilesChecksumSha256: string;
+  actorObservationState?: 'consistent' | 'conflicted';
+  actorSemanticsVersion?: 1;
+  producerCapabilityId?: string;
+  producerRevision?: string;
+  actors?: Array<{ actorId: string; kind: 'human' | 'automation' | 'unknown' }>;
+  rosterState?: 'sealed';
 }
 
 export interface CookedAuthoritativeTrack {
@@ -189,7 +226,8 @@ export interface MeetingIntegrationTransport {
 }
 
 export interface MeetingIntegrationSink {
-  publishLifecycle(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome;
+  readonly lifecycleProducerConfiguration: MeetingLifecycleProducerConfiguration;
+  publishLifecycle(event: MeetingLifecycleEvent, lifecycleV3Snapshot?: DurableCraigLifecycleV3Snapshot): MeetingLifecyclePublishOutcome;
   publishPacket(packet: MeetingVoicePacket, opus: Buffer): boolean;
   publishOriginalRecording(input: OriginalRecordingPublicationInput): Promise<boolean>;
   recoverInterruptedOriginalRecording(input: InterruptedOriginalRecordingRecoveryInput): Promise<boolean>;
@@ -221,6 +259,7 @@ export type MeetingLifecyclePublishOutcome =
   | Readonly<{ status: 'accepted' }>
   | Readonly<{ status: 'missing-start' }>
   | Readonly<{ status: 'duplicate' }>
+  | Readonly<{ status: 'persistence-failed' }>
   | Readonly<{ status: 'capacity-exhausted' }>;
 
 const acceptedLifecycleOutcome: MeetingLifecyclePublishOutcome = Object.freeze({ status: 'accepted' });
@@ -242,6 +281,9 @@ export function reportMeetingLifecyclePublishOutcome(
       return;
     case 'duplicate':
       logger.debug(`Meeting integration ignored duplicate lifecycle event for recording ${recordingId} (${eventType})`);
+      return;
+    case 'persistence-failed':
+      logger.error(`Meeting integration could not durably persist lifecycle evidence for recording ${recordingId} (${eventType})`);
   }
 }
 
@@ -282,6 +324,7 @@ export class MeetingTerminalLifecycle {
 }
 
 export class NoopMeetingIntegrationSink implements MeetingIntegrationSink {
+  readonly lifecycleProducerConfiguration = Object.freeze({ schemaVersion: 1 as const });
   publishLifecycle(): MeetingLifecyclePublishOutcome {
     return acceptedLifecycleOutcome;
   }
@@ -376,6 +419,7 @@ export class CraigOriginalRecordingCooker implements OriginalRecordingCooker {
 }
 
 export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
+  readonly lifecycleProducerConfiguration: MeetingLifecycleProducerConfiguration;
   private readonly queue: QueueItem[] = [];
   private readonly originalJobs: PendingOriginalRecordingJob[] = [];
   private readonly drainWaiters = new Set<() => void>();
@@ -391,6 +435,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private readonly recordingRoot?: string;
   private readonly pendingOriginalRoot?: string;
   private readonly rejectedOriginalRoot?: string;
+  private readonly pendingLifecycleV3Root?: string;
+  private readonly rejectedLifecycleV3Root?: string;
   private readonly originalCooker?: OriginalRecordingCooker;
 
   constructor(
@@ -399,8 +445,10 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     private readonly maxQueuedPackets = 8192,
     private readonly batchSize = 128,
     private readonly maxQueuedLifecycleEvents = 1024,
-    originalRecording?: OriginalRecordingOutboxOptions
+    originalRecording?: OriginalRecordingOutboxOptions,
+    lifecycleProducerConfiguration: unknown = { schemaVersion: 1 }
   ) {
+    this.lifecycleProducerConfiguration = parseMeetingLifecycleProducerConfiguration(lifecycleProducerConfiguration);
     if (!Number.isSafeInteger(maxQueuedPackets) || maxQueuedPackets < 1) throw new Error('maxQueuedPackets must be a positive integer');
     if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > maxQueuedPackets)
       throw new Error('batchSize must be a positive integer no greater than maxQueuedPackets');
@@ -411,23 +459,34 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       const outboxRoot = path.resolve(originalRecording.outboxRoot ?? path.join(this.recordingRoot, '.meeting-integration-outbox'));
       this.pendingOriginalRoot = path.join(outboxRoot, 'pending');
       this.rejectedOriginalRoot = path.join(outboxRoot, 'rejected');
+      this.pendingLifecycleV3Root = path.join(outboxRoot, 'lifecycle-v3', 'pending');
+      this.rejectedLifecycleV3Root = path.join(outboxRoot, 'lifecycle-v3', 'rejected');
       this.originalCooker = originalRecording.cooker ?? new CraigOriginalRecordingCooker();
     }
   }
 
-  publishLifecycle(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome {
+  publishLifecycle(event: MeetingLifecycleEvent, lifecycleV3Snapshot?: DurableCraigLifecycleV3Snapshot): MeetingLifecyclePublishOutcome {
     // Lifecycle traffic is tiny and must remain ordered with the accepted audio.
     const queuedLifecycleEvents = this.queue.length - this.queuedPackets;
     const isTerminal = event.type === 'meeting.ended' || event.type === 'meeting.aborted';
     if (event.type === 'meeting.started') {
       if (this.openRecordings.has(event.recordingId) || this.closedRecordings.has(event.recordingId)) return { status: 'duplicate' };
       if (queuedLifecycleEvents + this.openRecordings.size + 2 > this.maxQueuedLifecycleEvents) return { status: 'capacity-exhausted' };
-      this.openRecordings.add(event.recordingId);
     } else if (!this.openRecordings.has(event.recordingId))
       return { status: isTerminal && this.closedRecordings.has(event.recordingId) ? 'duplicate' : 'missing-start' };
     else if (!isTerminal && queuedLifecycleEvents + this.openRecordings.size + 1 > this.maxQueuedLifecycleEvents)
       return { status: 'capacity-exhausted' };
 
+    if (event.schemaVersion === 3) {
+      try {
+        this.persistLifecycleV3Admission(event, lifecycleV3Snapshot);
+      } catch (error) {
+        this.logger.error(`Failed to persist lifecycle v3 evidence for ${event.recordingId}`, error);
+        return { status: 'persistence-failed' };
+      }
+    }
+
+    if (event.type === 'meeting.started') this.openRecordings.add(event.recordingId);
     this.queue.push({ type: 'lifecycle', event });
     if (isTerminal) {
       this.openRecordings.delete(event.recordingId);
@@ -474,8 +533,10 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       });
       const queuedJob = existing ?? job;
       if (existing === undefined) await writeOriginalRecordingJob(filePath, job);
-      else if (existing.publicationId !== job.publicationId)
+      else if (existing.admissionDigestSha256 !== job.admissionDigestSha256) {
+        await this.rejectOriginalJob(filePath, path.basename(filePath));
         throw new Error(`Original recording outbox contains a conflicting job for ${job.recordingId}`);
+      }
       this.enqueueOriginalJob({ filePath, job: queuedJob });
       this.scheduleOriginalProcessing();
       return true;
@@ -501,6 +562,43 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       );
       await Promise.all(sourceFileKinds.map((kind) => digestFile(`${input.sourceFileBase}.${kind}`)));
       const recoveryIdentity = createHash('sha256').update(input.recordingId).digest('hex').slice(0, 32);
+
+      const durableLifecycle = this.readLifecycleV3Snapshot(input.recordingId);
+      if (durableLifecycle !== undefined) {
+        const lifecycle = restoreCraigLifecycleV3ProducerFromSnapshot(durableLifecycle);
+        if (
+          durableLifecycle.guildId !== input.guildId ||
+          durableLifecycle.channelId !== input.channelId ||
+          durableLifecycle.recordingId !== input.recordingId
+        )
+          throw new Error('Durable lifecycle v3 recovery evidence belongs to another recording context');
+        const envelope = (eventId: string, occurredAt: string) => ({
+          eventId,
+          recordingId: input.recordingId,
+          guildId: input.guildId,
+          channelId: input.channelId,
+          occurredAt
+        });
+        const startedEvent = durableLifecycle.pendingOutbox.find((event) => event.type === 'meeting.started');
+        if (startedEvent?.type !== 'meeting.started') throw new Error('Durable lifecycle v3 recovery evidence has no trusted start');
+        const persistedTerminal = durableLifecycle.pendingOutbox.find((event) => event.type === 'meeting.ended' || event.type === 'meeting.aborted');
+        const terminalEvent =
+          persistedTerminal?.type === 'meeting.ended' || persistedTerminal?.type === 'meeting.aborted'
+            ? persistedTerminal
+            : lifecycle.terminal(
+                envelope(`recovery:v3:${recoveryIdentity}:ended`, input.recoveredAt),
+                'meeting.ended',
+                'Craig restarted during an active recording; the authoritative original was recovered from durable files.'
+              );
+        const recoveredSnapshot = lifecycle.durableSnapshot();
+        this.persistLifecycleV3Snapshot(recoveredSnapshot);
+        return await this.publishOriginalRecording({
+          sourceFileBase: input.sourceFileBase,
+          startedEvent,
+          terminalEvent,
+          lifecycleV3Snapshot: recoveredSnapshot
+        });
+      }
 
       return await this.publishOriginalRecording({
         sourceFileBase: input.sourceFileBase,
@@ -538,13 +636,15 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     if (this.pendingOriginalRoot === undefined || this.rejectedOriginalRoot === undefined) return;
     try {
       await this.ensureOriginalOutboxDirectories();
+      this.restoreLifecycleV3Admissions();
       const entries = (await readdir(this.pendingOriginalRoot)).filter((entry) => entry.endsWith('.json')).sort();
       for (const entry of entries) {
         const filePath = path.join(this.pendingOriginalRoot, entry);
         try {
+          const job = await readOriginalRecordingJob(filePath);
           this.enqueueOriginalJob({
             filePath,
-            job: await readOriginalRecordingJob(filePath)
+            job
           });
         } catch (error) {
           this.logger.error(`Rejecting invalid Meeting original recording outbox job ${entry}`, error);
@@ -582,8 +682,111 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private async ensureOriginalOutboxDirectories(): Promise<void> {
     await Promise.all([
       mkdir(this.pendingOriginalRoot!, { recursive: true, mode: 0o700 }),
-      mkdir(this.rejectedOriginalRoot!, { recursive: true, mode: 0o700 })
+      mkdir(this.rejectedOriginalRoot!, { recursive: true, mode: 0o700 }),
+      mkdir(this.pendingLifecycleV3Root!, { recursive: true, mode: 0o700 }),
+      mkdir(this.rejectedLifecycleV3Root!, { recursive: true, mode: 0o700 })
     ]);
+  }
+
+  private persistLifecycleV3Admission(event: CraigLifecycleV3Event, snapshot: DurableCraigLifecycleV3Snapshot | undefined): void {
+    if (snapshot === undefined) throw new Error('Lifecycle v3 admission requires its durable producer snapshot');
+    const normalized = restoreCraigLifecycleV3ProducerFromSnapshot(snapshot).durableSnapshot();
+    const admitted = normalized.pendingOutbox[normalized.pendingOutbox.length - 1];
+    if (admitted === undefined || canonicalJson(admitted) !== canonicalJson(event))
+      throw new Error('Lifecycle v3 admission event is not the latest event in its durable snapshot');
+
+    const previous = this.readLifecycleV3Snapshot(event.recordingId);
+    if (previous !== undefined) {
+      if (canonicalJson(previous) === canonicalJson(normalized)) return;
+      if (
+        previous.pendingOutbox.length + 1 !== normalized.pendingOutbox.length ||
+        previous.pendingOutbox.some((persisted, index) => canonicalJson(persisted) !== canonicalJson(normalized.pendingOutbox[index]))
+      )
+        throw new Error('Lifecycle v3 durable admission is not an exact monotonic extension');
+    } else {
+      const configured = this.lifecycleProducerConfiguration;
+      if (
+        normalized.pendingOutbox.length !== 1 ||
+        event.type !== 'meeting.started' ||
+        configured.schemaVersion !== 3 ||
+        configured.actorSemanticsVersion !== normalized.producer.actorSemanticsVersion ||
+        configured.producerCapabilityId !== normalized.producer.producerCapabilityId ||
+        configured.producerRevision !== normalized.producer.producerRevision
+      )
+        throw new Error('Lifecycle v3 durable admission does not match the active producer rollout');
+    }
+    this.persistLifecycleV3Snapshot(normalized);
+  }
+
+  private persistLifecycleV3Snapshot(snapshot: DurableCraigLifecycleV3Snapshot): void {
+    if (this.pendingLifecycleV3Root === undefined) throw new Error('Lifecycle v3 durable outbox is not configured');
+    const normalized = restoreCraigLifecycleV3ProducerFromSnapshot(snapshot).durableSnapshot();
+    assertRecordingId(normalized.recordingId);
+    mkdirSync(this.pendingLifecycleV3Root, { recursive: true, mode: 0o700 });
+    const filePath = path.join(this.pendingLifecycleV3Root, `${normalized.recordingId}.json`);
+    const temporaryPath = path.join(this.pendingLifecycleV3Root, `.${normalized.recordingId}.${process.pid}.${Date.now()}.tmp`);
+    const descriptor = openSync(temporaryPath, 'wx', 0o600);
+    try {
+      writeFileSync(descriptor, `${JSON.stringify(normalized)}\n`, 'utf8');
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    try {
+      renameSync(temporaryPath, filePath);
+      syncDirectorySync(this.pendingLifecycleV3Root);
+    } catch (error) {
+      try {
+        unlinkSync(temporaryPath);
+      } catch {}
+      throw error;
+    }
+  }
+
+  private readLifecycleV3Snapshot(recordingId: string): DurableCraigLifecycleV3Snapshot | undefined {
+    if (this.pendingLifecycleV3Root === undefined) return undefined;
+    assertRecordingId(recordingId);
+    const filePath = path.join(this.pendingLifecycleV3Root, `${recordingId}.json`);
+    if (!existsSync(filePath)) return undefined;
+    return restoreCraigLifecycleV3ProducerFromSnapshot(JSON.parse(readFileSync(filePath, 'utf8')) as unknown).durableSnapshot();
+  }
+
+  private restoreLifecycleV3Admissions(): void {
+    if (this.pendingLifecycleV3Root === undefined || this.rejectedLifecycleV3Root === undefined) return;
+    mkdirSync(this.pendingLifecycleV3Root, { recursive: true, mode: 0o700 });
+    mkdirSync(this.rejectedLifecycleV3Root, { recursive: true, mode: 0o700 });
+    for (const entry of readdirSync(this.pendingLifecycleV3Root)
+      .filter((name) => name.endsWith('.json'))
+      .sort()) {
+      const filePath = path.join(this.pendingLifecycleV3Root, entry);
+      try {
+        const snapshot = restoreCraigLifecycleV3ProducerFromSnapshot(JSON.parse(readFileSync(filePath, 'utf8')) as unknown).durableSnapshot();
+        if (entry !== `${snapshot.recordingId}.json`) throw new Error('Lifecycle v3 durable snapshot filename does not match its recording');
+        for (const event of snapshot.pendingOutbox) {
+          if (!this.queue.some((item) => item.type === 'lifecycle' && item.event.eventId === event.eventId))
+            this.queue.push({ type: 'lifecycle', event });
+          if (event.type === 'meeting.started') this.openRecordings.add(event.recordingId);
+          if (event.type === 'meeting.ended' || event.type === 'meeting.aborted') {
+            this.openRecordings.delete(event.recordingId);
+            this.rememberClosedRecording(event.recordingId);
+          }
+        }
+      } catch (error) {
+        this.logger.error(`Rejecting invalid lifecycle v3 durable snapshot ${entry}`, error);
+        renameSync(filePath, path.join(this.rejectedLifecycleV3Root, entry));
+      }
+    }
+  }
+
+  private removeLifecycleV3Snapshot(recordingId: string): void {
+    if (this.pendingLifecycleV3Root === undefined) return;
+    try {
+      unlinkSync(path.join(this.pendingLifecycleV3Root, `${recordingId}.json`));
+      syncDirectorySync(this.pendingLifecycleV3Root);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+        this.logger.warn(`Failed to remove delivered lifecycle v3 snapshot for ${recordingId}: ${String(error)}`);
+    }
   }
 
   private enqueueOriginalJob(pending: PendingOriginalRecordingJob): void {
@@ -690,6 +893,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       pending.job = await this.prepareOriginalJob(pending);
       await this.deliverOriginalJob(pending.job);
       await unlink(pending.filePath);
+      this.removeLifecycleV3Snapshot(pending.job.recordingId);
       this.originalJobs.shift();
       this.consecutiveOriginalFailures = 0;
     } catch (error) {
@@ -731,7 +935,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     if (
       pending.job.authoritativeTimelineBasis === authoritativeTimelineBasis &&
       pending.job.authoritativeTracks !== undefined &&
-      pending.job.sourceFiles.every((source) => source.checksumSha256 !== undefined && source.sizeBytes !== undefined)
+      pending.job.sourceFiles.every((source) => source.checksumSha256 !== undefined && source.sizeBytes !== undefined) &&
+      (pending.job.lifecycleV3Snapshot === undefined || pending.job.lifecycleV3Snapshot.sealedReady !== null)
     )
       return pending.job;
 
@@ -749,7 +954,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       assertOriginalSourceIntegrity(source, digest);
       sourceFiles.push({ ...source, ...digest });
     }
-    const prepared: OriginalRecordingOutboxJob = {
+    let prepared: OriginalRecordingOutboxJob = {
       ...pending.job,
       sourceFiles,
       authoritativeTracks: users.tracks.map((track) => ({
@@ -758,13 +963,37 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       })),
       authoritativeTimelineBasis
     };
+    if (prepared.lifecycleV3Snapshot !== undefined) {
+      const lifecycle = restoreCraigLifecycleV3ProducerFromSnapshot(prepared.lifecycleV3Snapshot);
+      lifecycle.authoritativeReady(
+        {
+          eventId: `${prepared.recordingId}:authoritative-ready:v3`,
+          recordingId: prepared.recordingId,
+          guildId: prepared.guildId,
+          channelId: prepared.channelId,
+          occurredAt: prepared.terminalEvent.occurredAt
+        },
+        {
+          actors: prepared.authoritativeTracks!.map(({ speakerId }) => ({ id: speakerId })),
+          endedAt: prepared.terminalEvent.occurredAt,
+          trackCount: prepared.authoritativeTracks!.length,
+          sourceFilesChecksumSha256: sourceFilesChecksum(prepared.sourceFiles)
+        }
+      );
+      prepared = { ...prepared, lifecycleV3Snapshot: lifecycle.durableSnapshot() };
+    }
     await writeOriginalRecordingJob(pending.filePath, prepared);
     return prepared;
   }
 
   private async deliverOriginalJob(job: OriginalRecordingOutboxJob): Promise<void> {
-    await this.transport.post('/v1/craig/events', job.startedEvent);
-    await this.transport.post('/v1/craig/events', job.terminalEvent);
+    if (job.lifecycleV3Snapshot === undefined) {
+      await this.transport.post('/v1/craig/events', job.startedEvent);
+      await this.transport.post('/v1/craig/events', job.terminalEvent);
+    } else {
+      const durableEvents = restoreCraigLifecycleV3ProducerFromSnapshot(job.lifecycleV3Snapshot).durableSnapshot().pendingOutbox;
+      for (const event of durableEvents) if (event.type !== 'recording.authoritative_ready') await this.transport.post('/v1/craig/events', event);
+    }
     if (job.terminalEvent.type === 'meeting.aborted') return;
 
     if (job.authoritativeTracks === undefined) throw new PermanentOriginalRecordingError('Original recording track metadata was not prepared');
@@ -791,18 +1020,24 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       }
     }
 
-    await this.transport.postAuthoritativeReady!({
-      schemaVersion: 1,
-      eventId: `${job.recordingId}:authoritative-ready:v1`,
-      recordingId: job.recordingId,
-      guildId: job.guildId,
-      channelId: job.channelId,
-      occurredAt: job.terminalEvent.occurredAt,
-      type: 'recording.authoritative_ready',
-      endedAt: job.terminalEvent.occurredAt,
-      trackCount: job.authoritativeTracks.length,
-      sourceFilesChecksumSha256: sourceFilesChecksum(job.sourceFiles)
-    });
+    if (job.lifecycleV3Snapshot !== undefined) {
+      const ready = restoreCraigLifecycleV3ProducerFromSnapshot(job.lifecycleV3Snapshot).durableSnapshot().sealedReady;
+      if (ready === null || ready.type !== 'recording.authoritative_ready')
+        throw new PermanentOriginalRecordingError('Lifecycle v3 outbox was not sealed before authoritative publication');
+      await this.transport.postAuthoritativeReady!(ready);
+    } else
+      await this.transport.postAuthoritativeReady!({
+        schemaVersion: 1,
+        eventId: `${job.recordingId}:authoritative-ready:v1`,
+        recordingId: job.recordingId,
+        guildId: job.guildId,
+        channelId: job.channelId,
+        occurredAt: job.terminalEvent.occurredAt,
+        type: 'recording.authoritative_ready',
+        endedAt: job.terminalEvent.occurredAt,
+        trackCount: job.authoritativeTracks.length,
+        sourceFilesChecksumSha256: sourceFilesChecksum(job.sourceFiles)
+      });
   }
 
   private resolveSourceFile(source: OriginalRecordingSourceFileReference): string {
@@ -924,7 +1159,8 @@ export async function createMeetingIntegrationSink(
     config.maxQueuedPackets,
     config.batchSize,
     1024,
-    recordingRoot === undefined ? undefined : { recordingRoot }
+    recordingRoot === undefined ? undefined : { recordingRoot },
+    config.lifecycleProducer ?? { schemaVersion: 1 }
   );
   await sink.restoreOriginalRecordingJobs();
   return sink;
@@ -1075,7 +1311,7 @@ function parseTerminalLifecycleEvent(value: unknown): MeetingTerminalLifecycleEv
   };
 }
 
-function assertMatchingLifecycleIdentity(startedEvent: MeetingStartedLifecycleEvent, terminalEvent: MeetingTerminalLifecycleEvent): void {
+function assertMatchingLifecycleIdentity(startedEvent: AnyMeetingStartedLifecycleEvent, terminalEvent: AnyMeetingTerminalLifecycleEvent): void {
   if (
     terminalEvent.recordingId !== startedEvent.recordingId ||
     terminalEvent.guildId !== startedEvent.guildId ||
@@ -1092,6 +1328,37 @@ function isCanonicalInstant(value: string): boolean {
 }
 
 function createOriginalRecordingJob(input: OriginalRecordingPublicationInput, recordingRoot: string): OriginalRecordingOutboxJob {
+  if (input.lifecycleV3Snapshot !== undefined) {
+    const lifecycleV3Snapshot = restoreCraigLifecycleV3ProducerFromSnapshot(input.lifecycleV3Snapshot).durableSnapshot();
+    if (input.startedEvent.schemaVersion !== 3 || input.terminalEvent.schemaVersion !== 3)
+      throw new Error('Lifecycle v3 outbox cannot mix schema versions');
+    const startedEvent = lifecycleV3Snapshot.pendingOutbox.find(({ eventId }) => eventId === input.startedEvent.eventId);
+    const terminalEvent = lifecycleV3Snapshot.pendingOutbox.find(({ eventId }) => eventId === input.terminalEvent.eventId);
+    if (
+      startedEvent?.type !== 'meeting.started' ||
+      (terminalEvent?.type !== 'meeting.ended' && terminalEvent?.type !== 'meeting.aborted') ||
+      JSON.stringify(startedEvent) !== JSON.stringify(input.startedEvent) ||
+      JSON.stringify(terminalEvent) !== JSON.stringify(input.terminalEvent)
+    )
+      throw new Error('Lifecycle v3 outbox events do not match their durable snapshot');
+    assertMatchingLifecycleIdentity(startedEvent, terminalEvent);
+    const { recordingId, guildId, channelId } = startedEvent;
+    assertRecordingId(recordingId);
+    assertOriginalSourceFileBase(recordingId, recordingRoot, input.sourceFileBase);
+    return withOriginalAdmissionDigest({
+      schemaVersion: 3,
+      publicationId: `authoritative-recording:v3:${recordingId}`,
+      recordingId,
+      guildId,
+      channelId,
+      startedEvent,
+      terminalEvent,
+      lifecycleV3Snapshot,
+      sourceFiles: sourceFileKinds.map((kind) => ({ kind, relativePath: `${recordingId}.ogg.${kind}` }))
+    });
+  }
+  if (input.startedEvent.schemaVersion !== 1 || input.terminalEvent.schemaVersion !== 1)
+    throw new Error('Lifecycle v3 publication requires a durable lifecycle snapshot');
   const startedEvent = parseStartedLifecycleEvent(input.startedEvent);
   const terminalEvent = parseTerminalLifecycleEvent(input.terminalEvent);
   assertMatchingLifecycleIdentity(startedEvent, terminalEvent);
@@ -1100,7 +1367,7 @@ function createOriginalRecordingJob(input: OriginalRecordingPublicationInput, re
 
   assertOriginalSourceFileBase(recordingId, recordingRoot, input.sourceFileBase);
 
-  return {
+  return withOriginalAdmissionDigest({
     schemaVersion: 2,
     publicationId: `authoritative-recording:v1:${recordingId}`,
     recordingId,
@@ -1112,7 +1379,26 @@ function createOriginalRecordingJob(input: OriginalRecordingPublicationInput, re
       kind,
       relativePath: `${recordingId}.ogg.${kind}`
     }))
+  });
+}
+
+function withOriginalAdmissionDigest(job: OriginalRecordingOutboxJob): OriginalRecordingOutboxJob {
+  return {
+    ...job,
+    admissionDigestSha256: createHash('sha256').update(canonicalJson(job)).digest('hex')
   };
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object')
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(',')}}`;
+  const primitive = JSON.stringify(value);
+  if (primitive === undefined) throw new Error('Canonical JSON cannot contain undefined values');
+  return primitive;
 }
 
 function assertOriginalSourceFileBase(recordingId: string, recordingRoot: string, sourceFileBase: string): void {
@@ -1150,9 +1436,34 @@ async function syncDirectory(directoryPath: string): Promise<void> {
   }
 }
 
+function syncDirectorySync(directoryPath: string): void {
+  const descriptor = openSync(directoryPath, 'r');
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecordingOutboxJob> {
   const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
-  if (!isRecord(parsed) || parsed.schemaVersion !== 2) throw new Error('Original recording outbox job has an unsupported schema');
+  if (!isRecord(parsed) || (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3))
+    throw new Error('Original recording outbox job has an unsupported schema');
+  const allowedKeys = new Set([
+    'schemaVersion',
+    'publicationId',
+    'recordingId',
+    'guildId',
+    'channelId',
+    'startedEvent',
+    'terminalEvent',
+    'sourceFiles',
+    'authoritativeTracks',
+    'authoritativeTimelineBasis',
+    'lifecycleV3Snapshot',
+    'admissionDigestSha256'
+  ]);
+  if (Object.keys(parsed).some((key) => !allowedKeys.has(key))) throw new Error('Original recording outbox job contains unknown fields');
   const {
     publicationId,
     recordingId,
@@ -1162,8 +1473,10 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     terminalEvent: rawTerminalEvent,
     sourceFiles,
     authoritativeTracks: rawAuthoritativeTracks,
-    authoritativeTimelineBasis: rawAuthoritativeTimelineBasis
+    authoritativeTimelineBasis: rawAuthoritativeTimelineBasis,
+    lifecycleV3Snapshot: rawLifecycleV3Snapshot
   } = parsed;
+  const admissionDigestSha256 = parsed.admissionDigestSha256;
   if (
     typeof publicationId !== 'string' ||
     typeof recordingId !== 'string' ||
@@ -1172,11 +1485,40 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     !Array.isArray(sourceFiles)
   )
     throw new Error('Original recording outbox job is malformed');
+  if (admissionDigestSha256 !== undefined && (typeof admissionDigestSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(admissionDigestSha256)))
+    throw new Error('Original recording outbox admission digest is invalid');
   assertRecordingId(recordingId);
-  if (publicationId !== `authoritative-recording:v1:${recordingId}` || !/^\d{16,22}$/.test(guildId) || !/^\d{16,22}$/.test(channelId))
+  const expectedPublicationId = `authoritative-recording:v${parsed.schemaVersion === 3 ? 3 : 1}:${recordingId}`;
+  if (publicationId !== expectedPublicationId || !/^\d{16,22}$/.test(guildId) || !/^\d{16,22}$/.test(channelId))
     throw new Error('Original recording outbox job identity is invalid');
-  const startedEvent = parseStartedLifecycleEvent(rawStartedEvent);
-  const terminalEvent = parseTerminalLifecycleEvent(rawTerminalEvent);
+  let startedEvent: AnyMeetingStartedLifecycleEvent;
+  let terminalEvent: AnyMeetingTerminalLifecycleEvent;
+  let lifecycleV3Snapshot: DurableCraigLifecycleV3Snapshot | undefined;
+  if (parsed.schemaVersion === 3) {
+    lifecycleV3Snapshot = restoreCraigLifecycleV3ProducerFromSnapshot(rawLifecycleV3Snapshot).durableSnapshot();
+    const snapshotStarted = lifecycleV3Snapshot.pendingOutbox.find(
+      (event) => event.type === 'meeting.started' && isRecord(rawStartedEvent) && event.eventId === rawStartedEvent.eventId
+    );
+    const snapshotTerminal = lifecycleV3Snapshot.pendingOutbox.find(
+      (event) =>
+        (event.type === 'meeting.ended' || event.type === 'meeting.aborted') &&
+        isRecord(rawTerminalEvent) &&
+        event.eventId === rawTerminalEvent.eventId
+    );
+    if (
+      snapshotStarted?.type !== 'meeting.started' ||
+      (snapshotTerminal?.type !== 'meeting.ended' && snapshotTerminal?.type !== 'meeting.aborted') ||
+      JSON.stringify(snapshotStarted) !== JSON.stringify(rawStartedEvent) ||
+      JSON.stringify(snapshotTerminal) !== JSON.stringify(rawTerminalEvent)
+    )
+      throw new Error('Original recording lifecycle v3 events do not match their durable snapshot');
+    startedEvent = snapshotStarted;
+    terminalEvent = snapshotTerminal;
+  } else {
+    if (rawLifecycleV3Snapshot !== undefined) throw new Error('Legacy outbox job cannot claim lifecycle v3 state');
+    startedEvent = parseStartedLifecycleEvent(rawStartedEvent);
+    terminalEvent = parseTerminalLifecycleEvent(rawTerminalEvent);
+  }
   assertMatchingLifecycleIdentity(startedEvent, terminalEvent);
   if (startedEvent.recordingId !== recordingId || startedEvent.guildId !== guildId || startedEvent.channelId !== channelId)
     throw new Error('Original recording outbox lifecycle identity does not match its job');
@@ -1212,15 +1554,29 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
     (authoritativeTracks === undefined || new Set(authoritativeTracks.map(({ timelineOffsetMs }) => timelineOffsetMs)).size !== 1)
   )
     throw new Error('Original recording outbox shared timeline metadata is invalid');
+  if (lifecycleV3Snapshot?.sealedReady !== null && lifecycleV3Snapshot?.sealedReady !== undefined) {
+    const ready = lifecycleV3Snapshot.sealedReady;
+    if (
+      ready.type !== 'recording.authoritative_ready' ||
+      authoritativeTracks === undefined ||
+      ready.trackCount !== authoritativeTracks.length ||
+      ready.endedAt !== terminalEvent.occurredAt ||
+      ready.occurredAt !== terminalEvent.occurredAt ||
+      ready.sourceFilesChecksumSha256 !== sourceFilesChecksum(normalizedSources)
+    )
+      throw new Error('Original recording lifecycle v3 seal does not match prepared outbox evidence');
+  }
 
   return {
-    schemaVersion: 2,
+    schemaVersion: parsed.schemaVersion,
     publicationId,
     recordingId,
     guildId,
     channelId,
     startedEvent,
     terminalEvent,
+    ...(lifecycleV3Snapshot === undefined ? {} : { lifecycleV3Snapshot }),
+    ...(admissionDigestSha256 === undefined ? {} : { admissionDigestSha256 }),
     sourceFiles: normalizedSources.sort((left, right) => sourceFileKinds.indexOf(left.kind) - sourceFileKinds.indexOf(right.kind)),
     ...(authoritativeTracks === undefined ? {} : { authoritativeTracks }),
     ...(rawAuthoritativeTimelineBasis === undefined ? {} : { authoritativeTimelineBasis })

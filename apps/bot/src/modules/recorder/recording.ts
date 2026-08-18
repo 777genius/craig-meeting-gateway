@@ -26,6 +26,9 @@ import { CraigPlaybackArbiter } from './conversationPlayback';
 import { ConversationPlaybackReconnect } from './conversationPlaybackReconnect';
 import { CraigConversationPlaybackSession, createConversationPlaybackSession } from './conversationPlaybackSession';
 import {
+  type AnyMeetingStartedLifecycleEvent,
+  type AnyMeetingTerminalLifecycleEvent,
+  type LegacyMeetingLifecycleEvent,
   type MeetingLifecycleEvent,
   type MeetingLifecyclePublishOutcome,
   type MeetingStartedLifecycleEvent,
@@ -33,6 +36,13 @@ import {
   MeetingTerminalLifecycle,
   reportMeetingLifecyclePublishOutcome
 } from './meetingIntegration';
+import {
+  type AuthenticatedDiscordActor,
+  type CraigLifecycleV3Producer,
+  type DurableCraigLifecycleV3Snapshot,
+  createCraigLifecycleV3Producer,
+  restoreCraigLifecycleV3ProducerFromSnapshot
+} from './meetingLifecycleV3';
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
 import { WebappClient } from './webapp';
@@ -45,6 +55,21 @@ const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 const recNanoid = customAlphabet(alphabet, 12);
 const recIndicator = / *!?\[RECORDING\] */;
 const opusSilenceFrame = Buffer.from([0xf8, 0xff, 0xfe]);
+
+function authenticatedDiscordActor(value: {
+  id: string;
+  bot?: boolean;
+  system?: boolean;
+  webhookID?: string | null;
+  user?: { bot?: boolean; system?: boolean };
+}): AuthenticatedDiscordActor {
+  return {
+    id: value.id,
+    bot: value.bot === true || value.user?.bot === true,
+    system: value.system === true || value.user?.system === true,
+    webhook: typeof value.webhookID === 'string' && value.webhookID.length > 0
+  };
+}
 
 export const NOTE_TRACK_NUMBER = 65536;
 const USER_HARD_LIMIT = 10000;
@@ -163,7 +188,9 @@ export default class Recording {
   private stopPromise: Promise<void> | null = null;
   private connectionLossOpen = false;
   private readonly terminalMeetingLifecycle = new MeetingTerminalLifecycle();
-  private meetingStartedLifecycle?: MeetingStartedLifecycleEvent;
+  private meetingStartedLifecycle?: AnyMeetingStartedLifecycleEvent;
+  private lifecycleV3?: CraigLifecycleV3Producer;
+  private lifecycleV3Checkpoint?: DurableCraigLifecycleV3Snapshot;
 
   constructor(recorder: RecorderModule<DexareClient<CraigBotConfig>>, channel: Eris.StageChannel | Eris.VoiceChannel, user: Eris.User, auto = false) {
     this.recorder = recorder;
@@ -277,7 +304,14 @@ export default class Recording {
     this.writeToLog(`Connected to channel ${this.connection?.channelID} at ${this.connection?.endpoint}`);
 
     const participantIds = this.meetingParticipants.begin(this.channel.voiceMembers.keys(), this.recorder.client.bot.user.id);
-    const startedEvent = this.createMeetingLifecycleEvent('meeting.started', { participantIds }) as MeetingStartedLifecycleEvent;
+    const lifecycleConfiguration = this.recorder.meetingIntegration.lifecycleProducerConfiguration;
+    if (lifecycleConfiguration.schemaVersion === 3)
+      this.lifecycleV3 = createCraigLifecycleV3Producer(lifecycleConfiguration, {
+        recordingId: this.id,
+        guildId: this.channel.guild.id,
+        channelId: this.channel.id
+      });
+    const startedEvent = this.createMeetingStartedLifecycleEvent(participantIds);
     const startedOutcome = this.publishMeetingLifecycleEvent(startedEvent);
     if (this.terminalMeetingLifecycle.acceptStart(startedOutcome)) {
       this.meetingStartedLifecycle = startedEvent;
@@ -374,16 +408,17 @@ export default class Recording {
       // Close the output files and connection
       this.closing = true;
       this.webapp?.close(WebappOpCloseReason.RECORDING_ENDED);
-      let persistedTerminalEvent: MeetingTerminalLifecycleEvent | undefined;
+      let persistedTerminalEvent: AnyMeetingTerminalLifecycleEvent | undefined;
       await this.terminalMeetingLifecycle.complete(
         internal ? 'meeting.aborted' : 'meeting.ended',
         async () => {
           await wait(200);
           const writer = this.writer;
           await writer?.end();
-          persistedTerminalEvent = this.createMeetingLifecycleEvent(internal ? 'meeting.aborted' : 'meeting.ended', {
-            reason: this.stateDescription ?? null
-          }) as MeetingTerminalLifecycleEvent;
+          persistedTerminalEvent = this.createMeetingTerminalLifecycleEvent(
+            internal ? 'meeting.aborted' : 'meeting.ended',
+            this.stateDescription ?? null
+          );
           if (writer) {
             const startedEvent = this.meetingStartedLifecycle;
             const persisted =
@@ -393,7 +428,8 @@ export default class Recording {
                     .publishOriginalRecording({
                       startedEvent,
                       terminalEvent: persistedTerminalEvent,
-                      sourceFileBase: writer.fileBase
+                      sourceFileBase: writer.fileBase,
+                      ...(this.lifecycleV3 === undefined ? {} : { lifecycleV3Snapshot: this.lifecycleV3.durableSnapshot() })
                     })
                     .catch((error) => {
                       this.recorder.logger.error(
@@ -412,9 +448,7 @@ export default class Recording {
           const terminalEvent =
             persistedTerminalEvent?.type === type
               ? persistedTerminalEvent
-              : (this.createMeetingLifecycleEvent(type, {
-                  reason: this.stateDescription ?? 'Craig recording finalization failed.'
-                }) as MeetingTerminalLifecycleEvent);
+              : this.createMeetingTerminalLifecycleEvent(type, this.stateDescription ?? 'Craig recording finalization failed.');
           this.publishMeetingLifecycleEvent(terminalEvent);
         }
       );
@@ -718,7 +752,7 @@ export default class Recording {
     const transition = this.meetingParticipants.observe(member.id, isPresent);
     if (transition === null) return;
 
-    const event = this.createMeetingLifecycleEvent(transition, { participantId: member.id });
+    const event = this.createMeetingParticipantLifecycleEvent(transition, authenticatedDiscordActor(member));
     const outcome = this.publishMeetingLifecycleEvent(event);
     if (outcome.status !== 'accepted') this.meetingParticipants.observe(member.id, !isPresent);
   }
@@ -1049,46 +1083,103 @@ export default class Recording {
   }
 
   private publishMeetingLifecycle(
-    type: MeetingLifecycleEvent['type'],
-    details: Pick<MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+    type: 'meeting.ended' | 'meeting.aborted',
+    details: Pick<LegacyMeetingLifecycleEvent, 'reason'>
   ): MeetingLifecycleEvent {
-    const event = this.createMeetingLifecycleEvent(type, details);
+    const event = this.createMeetingTerminalLifecycleEvent(type, details.reason ?? null);
     this.publishMeetingLifecycleEvent(event);
     return event;
   }
 
-  private createMeetingLifecycleEvent(
-    type: MeetingLifecycleEvent['type'],
-    details: Pick<MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+  private createMeetingStartedLifecycleEvent(participantIds: string[]): AnyMeetingStartedLifecycleEvent {
+    if (this.lifecycleV3 === undefined)
+      return this.createMeetingLifecycleEvent('meeting.started', { participantIds }) as MeetingStartedLifecycleEvent;
+    const actors = participantIds.map((participantId) => {
+      const member = this.channel.voiceMembers.get(participantId);
+      return member === undefined ? { id: participantId } : authenticatedDiscordActor(member);
+    });
+    return this.createLifecycleV3Event(() => this.lifecycleV3!.started(this.createMeetingLifecycleEnvelope(), actors));
+  }
+
+  private createMeetingParticipantLifecycleEvent(
+    type: 'participant.joined' | 'participant.left',
+    actor: AuthenticatedDiscordActor
   ): MeetingLifecycleEvent {
+    if (this.lifecycleV3 === undefined) return this.createMeetingLifecycleEvent(type, { participantId: actor.id });
+    return this.createLifecycleV3Event(() => this.lifecycleV3!.participant(this.createMeetingLifecycleEnvelope(), type, actor));
+  }
+
+  private createMeetingTerminalLifecycleEvent(type: 'meeting.ended' | 'meeting.aborted', reason: string | null): AnyMeetingTerminalLifecycleEvent {
+    if (this.lifecycleV3 === undefined) return this.createMeetingLifecycleEvent(type, { reason }) as MeetingTerminalLifecycleEvent;
+    return this.createLifecycleV3Event(() => this.lifecycleV3!.terminal(this.createMeetingLifecycleEnvelope(), type, reason));
+  }
+
+  private createMeetingLifecycleEnvelope() {
     return {
-      schemaVersion: 1,
       eventId: `${this.id}:${++this.lifecycleSequence}`,
       recordingId: this.id,
       guildId: this.channel.guild.id,
       channelId: this.channel.id,
-      occurredAt: new Date().toISOString(),
+      occurredAt: new Date().toISOString()
+    };
+  }
+
+  private createMeetingLifecycleEvent(
+    type: LegacyMeetingLifecycleEvent['type'],
+    details: Pick<LegacyMeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+  ): LegacyMeetingLifecycleEvent {
+    return {
+      schemaVersion: 1,
+      ...this.createMeetingLifecycleEnvelope(),
       type,
       ...details
     };
   }
 
   private publishMeetingLifecycleEvent(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome {
-    const outcome = this.recorder.meetingIntegration.publishLifecycle(event);
+    const outcome = this.recorder.meetingIntegration.publishLifecycle(
+      event,
+      this.lifecycleV3 === undefined ? undefined : this.lifecycleV3.durableSnapshot()
+    );
+    if (event.schemaVersion === 3) {
+      if (outcome.status !== 'accepted' && this.lifecycleV3Checkpoint !== undefined)
+        this.lifecycleV3 = restoreCraigLifecycleV3ProducerFromSnapshot(this.lifecycleV3Checkpoint);
+      this.lifecycleV3Checkpoint = undefined;
+    }
     reportMeetingLifecyclePublishOutcome(this.recorder.logger, this.id, event.type, outcome);
     return outcome;
   }
 
+  private createLifecycleV3Event<T extends MeetingLifecycleEvent>(create: () => T): T {
+    const checkpoint = this.lifecycleV3!.durableSnapshot();
+    this.lifecycleV3Checkpoint = checkpoint;
+    try {
+      return create();
+    } catch (error) {
+      this.lifecycleV3 = restoreCraigLifecycleV3ProducerFromSnapshot(checkpoint);
+      this.lifecycleV3Checkpoint = undefined;
+      throw error;
+    }
+  }
+
   private markConnectionLost(reason: string) {
     if (this.connectionLossOpen) return;
-    const event = this.createMeetingLifecycleEvent('meeting.connection_lost', { reason });
+    const event =
+      this.lifecycleV3 === undefined
+        ? this.createMeetingLifecycleEvent('meeting.connection_lost', { reason })
+        : this.createLifecycleV3Event(() => this.lifecycleV3!.connection(this.createMeetingLifecycleEnvelope(), 'meeting.connection_lost', reason));
     const outcome = this.publishMeetingLifecycleEvent(event);
     if (outcome.status === 'accepted') this.connectionLossOpen = true;
   }
 
   private markConnectionRecovered() {
     if (!this.connectionLossOpen) return;
-    const event = this.createMeetingLifecycleEvent('meeting.connection_recovered', { reason: null });
+    const event =
+      this.lifecycleV3 === undefined
+        ? this.createMeetingLifecycleEvent('meeting.connection_recovered', { reason: null })
+        : this.createLifecycleV3Event(() =>
+            this.lifecycleV3!.connection(this.createMeetingLifecycleEnvelope(), 'meeting.connection_recovered', null)
+          );
     const outcome = this.publishMeetingLifecycleEvent(event);
     if (outcome.status === 'accepted') this.connectionLossOpen = false;
   }
