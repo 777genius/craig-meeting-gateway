@@ -138,6 +138,7 @@ type LifecycleV3JournalState = {
 };
 
 const lifecycleV3MaintenanceRecordsPerStep = 8;
+const cancellationProofSelectionBudget = 8;
 type LifecycleV3MaintenanceState = {
   schemaVersion: 1;
   phase: 'capture-base' | 'capture-deltas' | 'publish' | 'cleanup-deltas' | 'cleanup-generations';
@@ -215,6 +216,12 @@ interface OriginalRecordingOutboxJob {
 interface PendingOriginalRecordingJob {
   filePath: string;
   job: OriginalRecordingOutboxJob;
+}
+
+interface PendingCancellationProofJob {
+  filePath: string;
+  consecutiveFailures: number;
+  notBeforeMs: number;
 }
 
 export interface AuthoritativeTrackMetadata {
@@ -504,6 +511,12 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private retryTimer: NodeJS.Timeout | null = null;
   private processingOriginal = false;
   private originalRetryTimer: NodeJS.Timeout | null = null;
+  private lifecycleV3MaintenanceTimer: NodeJS.Timeout | null = null;
+  private lifecycleV3MaintenanceFailures = 0;
+  private processingCancellationProof = false;
+  private cancellationProofRetryTimer: NodeJS.Timeout | null = null;
+  private readonly cancellationProofJobs: PendingCancellationProofJob[] = [];
+  private readonly cancellationProofPaths = new Set<string>();
   private queuedPackets = 0;
   private consecutiveFailures = 0;
   private consecutiveOriginalFailures = 0;
@@ -715,8 +728,19 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     if (this.pendingOriginalRoot === undefined || this.rejectedOriginalRoot === undefined) return;
     try {
       await this.ensureOriginalOutboxDirectories();
-      await this.replayCancellationProofs();
+    } catch (error) {
+      this.logger.error('Failed to initialize Meeting original recording outbox directories; original Craig files remain untouched', error);
+      return;
+    }
+    try {
+      this.restoreCancellationProofJobs();
+      this.scheduleCancellationProofProcessing();
+    } catch (error) {
+      this.logger.error('Failed to scan cancellation PCM proof outbox; proof evidence remains untouched', error);
+    }
+    try {
       this.restoreLifecycleV3Admissions();
+      this.scheduleLifecycleV3Maintenance();
       const entries = (await readdir(this.pendingOriginalRoot)).filter((entry) => entry.endsWith('.json')).sort();
       for (const entry of entries) {
         const filePath = path.join(this.pendingOriginalRoot, entry);
@@ -743,17 +767,82 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     const root = path.join(this.pendingOriginalRoot, 'cancellation-pcm-fence');
     mkdirSync(root, { recursive: true, mode: 0o700 });
     for (const entry of readdirSync(root).filter((name) => name.endsWith('.json')).sort()) {
-      const proofPath = path.join(root, entry);
-      const proof = JSON.parse(readFileSync(proofPath, 'utf8')) as CraigAuthoritativeCancellationPcmFenceLog;
-      // Rebuild through the strict adapter so corrupted manifests fail closed.
-      const normalized = createAuthoritativeCancellationPcmFenceLog(proof);
-      const manifestPath = path.join(this.pendingOriginalRoot, 'cancellation-pcm-fence-manifests', entry);
-      const manifest = readCancellationProofManifest(manifestPath, normalized);
-      const receipt = await this.transport.postCancellationPcmFence(normalized);
-      assertCancellationProofReceipt(receipt, normalized, manifest.uploadAcknowledgement);
-      unlinkSync(proofPath);
-      syncDirectorySync(root);
+      await this.deliverCancellationProof(path.join(root, entry));
     }
+  }
+
+  private restoreCancellationProofJobs(): void {
+    if (this.pendingOriginalRoot === undefined || this.transport.postCancellationPcmFence === undefined) return;
+    const root = path.join(this.pendingOriginalRoot, 'cancellation-pcm-fence');
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    for (const entry of readdirSync(root).filter((name) => name.endsWith('.json')).sort())
+      this.enqueueCancellationProof(path.join(root, entry));
+  }
+
+  private enqueueCancellationProof(filePath: string): void {
+    if (this.cancellationProofPaths.has(filePath)) return;
+    this.cancellationProofPaths.add(filePath);
+    this.cancellationProofJobs.push({ filePath, consecutiveFailures: 0, notBeforeMs: 0 });
+  }
+
+  private scheduleCancellationProofProcessing(delayMs = 0): void {
+    if (this.processingCancellationProof || this.cancellationProofRetryTimer || this.cancellationProofJobs.length === 0 ||
+        this.transport.postCancellationPcmFence === undefined) return;
+    this.cancellationProofRetryTimer = setTimeout(() => {
+      this.cancellationProofRetryTimer = null;
+      void this.processCancellationProof();
+    }, delayMs);
+  }
+
+  private async processCancellationProof(): Promise<void> {
+    if (this.processingCancellationProof || this.cancellationProofJobs.length === 0) return;
+    const now = Date.now();
+    let pending: PendingCancellationProofJob | undefined;
+    let nextDelayMs = Number.POSITIVE_INFINITY;
+    const selectionCount = Math.min(cancellationProofSelectionBudget, this.cancellationProofJobs.length);
+    for (let index = 0; index < selectionCount; index++) {
+      const candidate = this.cancellationProofJobs.shift()!;
+      if (pending === undefined && candidate.notBeforeMs <= now) pending = candidate;
+      else {
+        nextDelayMs = Math.min(nextDelayMs, Math.max(0, candidate.notBeforeMs - now));
+        this.cancellationProofJobs.push(candidate);
+      }
+    }
+    if (pending === undefined) {
+      this.scheduleCancellationProofProcessing(Number.isFinite(nextDelayMs) ? nextDelayMs : retryDelay(1));
+      return;
+    }
+    this.processingCancellationProof = true;
+    try {
+      await this.deliverCancellationProof(pending.filePath);
+      this.cancellationProofPaths.delete(pending.filePath);
+    } catch (error) {
+      if (isRetryableDeliveryError(error)) {
+        pending.consecutiveFailures++;
+        const delayMs = retryDelay(pending.consecutiveFailures);
+        pending.notBeforeMs = Date.now() + delayMs;
+        this.cancellationProofJobs.push(pending);
+        this.logger.error(`Cancellation PCM proof delivery failed; retrying in ${delayMs}ms`, error);
+      } else {
+        this.cancellationProofPaths.delete(pending.filePath);
+        this.logger.error('Cancellation PCM proof was permanently rejected; retaining durable proof for operator recovery', error);
+      }
+    }
+    this.processingCancellationProof = false;
+    this.scheduleCancellationProofProcessing();
+    this.notifyIfDrained();
+  }
+
+  private async deliverCancellationProof(proofPath: string): Promise<void> {
+    if (this.pendingOriginalRoot === undefined || this.transport.postCancellationPcmFence === undefined) return;
+    const proof = JSON.parse(readFileSync(proofPath, 'utf8')) as CraigAuthoritativeCancellationPcmFenceLog;
+    const normalized = createAuthoritativeCancellationPcmFenceLog(proof);
+    const manifestPath = path.join(this.pendingOriginalRoot, 'cancellation-pcm-fence-manifests', path.basename(proofPath));
+    const manifest = readCancellationProofManifest(manifestPath, normalized);
+    const receipt = await this.transport.postCancellationPcmFence(normalized);
+    assertCancellationProofReceipt(receipt, normalized, manifest.uploadAcknowledgement);
+    unlinkSync(proofPath);
+    syncDirectorySync(path.dirname(proofPath));
   }
 
   async drain(timeoutMs: number): Promise<boolean> {
@@ -895,8 +984,11 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     const oldManifest = this.tryReadLifecycleV3Manifest(root);
     const current = { generation, file, checksumSha256, coveredDeltaCursor };
     const previous = oldManifest?.current && oldManifest.current.generation !== generation ? oldManifest.current : oldManifest?.previous ?? null;
-    if (oldManifest !== undefined) this.writeDurableJson(path.join(root, 'manifest.previous.json'), oldManifest);
-    this.writeDurableJson(manifestPath, { schemaVersion: 1, current, previous });
+    const nextManifest: LifecycleV3Manifest = { schemaVersion: 1, current, previous };
+    // Initial generation also receives an independently fsynced valid fallback
+    // before current publication, so a torn first manifest remains recoverable.
+    this.writeDurableJson(path.join(root, 'manifest.previous.json'), oldManifest ?? nextManifest);
+    this.writeDurableJson(manifestPath, nextManifest);
 
     const keep = new Set([current.file, previous?.file].filter((name): name is string => name !== undefined));
     for (const entry of readdirSync(root))
@@ -1376,6 +1468,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     if (sequence >= 128 && sequence % 128 === 0) {
       indexed.maintenanceNeeded = true;
       this.lifecycleV3MaintenanceQueue.add(event.recordingId);
+      this.scheduleLifecycleV3Maintenance();
     }
   }
 
@@ -1390,8 +1483,27 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     const journal = this.lifecycleV3JournalIndex.get(recordingId);
     if (journal === undefined) { this.lifecycleV3MaintenanceQueue.delete(recordingId); return this.lifecycleV3MaintenanceQueue.size > 0; }
     const again = this.runLifecycleV3MaintenanceJournalStep(recordingId, journal);
-    if (!again) this.lifecycleV3MaintenanceQueue.delete(recordingId);
+    this.lifecycleV3MaintenanceQueue.delete(recordingId);
+    if (again) this.lifecycleV3MaintenanceQueue.add(recordingId);
     return this.lifecycleV3MaintenanceQueue.size > 0;
+  }
+
+  private scheduleLifecycleV3Maintenance(delayMs = 0): void {
+    if (this.lifecycleV3MaintenanceTimer || this.lifecycleV3MaintenanceQueue.size === 0) return;
+    this.lifecycleV3MaintenanceTimer = setTimeout(() => {
+      this.lifecycleV3MaintenanceTimer = null;
+      try {
+        const more = this.runLifecycleV3MaintenanceStep();
+        this.lifecycleV3MaintenanceFailures = 0;
+        if (more) this.scheduleLifecycleV3Maintenance();
+      } catch (error) {
+        this.lifecycleV3MaintenanceFailures++;
+        const retryMs = retryDelay(this.lifecycleV3MaintenanceFailures);
+        this.logger.error(`Lifecycle v3 maintenance failed; retrying in ${retryMs}ms`, error);
+        this.scheduleLifecycleV3Maintenance(retryMs);
+      }
+      this.notifyIfDrained();
+    }, delayMs);
   }
 
   private enqueueOriginalJob(pending: PendingOriginalRecordingJob): void {
@@ -1721,7 +1833,10 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       const manifest = {
         schemaVersion: 1,
         uploadAcknowledgement,
+        uploadId: `authoritative-track:v1:${job.recordingId}:${track.trackNumber}`,
         recordingId: job.recordingId,
+        guildId: job.guildId,
+        channelId: job.channelId,
         speakerId: track.speakerId,
         trackNumber: track.trackNumber,
         trackSha256: uploadAcknowledgement.checksumSha256,
@@ -1736,10 +1851,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
         const persisted = JSON.parse(readFileSync(proofPath, 'utf8'));
         if (canonicalJson(persisted) !== canonicalJson(proof)) throw new Error('Conflicting durable cancellation PCM proof');
       } else this.writeDurableJson(proofPath, proof);
-      const receipt = await this.transport.postCancellationPcmFence(proof);
-      assertCancellationProofReceipt(receipt, proof, uploadAcknowledgement);
-      unlinkSync(proofPath);
-      syncDirectorySync(proofRoot);
+      this.enqueueCancellationProof(proofPath);
+      this.scheduleCancellationProofProcessing();
     }
   }
 
@@ -1758,7 +1871,9 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   }
 
   private isDrained(): boolean {
-    return this.queueLength() === 0 && !this.processing && this.originalJobs.length === 0 && !this.processingOriginal;
+    return this.queueLength() === 0 && !this.processing && this.originalJobs.length === 0 && !this.processingOriginal &&
+      this.lifecycleV3MaintenanceQueue.size === 0 && this.lifecycleV3MaintenanceTimer === null &&
+      this.cancellationProofJobs.length === 0 && !this.processingCancellationProof && this.cancellationProofRetryTimer === null;
   }
 
   private notifyIfDrained(): void {
@@ -1909,13 +2024,25 @@ function readCancellationProofManifest(
 ): { uploadAcknowledgement: DurableAuthoritativeTrackUploadAcknowledgement } {
   if (!existsSync(manifestPath)) throw new Error('Cancellation PCM proof manifest is missing');
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
-  if (canonicalJson(manifest.proof) !== canonicalJson(proof) || !isRecord(manifest.uploadAcknowledgement))
+  if (Object.keys(manifest).sort().join(',') !==
+      'channelId,guildId,proof,recordingId,schemaVersion,speakerId,trackNumber,trackSha256,trackSizeBytes,uploadAcknowledgement,uploadId' ||
+      manifest.schemaVersion !== 1 || manifest.recordingId !== proof.recordingId ||
+      typeof manifest.guildId !== 'string' || !discordSnowflake.test(manifest.guildId) ||
+      typeof manifest.channelId !== 'string' || !discordSnowflake.test(manifest.channelId) ||
+      typeof manifest.speakerId !== 'string' || !discordSnowflake.test(manifest.speakerId) ||
+      !Number.isSafeInteger(manifest.trackNumber) || Number(manifest.trackNumber) < 1 ||
+      manifest.trackSha256 !== proof.trackSha256 || typeof manifest.trackSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(manifest.trackSha256) ||
+      !Number.isSafeInteger(manifest.trackSizeBytes) || Number(manifest.trackSizeBytes) < 1 ||
+      manifest.uploadId !== `authoritative-track:v1:${proof.recordingId}:${String(manifest.trackNumber)}` ||
+      canonicalJson(manifest.proof) !== canonicalJson(proof) || !isRecord(manifest.uploadAcknowledgement))
     throw new Error('Cancellation PCM proof manifest is corrupt or mismatched');
   const upload = manifest.uploadAcknowledgement as unknown as DurableAuthoritativeTrackUploadAcknowledgement;
   parseDurableTrackUploadAcknowledgement(upload, {
-    schemaVersion: 1, uploadId: upload.uploadId, recordingId: proof.recordingId, trackNumber: upload.trackNumber,
-    guildId: String(manifest.guildId ?? 'manifest-validation'), channelId: String(manifest.channelId ?? 'manifest-validation'),
-    speakerId: String(manifest.speakerId), timelineOffsetMs: 0, checksumSha256: proof.trackSha256, sizeBytes: Number(manifest.trackSizeBytes)
+    schemaVersion: 1, uploadId: String(manifest.uploadId), recordingId: proof.recordingId,
+    trackNumber: Number(manifest.trackNumber), guildId: manifest.guildId, channelId: manifest.channelId,
+    speakerId: manifest.speakerId, timelineOffsetMs: 0, checksumSha256: manifest.trackSha256,
+    sizeBytes: Number(manifest.trackSizeBytes)
   });
   return { uploadAcknowledgement: upload };
 }

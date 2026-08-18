@@ -1485,13 +1485,17 @@ test('hard-crash recovery replays exact durable v3 identities and never fabricat
   assert.deepEqual(replayed, [started, joined]);
   assert.deepEqual(
     await readdir(path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`)),
-    ['00000000.event.json', '00000001.event.json', 'cursor.json', 'manifest.json', 'snapshot-00000000.json'],
+    ['00000000.event.json', '00000001.event.json', 'cursor.json', 'manifest.json', 'manifest.previous.json', 'snapshot-00000000.json'],
     'the fsynced ack cursor pins its exact segment while compacting older acknowledged events'
   );
   const manifest = JSON.parse(
     await readFile(path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`, 'manifest.json'), 'utf8')
   );
   assert.equal(manifest.current.generation, 0);
+  const initialFallback = JSON.parse(
+    await readFile(path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`, 'manifest.previous.json'), 'utf8')
+  );
+  assert.deepEqual(initialFallback, manifest, 'initial current publication has an independently fsynced valid fallback');
   const cursorPath = path.join(outboxRoot, 'lifecycle-v3', 'pending', `${event.recordingId}.journal`, 'cursor.json');
   const compactedCursor = JSON.parse(await readFile(cursorPath, 'utf8'));
   assert.equal(compactedCursor.ackedSequence, 1);
@@ -1787,6 +1791,11 @@ test('production original upload durably manifests and emits the exact trusted c
   const manifestRoot = path.join(outboxRoot, 'pending', 'cancellation-pcm-fence-manifests');
   const [manifestName] = await readdir(manifestRoot);
   const manifest = JSON.parse(await readFile(path.join(manifestRoot, manifestName), 'utf8'));
+  assert.equal(manifest.schemaVersion, 1);
+  assert.equal(manifest.uploadId, `authoritative-track:v1:${event.recordingId}:1`);
+  assert.equal(manifest.recordingId, event.recordingId);
+  assert.equal(manifest.speakerId, botId);
+  assert.equal(manifest.trackNumber, 1);
   assert.equal(manifest.trackSha256, checksumSha256);
   assert.equal(manifest.trackSizeBytes, cookedBytes.length);
   assert.deepEqual(manifest.proof, proofs[0]);
@@ -1826,8 +1835,75 @@ test('production original upload durably manifests and emits the exact trusted c
     logger, 4, 2, 1024, { recordingRoot, outboxRoot }
   );
   await replay.restoreOriginalRecordingJobs();
+  assert.equal(await replay.drain(2000), true);
   assert.deepEqual(replayedProofs, proofs);
   assert.deepEqual(await readdir(proofRoot), [], 'proof outbox is acknowledged only after successful crash replay');
+});
+
+test('cancellation proof retry is autonomous and does not block original outbox scanning', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-proof-retry-worker-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const recordingRoot = path.join(root, 'recordings');
+  const outboxRoot = path.join(root, 'outbox');
+  const pendingRoot = path.join(outboxRoot, 'pending');
+  const proofRoot = path.join(pendingRoot, 'cancellation-pcm-fence');
+  const manifestRoot = path.join(pendingRoot, 'cancellation-pcm-fence-manifests');
+  await Promise.all([mkdir(recordingRoot, { recursive: true }), mkdir(proofRoot, { recursive: true }), mkdir(manifestRoot, { recursive: true })]);
+  const recordingId = 'proof-retry-recording';
+  const speakerId = '1533228054724346087';
+  const trackSha256 = 'a'.repeat(64);
+  const proof = {
+    acceptedPacketCountAfterCancellation: 0, attemptedPacketCountAfterCancellation: 1,
+    attemptId: 'attempt-1', cancellationObservedAt: '2026-08-18T00:00:03.000Z',
+    fenceObservedAt: '2026-08-18T00:00:03.000Z', meetingId: 'meeting-1',
+    message: 'Craig authoritative cancellation PCM fence observed' as const, recordingId,
+    source: 'craig-authoritative-playback-track' as const, trackSha256, turnId: 'turn-1'
+  };
+  const metadata = {
+    schemaVersion: 1 as const, uploadId: `authoritative-track:v1:${recordingId}:1`, recordingId,
+    guildId: event.guildId, channelId: event.channelId, speakerId, trackNumber: 1,
+    timelineOffsetMs: 0, checksumSha256: trackSha256, sizeBytes: 123
+  };
+  const acknowledgement = uploadAck(metadata);
+  const fileName = `${recordingId}.pcm-fence.retry.json`;
+  const manifest = {
+    schemaVersion: 1, uploadAcknowledgement: acknowledgement, uploadId: metadata.uploadId,
+    recordingId, guildId: event.guildId, channelId: event.channelId, speakerId, trackNumber: 1,
+    trackSha256, trackSizeBytes: metadata.sizeBytes, proof
+  };
+  await Promise.all([
+    writeFile(path.join(proofRoot, fileName), `${JSON.stringify(proof)}\n`),
+    writeFile(path.join(manifestRoot, fileName), `${JSON.stringify(manifest)}\n`),
+    writeFile(path.join(pendingRoot, 'unrelated-invalid.json'), '{"schemaVersion":')
+  ]);
+  let attempts = 0;
+  const sink = new BoundedMeetingIntegrationSink({
+    post: async () => undefined,
+    postCancellationPcmFence: async (delivered) => {
+      attempts++;
+      if (attempts === 1) throw new MeetingIntegrationDeliveryError('temporary proof outage', true, 503);
+      return proofReceipt(delivered, acknowledgement);
+    }
+  }, logger, 4, 2, 1024, { recordingRoot, outboxRoot });
+  await sink.restoreOriginalRecordingJobs();
+  assert.deepEqual(await readdir(path.join(outboxRoot, 'rejected')), ['unrelated-invalid.json'],
+    'proof retry does not abort the unrelated original-job scan');
+  assert.equal(await sink.drain(2000), true, 'transient proof delivery recovers automatically without restart');
+  assert.equal(attempts, 2);
+  assert.deepEqual(await readdir(proofRoot), []);
+
+  for (const [field, value] of [
+    ['schemaVersion', 2], ['recordingId', 'different-recording'], ['speakerId', 'invalid'],
+    ['trackNumber', 2], ['trackSha256', 'b'.repeat(64)], ['uploadId', 'authoritative-track:v1:wrong:1']
+  ] as const) {
+    await writeFile(path.join(proofRoot, fileName), `${JSON.stringify(proof)}\n`);
+    await writeFile(path.join(manifestRoot, fileName), `${JSON.stringify({ ...manifest, [field]: value })}\n`);
+    await assert.rejects(() => (sink as any).replayCancellationProofs(), /manifest is corrupt or mismatched/,
+      `${field} restart identity mismatch fails closed`);
+  }
+  await writeFile(path.join(manifestRoot, fileName), `${JSON.stringify({ ...manifest, unexpected: true })}\n`);
+  await assert.rejects(() => (sink as any).replayCancellationProofs(), /manifest is corrupt or mismatched/,
+    'unknown manifest keys fail closed');
 });
 
 test('lifecycle v3 COMPLETE and ACK hot paths have constant persistence for N=10 and N=5000', async (context) => {
@@ -1850,8 +1926,9 @@ test('lifecycle v3 COMPLETE and ACK hot paths have constant persistence for N=10
       { recordingRoot: root, outboxRoot }, lifecycleV3Config
     );
     const actors = Array.from({ length: actorCount }, (_, index) => ({
-      actorId: String(10_000_000_000_000_000n + BigInt(index)), kind: 'human' as const
+      actorId: String(10_000_000_000_000_000n + BigInt(index % 1000)), kind: 'human' as const
     }));
+    const uniqueActorCount = new Set(actors.map(({ actorId }) => actorId)).size;
     const sequence = operation.startsWith('threshold') ? 128 : 127;
     const lifecycleEvent = {
       schemaVersion: 3 as const, eventId: `event-${operation}`, recordingId,
@@ -1900,16 +1977,22 @@ test('lifecycle v3 COMPLETE and ACK hot paths have constant persistence for N=10
       (sink as any).acknowledgeLifecycleV3Event(lifecycleEvent);
       assert.equal(state.pendingEvents.size, 0, `${operation} physically evicts the pending event`);
       assert.equal(state.eventDigests.size, 0, `${operation} physically evicts the event digest`);
-      assert.equal(state.actorIndex.size, actorCount, `${operation} preserves the indexed roster`);
+      assert.equal(state.actorIndex.size, uniqueActorCount, `${operation} preserves the indexed roster`);
     } else {
       (sink as any).appendLifecycleV3Event(undefined, lifecycleEvent, sequence);
       assert.equal(state.pendingEvents.size, 1, `${operation} indexes one pending event`);
       assert.equal(state.eventDigests.size, 1, `${operation} indexes one event digest`);
-      assert.equal(state.actorIndex.size, actorCount + 1, `${operation} applies the participant delta once`);
+      assert.equal(state.actorIndex.size, uniqueActorCount + 1, `${operation} applies the participant delta once`);
     }
     const threshold = sequence === 128 && isAck;
     assert.equal(state.maintenanceNeeded, threshold, `${operation} only marks the ACK maintenance boundary`);
     assert.equal((sink as any).lifecycleV3MaintenanceQueue.size, threshold ? 1 : 0);
+    assert.equal((sink as any).lifecycleV3MaintenanceTimer !== null, threshold,
+      `${operation} schedules maintenance only after the ACK boundary`);
+    if ((sink as any).lifecycleV3MaintenanceTimer !== null) {
+      clearTimeout((sink as any).lifecycleV3MaintenanceTimer);
+      (sink as any).lifecycleV3MaintenanceTimer = null;
+    }
     return { calls, bytes, pendingEvents: state.pendingEvents.size, eventDigests: state.eventDigests.size };
   };
 
@@ -1955,7 +2038,7 @@ test('lifecycle v3 maintenance ticks are K-bounded for N=128 and N=5000 and even
     const journalRoot = path.join(outboxRoot, 'lifecycle-v3', 'pending', `${recordingId}.journal`);
     await mkdir(journalRoot, { recursive: true });
     const actors = Array.from({ length: actorCount }, (_, index) => ({
-      actorId: String(10_000_000_000_000_000n + BigInt(index)), kind: 'human' as const
+      actorId: String(10_000_000_000_000_000n + BigInt(index % 1000)), kind: 'human' as const
     }));
     const base = {
       schemaVersion: 2, generation: 0, baseSequence: 128, recordingId,
@@ -2005,6 +2088,51 @@ test('lifecycle v3 maintenance ticks are K-bounded for N=128 and N=5000 and even
   assert.ok(results[1].maximumBytes <= results[0].maximumBytes + 16,
     `tick bytes grew with N: ${JSON.stringify(results)}`);
   assert.ok(results[1].ticks > results[0].ticks, 'larger generations complete through more fixed-work ticks');
+});
+
+test('production lifecycle maintenance scheduler fairly compacts two interleaved recordings', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-fair-maintenance-scheduler-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const sink = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined }, logger, 4, 2, 1024,
+    { recordingRoot: root, outboxRoot: root }, lifecycleV3Config
+  );
+  const recordingIds = ['fair-maintenance-a', 'fair-maintenance-b'];
+  for (const [recordingIndex, recordingId] of recordingIds.entries()) {
+    const actors = Array.from({ length: 17 + recordingIndex * 2 }, (_, index) => ({
+      actorId: String(10_000_000_000_000_000n + BigInt(index)), kind: 'human' as const
+    }));
+    const journalRoot = path.join(root, 'lifecycle-v3', 'pending', `${recordingId}.journal`);
+    await mkdir(journalRoot, { recursive: true });
+    const base = {
+      schemaVersion: 2, generation: 0, baseSequence: 128, recordingId,
+      guildId: event.guildId, channelId: event.channelId, producer: lifecycleV3Config,
+      actorObservationState: 'consistent', actors, sealedReady: null
+    };
+    (sink as any).publishLifecycleV3Generation(journalRoot, base, 128);
+    (sink as any).lifecycleV3JournalIndex.set(recordingId, {
+      snapshot: { ...base, emitted: [], pendingOutbox: [] },
+      actorIndex: new Map(actors.map((actor) => [actor.actorId, actor])), pendingEvents: new Map(), eventDigests: new Map(),
+      generation: 0, nextSequence: 129, ackedSequence: 128, closed: true,
+      lastOccurredAt: '2026-08-18T00:00:00.000Z', lastAcknowledgedEventId: 'acked',
+      lastAcknowledgedDigest: 'a'.repeat(64), maintenanceNeeded: true
+    });
+    (sink as any).lifecycleV3MaintenanceQueue.add(recordingId);
+  }
+  const originalStep = (sink as any).runLifecycleV3MaintenanceJournalStep.bind(sink);
+  const order: string[] = [];
+  (sink as any).runLifecycleV3MaintenanceJournalStep = (recordingId: string, state: unknown) => {
+    order.push(recordingId);
+    return originalStep(recordingId, state);
+  };
+  (sink as any).scheduleLifecycleV3Maintenance();
+  assert.equal(await sink.drain(5000), true, 'scheduled bounded ticks eventually compact both recordings');
+  assert.deepEqual(order.slice(0, 8), [
+    recordingIds[0], recordingIds[1], recordingIds[0], recordingIds[1],
+    recordingIds[0], recordingIds[1], recordingIds[0], recordingIds[1]
+  ], 'unfinished journals rotate to the tail after every K-bounded tick');
+  for (const recordingId of recordingIds)
+    assert.equal((sink as any).lifecycleV3JournalIndex.get(recordingId).generation, 1);
 });
 
 test('lifecycle v3 recovery rejects torn chunks and descriptors and falls back through manifests', async (context) => {
@@ -2165,6 +2293,7 @@ test('lifecycle v3 long-run append ACK compaction and restart keeps physical ind
     { recordingRoot: root, outboxRoot: root }, lifecycleV3Config
   );
   let sink = makeSink();
+  (sink as any).scheduleLifecycleV3Maintenance = () => undefined;
   const firstActor = { actorId: '10000000000000000', kind: 'human' as const };
   const admission = {
     schemaVersion: 2 as const, recordingId, guildId: event.guildId, channelId: event.channelId,
@@ -2191,7 +2320,7 @@ test('lifecycle v3 long-run append ACK compaction and restart keeps physical ind
       type: 'participant.joined' as const, actorSemanticsVersion,
       producerCapabilityId: sealedActorRosterCapabilityId, producerRevision: lifecycleV3Config.producerRevision,
       actorObservationState: 'consistent' as const,
-      actor: { actorId: String(10_000_000_000_000_000n + BigInt(sequence)), kind: 'human' as const }
+      actor: { actorId: String(10_000_000_000_000_000n + BigInt(sequence % 1000)), kind: 'human' as const }
     };
     (sink as any).appendLifecycleV3Event(undefined, last, sequence);
     (sink as any).acknowledgeLifecycleV3Event(last);
@@ -2207,7 +2336,7 @@ test('lifecycle v3 long-run append ACK compaction and restart keeps physical ind
   assert.equal(recovered.ackedSequence, 1024);
   assert.equal(recovered.pendingEvents.size, 0);
   assert.equal(recovered.eventDigests.size, 0);
-  assert.equal(recovered.actorIndex.size, 1025, 'post-capture deltas survive interleaved compaction and restart');
+  assert.equal(recovered.actorIndex.size, 1000, 'post-capture deltas survive interleaved compaction and restart within roster cap');
   (sink as any).acknowledgeLifecycleV3Event(last);
   assert.equal(recovered.ackedSequence, 1024, 'duplicate ACK after restart is idempotent');
 });
