@@ -1906,6 +1906,29 @@ test('cancellation proof retry is autonomous and does not block original outbox 
     'unknown manifest keys fail closed');
 });
 
+test('cancellation proof worker rotates a delayed selection window before sleeping', async () => {
+  const sink = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined, postCancellationPcmFence: async () => { throw new Error('unused'); } },
+    logger, 4, 2
+  );
+  const now = Date.now();
+  const jobs = Array.from({ length: 9 }, (_, index) => ({
+    filePath: `proof-${index}.json`, consecutiveFailures: 1,
+    notBeforeMs: index < 8 ? now + 10_000 : 0
+  }));
+  (sink as any).cancellationProofJobs.push(...jobs);
+  const delivered: string[] = [];
+  (sink as any).deliverCancellationProof = async (filePath: string) => { delivered.push(filePath); };
+  const scheduledDelays: number[] = [];
+  (sink as any).scheduleCancellationProofProcessing = (delayMs = 0) => { scheduledDelays.push(delayMs); };
+
+  await (sink as any).processCancellationProof();
+  assert.deepEqual(delivered, []);
+  assert.equal(scheduledDelays.shift(), 0, 'an uninspected window is scheduled immediately');
+  await (sink as any).processCancellationProof();
+  assert.deepEqual(delivered, ['proof-8.json'], 'ready proof behind eight delayed retries is not hidden by backoff');
+});
+
 test('lifecycle v3 COMPLETE and ACK hot paths have constant persistence for N=10 and N=5000', async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-bounded-hot-path-test-'));
   context.after(async () => rm(root, { recursive: true, force: true }));
@@ -2121,16 +2144,17 @@ test('production lifecycle maintenance scheduler fairly compacts two interleaved
   }
   const originalStep = (sink as any).runLifecycleV3MaintenanceJournalStep.bind(sink);
   const order: string[] = [];
+  let injectedFailures = 2;
   (sink as any).runLifecycleV3MaintenanceJournalStep = (recordingId: string, state: unknown) => {
     order.push(recordingId);
+    if (recordingId === recordingIds[0] && injectedFailures-- > 0) throw new Error('injected journal failure');
     return originalStep(recordingId, state);
   };
   (sink as any).scheduleLifecycleV3Maintenance();
   assert.equal(await sink.drain(5000), true, 'scheduled bounded ticks eventually compact both recordings');
-  assert.deepEqual(order.slice(0, 8), [
-    recordingIds[0], recordingIds[1], recordingIds[0], recordingIds[1],
-    recordingIds[0], recordingIds[1], recordingIds[0], recordingIds[1]
-  ], 'unfinished journals rotate to the tail after every K-bounded tick');
+  assert.deepEqual(order.slice(0, 6), [
+    recordingIds[0], recordingIds[1], recordingIds[0], recordingIds[1], recordingIds[0], recordingIds[1]
+  ], 'failed and unfinished journals rotate to the tail after every K-bounded tick');
   for (const recordingId of recordingIds)
     assert.equal((sink as any).lifecycleV3JournalIndex.get(recordingId).generation, 1);
 });

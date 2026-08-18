@@ -799,7 +799,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     const now = Date.now();
     let pending: PendingCancellationProofJob | undefined;
     let nextDelayMs = Number.POSITIVE_INFINITY;
-    const selectionCount = Math.min(cancellationProofSelectionBudget, this.cancellationProofJobs.length);
+    const jobCount = this.cancellationProofJobs.length;
+    const selectionCount = Math.min(cancellationProofSelectionBudget, jobCount);
     for (let index = 0; index < selectionCount; index++) {
       const candidate = this.cancellationProofJobs.shift()!;
       if (pending === undefined && candidate.notBeforeMs <= now) pending = candidate;
@@ -809,7 +810,11 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       }
     }
     if (pending === undefined) {
-      this.scheduleCancellationProofProcessing(Number.isFinite(nextDelayMs) ? nextDelayMs : retryDelay(1));
+      // Continue immediately when the bounded scan left jobs uninspected. The
+      // inspected window was rotated to the tail, so ready work cannot hide
+      // behind an earlier window of delayed retries.
+      const delayMs = jobCount > selectionCount ? 0 : Number.isFinite(nextDelayMs) ? nextDelayMs : retryDelay(1);
+      this.scheduleCancellationProofProcessing(delayMs);
       return;
     }
     this.processingCancellationProof = true;
@@ -1482,9 +1487,16 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     if (recordingId === undefined) return false;
     const journal = this.lifecycleV3JournalIndex.get(recordingId);
     if (journal === undefined) { this.lifecycleV3MaintenanceQueue.delete(recordingId); return this.lifecycleV3MaintenanceQueue.size > 0; }
-    const again = this.runLifecycleV3MaintenanceJournalStep(recordingId, journal);
+    // Rotate before doing fallible work. A persistently broken journal must not
+    // monopolize the head and prevent unrelated recordings from compacting.
     this.lifecycleV3MaintenanceQueue.delete(recordingId);
-    if (again) this.lifecycleV3MaintenanceQueue.add(recordingId);
+    try {
+      if (this.runLifecycleV3MaintenanceJournalStep(recordingId, journal))
+        this.lifecycleV3MaintenanceQueue.add(recordingId);
+    } catch (error) {
+      this.lifecycleV3MaintenanceQueue.add(recordingId);
+      throw error;
+    }
     return this.lifecycleV3MaintenanceQueue.size > 0;
   }
 
