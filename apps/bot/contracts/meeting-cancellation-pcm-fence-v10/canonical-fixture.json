@@ -1,0 +1,23 @@
+{
+  "contract": "meeting-cancellation-pcm-fence-v10",
+  "receipt": {
+    "schemaVersion": 10,
+    "type": "meeting.playback_cancelled",
+    "capabilityId": "meeting.cancellation.pcm-fence.v10",
+    "meetingId": "meeting-1",
+    "turnId": "turn-1",
+    "cancelReason": "barge-in",
+    "cancelledAt": "2026-08-18T00:00:03.000Z",
+    "lastAcceptedFactualPcmSequence": 1,
+    "lastAcceptedFactualPcmAt": "2026-08-18T00:00:02.000Z",
+    "noFactualPcmAcceptedAfterFence": true,
+    "botikTrack": {
+      "speakerId": "1533228054724346087",
+      "trackNumber": 7,
+      "packetCursor": 8
+    },
+    "botikTrackChecksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "botikTrackSizeBytes": 4096,
+    "playbackGeneration": 3
+  }
+}
