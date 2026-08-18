@@ -134,7 +134,7 @@ test('snapshot binds producer, recording context, event order, and pending exact
   assert.deepEqual(restoreCraigLifecycleV3ProducerFromSnapshot(snapshot).durableSnapshot(), snapshot);
   assert.deepEqual(
     snapshot.emitted,
-    snapshot.pendingOutbox.map(({ eventId, occurredAt }: any) => ({ eventId, occurredAt }))
+    snapshot.pendingOutbox.map(({ eventId, occurredAt, type }: any) => ({ eventId, occurredAt, type }))
   );
   assert.throws(
     () => createCraigLifecycleV3Producer(config, { ...context, channelId: '1533228823045214399' }, snapshot),
@@ -147,6 +147,9 @@ test('snapshot binds producer, recording context, event order, and pending exact
   const unbound = JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
   unbound.emitted.pop();
   assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(unbound), /not bound/);
+  const missingPinned = JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
+  missingPinned.pendingOutbox.shift();
+  assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(missingPinned), /omits pinned evidence/);
   snapshot.pendingOutbox[0].recordingId = 'other-recording';
   assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(snapshot), /another recording context/);
 });

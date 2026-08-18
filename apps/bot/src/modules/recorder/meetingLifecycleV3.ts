@@ -55,14 +55,14 @@ export type CraigLifecycleV3Event =
     });
 
 export type DurableCraigLifecycleV3Snapshot = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   recordingId: string;
   guildId: string;
   channelId: string;
   producer: CraigProducerIdentity;
   actorObservationState: 'consistent' | 'conflicted';
   actors: CraigActor[];
-  emitted: Array<Readonly<{ eventId: string; occurredAt: string }>>;
+  emitted: Array<Readonly<{ eventId: string; occurredAt: string; type: CraigLifecycleV3Event['type'] }>>;
   pendingOutbox: CraigLifecycleV3Event[];
   sealedReady: CraigLifecycleV3Event | null;
 }>;
@@ -182,7 +182,7 @@ export class CraigActorObservationLedger {
 }
 
 export class CraigLifecycleV3Producer {
-  private readonly emitted: Array<Readonly<{ eventId: string; occurredAt: string }>> = [];
+  private readonly emitted: Array<Readonly<{ eventId: string; occurredAt: string; type: CraigLifecycleV3Event['type'] }>> = [];
   private readonly emittedIds = new Set<string>();
   private readonly pendingOutbox: CraigLifecycleV3Event[] = [];
   private readonly admissionRollbacks: Array<() => void> = [];
@@ -273,7 +273,7 @@ export class CraigLifecycleV3Producer {
 
   durableSnapshot(): DurableCraigLifecycleV3Snapshot {
     return deepFreeze({
-      schemaVersion: 2 as const,
+      schemaVersion: 3 as const,
       ...this.context,
       producer: { ...this.ledger.producer },
       actorObservationState: this.ledger.observationState(),
@@ -354,7 +354,7 @@ export class CraigLifecycleV3Producer {
     if (last !== undefined && Date.parse(event.occurredAt) < Date.parse(last.occurredAt))
       throw new Error('Craig lifecycle timestamps must be ordered');
     const frozen = deepFreeze(cloneEvent(event)) as T;
-    this.emitted.push(Object.freeze({ eventId: event.eventId, occurredAt: event.occurredAt }));
+    this.emitted.push(Object.freeze({ eventId: event.eventId, occurredAt: event.occurredAt, type: event.type }));
     this.emittedIds.add(event.eventId);
     this.pendingOutbox.push(frozen);
     this.admissionRollbacks.push(rollback);
@@ -402,7 +402,7 @@ export class CraigLifecycleV3Producer {
         'pendingOutbox',
         'sealedReady'
       ]) ||
-      value.schemaVersion !== 2 ||
+      value.schemaVersion !== 3 ||
       !isRecord(value.producer) ||
       !Array.isArray(value.actors) ||
       !Array.isArray(value.emitted) ||
@@ -430,8 +430,8 @@ export class CraigLifecycleV3Producer {
         throw new Error('Durable lifecycle snapshot events are unordered');
     if (events.some((event) => !sameContext(event, context))) throw new Error('Durable lifecycle outbox event belongs to another recording context');
     if (events.some((event) => !sameProducer(event, producer))) throw new Error('Durable lifecycle outbox event belongs to another producer');
-    const emittedById = new Map(emitted.map((item) => [item.eventId, item.occurredAt]));
-    if (events.some((event) => emittedById.get(event.eventId) !== event.occurredAt))
+    const emittedById = new Map(emitted.map((item) => [item.eventId, item]));
+    if (events.some((event) => emittedById.get(event.eventId)?.occurredAt !== event.occurredAt || emittedById.get(event.eventId)?.type !== event.type))
       throw new Error('Durable lifecycle outbox is not bound to emitted event order');
     let previousEmittedIndex = -1;
     for (const event of events) {
@@ -439,8 +439,13 @@ export class CraigLifecycleV3Producer {
       if (emittedIndex <= previousEmittedIndex) throw new Error('Durable lifecycle pending outbox is unordered');
       previousEmittedIndex = emittedIndex;
     }
-    if (events.some((event) => !emittedById.has(event.eventId)))
-      throw new Error('Durable lifecycle pending outbox is not emitted evidence');
+    const pendingById = new Map(events.map((event) => [event.eventId, event]));
+    for (const reference of emitted)
+      if (isPinnedLifecycleType(reference.type)) {
+        const pinned = pendingById.get(reference.eventId);
+        if (pinned?.type !== reference.type || pinned.occurredAt !== reference.occurredAt)
+          throw new Error('Durable lifecycle snapshot omits pinned evidence');
+      }
     const readyEvents = events.filter(({ type }) => type === 'recording.authoritative_ready');
     if (readyEvents.length > 1 || (readyEvents.length === 1 && events[events.length - 1]?.type !== 'recording.authoritative_ready'))
       throw new Error('Durable lifecycle snapshot has an invalid seal order');
@@ -450,7 +455,12 @@ export class CraigLifecycleV3Producer {
 
     if (value.sealedReady !== null) {
       const ready = parseV3Event(value.sealedReady);
-      if (ready.type !== 'recording.authoritative_ready' || !sameContext(ready, context) || emittedById.get(ready.eventId) !== ready.occurredAt)
+      if (
+        ready.type !== 'recording.authoritative_ready' ||
+        !sameContext(ready, context) ||
+        emittedById.get(ready.eventId)?.occurredAt !== ready.occurredAt ||
+        emittedById.get(ready.eventId)?.type !== ready.type
+      )
         throw new Error('Durable lifecycle snapshot seal is invalid');
       if (
         !sameProducer(ready, producer) ||
@@ -560,16 +570,34 @@ function parseStoredActor(value: unknown): CraigActor {
   return Object.freeze({ actorId: value.actorId, kind: value.kind });
 }
 
-function parseEmittedReference(value: unknown): Readonly<{ eventId: string; occurredAt: string }> {
+function parseEmittedReference(value: unknown): Readonly<{ eventId: string; occurredAt: string; type: CraigLifecycleV3Event['type'] }> {
   if (
     !isRecord(value) ||
-    !hasExactlyKeys(value, ['eventId', 'occurredAt']) ||
+    !hasExactlyKeys(value, ['eventId', 'occurredAt', 'type']) ||
     typeof value.eventId !== 'string' ||
-    typeof value.occurredAt !== 'string'
+    typeof value.occurredAt !== 'string' ||
+    !isLifecycleEventType(value.type)
   )
     throw new Error('Durable lifecycle snapshot emitted reference is invalid');
   assertEventIdentity(value.eventId, value.occurredAt);
-  return Object.freeze({ eventId: value.eventId, occurredAt: value.occurredAt });
+  return Object.freeze({ eventId: value.eventId, occurredAt: value.occurredAt, type: value.type });
+}
+
+function isPinnedLifecycleType(type: CraigLifecycleV3Event['type']): boolean {
+  return type === 'meeting.started' || type === 'meeting.ended' || type === 'meeting.aborted' || type === 'recording.authoritative_ready';
+}
+
+function isLifecycleEventType(value: unknown): value is CraigLifecycleV3Event['type'] {
+  return (
+    value === 'meeting.started' ||
+    value === 'participant.joined' ||
+    value === 'participant.left' ||
+    value === 'meeting.connection_lost' ||
+    value === 'meeting.connection_recovered' ||
+    value === 'meeting.ended' ||
+    value === 'meeting.aborted' ||
+    value === 'recording.authoritative_ready'
+  );
 }
 
 function parseV3Event(value: unknown): CraigLifecycleV3Event {

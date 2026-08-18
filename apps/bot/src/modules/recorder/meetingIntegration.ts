@@ -945,7 +945,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       observeLifecycleV3Actor(actorIndex, event.actor);
     this.lifecycleV3JournalIndex.set(event.recordingId, {
       snapshot: {
-        schemaVersion: 2,
+        schemaVersion: 3,
         recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId,
         producer: { actorSemanticsVersion: event.actorSemanticsVersion, producerCapabilityId: event.producerCapabilityId, producerRevision: event.producerRevision },
         actorObservationState: event.actorObservationState, actors: priorSnapshot?.actors ?? admission!.actors,
@@ -1175,9 +1175,9 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     const actors = [...actorIndex.values()].sort((left, right) => left.actorId.localeCompare(right.actorId));
     const last = retained[retained.length - 1].event;
     const snapshot = restoreCraigLifecycleV3ProducerFromSnapshot({
-      schemaVersion: 2, recordingId: checkpoint.recordingId, guildId: checkpoint.guildId, channelId: checkpoint.channelId,
+      schemaVersion: 3, recordingId: checkpoint.recordingId, guildId: checkpoint.guildId, channelId: checkpoint.channelId,
       producer: checkpoint.producer, actorObservationState: last.actorObservationState ?? checkpoint.actorObservationState, actors,
-      emitted: events.map(({ eventId, occurredAt }) => ({ eventId, occurredAt })), pendingOutbox: events,
+      emitted: events.map(({ eventId, occurredAt, type }) => ({ eventId, occurredAt, type })), pendingOutbox: events,
       sealedReady
     }).durableSnapshot();
     return {
@@ -1221,7 +1221,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
         : [pinnedStart, ...pendingEvents.filter(({ eventId }) => eventId !== pinnedStart.eventId)];
       return restoreCraigLifecycleV3ProducerFromSnapshot({
         ...journal.snapshot,
-        emitted: events.map(({ eventId, occurredAt }) => ({ eventId, occurredAt })),
+        emitted: events.map(({ eventId, occurredAt, type }) => ({ eventId, occurredAt, type })),
         pendingOutbox: events
       }).durableSnapshot();
     }

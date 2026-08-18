@@ -1312,7 +1312,7 @@ test('persists lifecycle v3 context, producer, event order, and pending outbox a
   assert.equal(persisted.schemaVersion, 3);
   assert.deepEqual(
     persisted.lifecycleV3Snapshot.emitted,
-    [startedEvent, endedEvent].map(({ eventId, occurredAt }) => ({ eventId, occurredAt }))
+    [startedEvent, endedEvent].map(({ eventId, occurredAt, type }) => ({ eventId, occurredAt, type }))
   );
   assert.deepEqual(persisted.lifecycleV3Snapshot.pendingOutbox, [startedEvent, endedEvent]);
 
@@ -2031,7 +2031,7 @@ test('lifecycle v3 COMPLETE and ACK hot paths have constant persistence for N=10
     const isAck = operation.endsWith('ack');
     const state = {
       snapshot: {
-        schemaVersion: 2, recordingId, guildId: event.guildId, channelId: event.channelId,
+        schemaVersion: 3, recordingId, guildId: event.guildId, channelId: event.channelId,
         producer: lifecycleV3Config, actorObservationState: 'consistent', actors: rosterMaterializationTrap,
         sealedReady: null, emitted: [], pendingOutbox: []
       },
