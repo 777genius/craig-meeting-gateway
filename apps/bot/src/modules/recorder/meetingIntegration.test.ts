@@ -2065,16 +2065,16 @@ test('lifecycle v3 maintenance ticks are K-bounded for N=128 and N=5000 and even
     let maximumCalls = 0;
     let maximumBytes = 0;
     let ticks = 0;
+    let more: boolean;
     do {
       calls = 0;
       bytes = 0;
-      const more = sink.runLifecycleV3MaintenanceStep();
+      more = sink.runLifecycleV3MaintenanceStep();
       maximumCalls = Math.max(maximumCalls, calls);
       maximumBytes = Math.max(maximumBytes, bytes);
       ticks++;
-      if (!more) break;
-      assert.ok(ticks < 2000, 'restartable maintenance must make progress');
-    } while (true);
+      if (more) assert.ok(ticks < 2000, 'restartable maintenance must make progress');
+    } while (more);
     assert.equal(state.generation, 1);
     assert.equal(state.maintenanceNeeded, false);
     const chunks = (await readdir(journalRoot)).filter((name) => /^generation-00000001-chunk-/.test(name));
