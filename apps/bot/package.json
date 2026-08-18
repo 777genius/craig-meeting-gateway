@@ -13,7 +13,7 @@
     "start": "dotenv -e ../../.env -c -- node dist/index.js",
     "start:sharding": "dotenv -e ../../.env -c -- node dist/sharding/index.js",
     "build": "rimraf dist && tsc",
-    "test": "tsx --test src/modules/gatewayInteractionOwnership.test.ts src/modules/meetingAutoRecord.test.ts src/modules/recorder/conversationPlayback.test.ts src/modules/recorder/conversationPlaybackReconnect.test.ts src/modules/recorder/conversationPlaybackSession.test.ts src/modules/recorder/meetingIntegration.test.ts src/modules/recorder/meetingParticipantLifecycle.test.ts src/modules/recorder/recordingLifecycleTransition.test.ts",
+    "test": "tsx --test src/modules/gatewayInteractionOwnership.test.ts src/modules/meetingAutoRecord.test.ts src/modules/recorder/conversationPlayback.test.ts src/modules/recorder/conversationPlaybackReconnect.test.ts src/modules/recorder/conversationPlaybackSession.test.ts src/modules/recorder/meetingIntegration.test.ts src/modules/recorder/meetingLifecycleV3.test.ts src/modules/recorder/meetingParticipantLifecycle.test.ts src/modules/recorder/recordingLifecycleTransition.test.ts",
     "sync": "slash-up sync",
     "sync:dev": "slash-up sync -e development",
     "lint": "eslint .",
