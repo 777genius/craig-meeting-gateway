@@ -51,6 +51,9 @@ export interface ConversationPlaybackSessionOptions {
   createOpusEncoder?: () => CraigPlaybackOpusEncoder;
   now?: () => number;
   onPacketDispatched?: (opusPacket: Buffer) => void;
+  onCancellation: ConstructorParameters<typeof CraigPlaybackController>[0]['onCancellation'];
+  isAttemptRevoked: ConstructorParameters<typeof CraigPlaybackController>[0]['isAttemptRevoked'];
+  onPostCancellationPacket: ConstructorParameters<typeof CraigPlaybackController>[0]['onPostCancellationPacket'];
   onReady?: () => void;
   onClosed?: (reason: ConversationPlaybackCloseReason) => void;
 }
@@ -124,7 +127,14 @@ export class CraigConversationPlaybackSession {
       return this.closeForProtocolViolation();
     }
 
-    if (!this.controller.handleCommand(parsed)) this.closeForProtocolViolation();
+    let handled: boolean;
+    try {
+      handled = this.controller.handleCommand(parsed);
+    } catch (error) {
+      this.onError(error instanceof Error ? error : new Error('Unknown playback controller failure'));
+      return;
+    }
+    if (!handled) this.closeForProtocolViolation();
   }
 
   private onRemoteClose(): void {
@@ -193,6 +203,9 @@ interface PlaybackSessionReadyEvent {
 export async function createConversationPlaybackSession(
   options: ConversationPlaybackSessionOptions
 ): Promise<CraigConversationPlaybackSession | undefined> {
+  if (typeof options.onCancellation !== 'function' || typeof options.isAttemptRevoked !== 'function' ||
+      typeof options.onPostCancellationPacket !== 'function')
+    throw new Error('Durable playback cancellation, restart lookup, and post-fence attempt handlers are required');
   const config = options.config;
   if (!config?.enabled) return undefined;
 
@@ -219,6 +232,9 @@ export async function createConversationPlaybackSession(
     createOpusEncoder: options.createOpusEncoder,
     now: options.now,
     onPacketDispatched: options.onPacketDispatched,
+    onCancellation: options.onCancellation,
+    isAttemptRevoked: options.isAttemptRevoked,
+    onPostCancellationPacket: options.onPostCancellationPacket,
     onEvent: (event) => sendEvent(event)
   });
   const gatewaySessionId = options.createGatewaySessionId?.() ?? randomUUID();

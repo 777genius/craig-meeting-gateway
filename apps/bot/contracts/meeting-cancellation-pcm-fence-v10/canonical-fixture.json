@@ -1,0 +1,16 @@
+{
+  "contract": "meeting-cancellation-pcm-fence-v10",
+  "proof": {
+    "acceptedPacketCountAfterCancellation": 0,
+    "attemptedPacketCountAfterCancellation": 0,
+    "attemptId": "attempt-1",
+    "cancellationObservedAt": "2026-08-18T00:00:03.000Z",
+    "fenceObservedAt": "2026-08-18T00:00:03.000Z",
+    "meetingId": "meeting-1",
+    "message": "Craig authoritative cancellation PCM fence observed",
+    "recordingId": "recording-1",
+    "source": "craig-authoritative-playback-track",
+    "trackSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "turnId": "turn-1"
+  }
+}

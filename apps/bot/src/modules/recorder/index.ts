@@ -106,7 +106,14 @@ export default class RecorderModule<T extends DexareClient<CraigBotConfig>> exte
         warn: (message) => this.logger.warn(message),
         error: (message, error) => this.logger.error(message, error)
       },
-      this.recordingPath
+      this.recordingPath,
+      (recordingId, eventId) => {
+        for (const recording of this.recordings.values())
+          if (recording.id === recordingId) {
+            recording.acknowledgeMeetingLifecycleV3(eventId);
+            return;
+          }
+      }
     );
   }
 

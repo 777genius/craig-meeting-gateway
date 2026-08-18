@@ -16,6 +16,7 @@
   ],
   "scripts": {
     "build": "yarn workspaces run build",
+    "contracts:meeting-lifecycle-v3": "tsx scripts/generateMeetingLifecycleV3Bundle.ts --check",
     "test": "yarn workspaces run test",
     "lint": "yarn workspaces run lint",
     "lint:fix": "yarn workspaces run lint:fix",

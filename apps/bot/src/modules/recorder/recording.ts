@@ -1,4 +1,5 @@
 import { OpusEncoder } from '@discordjs/opus';
+import { createHash } from 'node:crypto';
 import type { DAVESession } from '@snazzah/davey';
 import axios from 'axios';
 import { stripIndents } from 'common-tags';
@@ -6,6 +7,7 @@ import dayjs from 'dayjs';
 import duration from 'dayjs/plugin/duration';
 import { DexareClient } from 'dexare';
 import Eris from 'eris';
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { access, writeFile } from 'fs/promises';
 import { customAlphabet, nanoid } from 'nanoid';
 import path from 'path';
@@ -22,15 +24,25 @@ import {
   appendAuthoritativeBotikPlaybackPacket,
   createAuthoritativeBotikPlaybackTrack
 } from './authoritativePlaybackTrack';
-import { CraigPlaybackArbiter } from './conversationPlayback';
+import { CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS, CraigPlaybackArbiter } from './conversationPlayback';
 import { ConversationPlaybackReconnect } from './conversationPlaybackReconnect';
 import { CraigConversationPlaybackSession, createConversationPlaybackSession } from './conversationPlaybackSession';
 import {
+  type AnyMeetingStartedLifecycleEvent,
+  type AnyMeetingTerminalLifecycleEvent,
+  type LegacyMeetingLifecycleEvent,
   type MeetingLifecycleEvent,
+  type MeetingLifecyclePublishOutcome,
   type MeetingStartedLifecycleEvent,
   type MeetingTerminalLifecycleEvent,
-  MeetingTerminalLifecycle
+  MeetingTerminalLifecycle,
+  reportMeetingLifecyclePublishOutcome
 } from './meetingIntegration';
+import {
+  type AuthenticatedDiscordActor,
+  type CraigLifecycleV3Producer,
+  createCraigLifecycleV3Producer
+} from './meetingLifecycleV3';
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
 import { WebappClient } from './webapp';
@@ -43,6 +55,21 @@ const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 const recNanoid = customAlphabet(alphabet, 12);
 const recIndicator = / *!?\[RECORDING\] */;
 const opusSilenceFrame = Buffer.from([0xf8, 0xff, 0xfe]);
+
+function authenticatedDiscordActor(value: {
+  id: string;
+  bot?: boolean;
+  system?: boolean;
+  webhookID?: string | null;
+  user?: { bot?: boolean; system?: boolean };
+}): AuthenticatedDiscordActor {
+  return {
+    id: value.id,
+    bot: value.bot === true || value.user?.bot === true,
+    system: value.system === true || value.user?.system === true,
+    webhook: typeof value.webhookID === 'string' && value.webhookID.length > 0
+  };
+}
 
 export const NOTE_TRACK_NUMBER = 65536;
 const USER_HARD_LIMIT = 10000;
@@ -161,7 +188,8 @@ export default class Recording {
   private stopPromise: Promise<void> | null = null;
   private connectionLossOpen = false;
   private readonly terminalMeetingLifecycle = new MeetingTerminalLifecycle();
-  private meetingStartedLifecycle?: MeetingStartedLifecycleEvent;
+  private meetingStartedLifecycle?: AnyMeetingStartedLifecycleEvent;
+  private lifecycleV3?: CraigLifecycleV3Producer;
 
   constructor(recorder: RecorderModule<DexareClient<CraigBotConfig>>, channel: Eris.StageChannel | Eris.VoiceChannel, user: Eris.User, auto = false) {
     this.recorder = recorder;
@@ -169,6 +197,10 @@ export default class Recording {
     this.user = user;
     this.autorecorded = auto;
     this.sizeLimit = this.recorder.client.config.craig.sizeLimit;
+  }
+
+  acknowledgeMeetingLifecycleV3(eventId: string): void {
+    this.lifecycleV3?.acknowledgeDelivered(eventId);
   }
 
   async sanityCheckIdClashing() {
@@ -275,9 +307,18 @@ export default class Recording {
     this.writeToLog(`Connected to channel ${this.connection?.channelID} at ${this.connection?.endpoint}`);
 
     const participantIds = this.meetingParticipants.begin(this.channel.voiceMembers.keys(), this.recorder.client.bot.user.id);
-    const startedEvent = this.createMeetingLifecycleEvent('meeting.started', { participantIds }) as MeetingStartedLifecycleEvent;
-    this.meetingStartedLifecycle = startedEvent;
-    this.publishMeetingLifecycleEvent(startedEvent);
+    const lifecycleConfiguration = this.recorder.meetingIntegration.lifecycleProducerConfiguration;
+    if (lifecycleConfiguration.schemaVersion === 3)
+      this.lifecycleV3 = createCraigLifecycleV3Producer(lifecycleConfiguration, {
+        recordingId: this.id,
+        guildId: this.channel.guild.id,
+        channelId: this.channel.id
+      });
+    const startedEvent = this.createMeetingStartedLifecycleEvent(participantIds);
+    const startedOutcome = this.publishMeetingLifecycleEvent(startedEvent);
+    if (this.terminalMeetingLifecycle.acceptStart(startedOutcome)) {
+      this.meetingStartedLifecycle = startedEvent;
+    }
 
     this.timeout = setTimeout(async () => {
       if (this.state !== RecordingState.RECORDING) return;
@@ -370,16 +411,17 @@ export default class Recording {
       // Close the output files and connection
       this.closing = true;
       this.webapp?.close(WebappOpCloseReason.RECORDING_ENDED);
-      let persistedTerminalEvent: MeetingTerminalLifecycleEvent | undefined;
+      let persistedTerminalEvent: AnyMeetingTerminalLifecycleEvent | undefined;
       await this.terminalMeetingLifecycle.complete(
         internal ? 'meeting.aborted' : 'meeting.ended',
         async () => {
           await wait(200);
           const writer = this.writer;
           await writer?.end();
-          persistedTerminalEvent = this.createMeetingLifecycleEvent(internal ? 'meeting.aborted' : 'meeting.ended', {
-            reason: this.stateDescription ?? null
-          }) as MeetingTerminalLifecycleEvent;
+          persistedTerminalEvent = this.createMeetingTerminalLifecycleEvent(
+            internal ? 'meeting.aborted' : 'meeting.ended',
+            this.stateDescription ?? null
+          );
           if (writer) {
             const startedEvent = this.meetingStartedLifecycle;
             const persisted =
@@ -389,7 +431,8 @@ export default class Recording {
                     .publishOriginalRecording({
                       startedEvent,
                       terminalEvent: persistedTerminalEvent,
-                      sourceFileBase: writer.fileBase
+                      sourceFileBase: writer.fileBase,
+                      ...(this.lifecycleV3 === undefined ? {} : { lifecycleV3Snapshot: this.lifecycleV3.durableSnapshot() })
                     })
                     .catch((error) => {
                       this.recorder.logger.error(
@@ -408,9 +451,7 @@ export default class Recording {
           const terminalEvent =
             persistedTerminalEvent?.type === type
               ? persistedTerminalEvent
-              : (this.createMeetingLifecycleEvent(type, {
-                  reason: this.stateDescription ?? 'Craig recording finalization failed.'
-                }) as MeetingTerminalLifecycleEvent);
+              : this.createMeetingTerminalLifecycleEvent(type, this.stateDescription ?? 'Craig recording finalization failed.');
           this.publishMeetingLifecycleEvent(terminalEvent);
         }
       );
@@ -608,6 +649,9 @@ export default class Recording {
         warn: (message, error) => this.recorder.logger.warn(message, error)
       },
       onPacketDispatched: (opusPacket) => this.recordDispatchedConversationPacket(opusPacket),
+      onCancellation: (cancellation) => this.persistConversationPlaybackFence(generation, cancellation),
+      isAttemptRevoked: (identity) => this.isConversationPlaybackAttemptRevoked(generation, identity),
+      onPostCancellationPacket: (identity) => this.recordPostCancellationPacketAttempt(generation, identity),
       onReady: () => this.conversationPlaybackReconnect.connected(),
       onClosed: (reason) => {
         if (this.conversationPlayback?.isClosed) this.conversationPlayback = undefined;
@@ -648,6 +692,132 @@ export default class Recording {
     const session = this.conversationPlayback;
     this.conversationPlayback = undefined;
     session?.close(reason);
+  }
+
+  private persistConversationPlaybackFence(
+    generation: number,
+    cancellation: Readonly<{
+      schemaVersion: 1 | 2; type: 'playback-cancel'; meetingId?: string; recordingId: string;
+      turnId: string; attemptId: string; cancellationObservedAtMs?: number; cancellationObservedAt?: string; reason: string;
+    }>
+  ): boolean {
+    const writer = this.writer;
+    if (!writer || cancellation.recordingId !== this.id || generation !== this.conversationPlaybackGeneration) return false;
+    if (cancellation.schemaVersion === 2 &&
+        (!Number.isSafeInteger(cancellation.cancellationObservedAtMs) || cancellation.cancellationObservedAtMs! < 0 ||
+         cancellation.cancellationObservedAtMs! > CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS)) return false;
+    const attemptKey = createHash('sha256')
+      .update(`${cancellation.turnId}\0${cancellation.attemptId}`)
+      .digest('hex')
+      .slice(0, 32);
+    const filePath = `${writer.fileBase}.playback-cancellation-fence.${attemptKey}.json`;
+    if (existsSync(filePath)) {
+      try {
+        const fence = this.readConversationPlaybackFence(filePath, cancellation);
+        if (fence.schemaVersion !== cancellation.schemaVersion || fence.type !== cancellation.type ||
+            fence.meetingId !== cancellation.meetingId || fence.reason !== cancellation.reason ||
+            fence.cancellationObservedAtMs !== cancellation.cancellationObservedAtMs ||
+            fence.cancellationObservedAt !== cancellation.cancellationObservedAt)
+          throw new Error('Cancellation fence retry conflicts with durable cancellation identity');
+        return true;
+      } catch (error) {
+        this.recorder.logger.error(`Failed to validate durable playback cancellation fence for recording ${this.id}`, error);
+        return false;
+      }
+    }
+    const temporaryPath = `${filePath}.${process.pid}.${nanoid(8)}.tmp`;
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(temporaryPath, 'wx', 0o600);
+      writeFileSync(
+        descriptor,
+        `${JSON.stringify({
+          ...cancellation,
+          playbackGeneration: generation,
+          attemptGenerationToken: nanoid(24),
+          fenceObservedAtMs: Math.max(Date.now(), cancellation.cancellationObservedAtMs ?? 0),
+          postCancellationAttemptedPacketCount: 0,
+          postCancellationAcceptedPacketCount: 0
+        })}\n`,
+        'utf8'
+      );
+      fsyncSync(descriptor);
+      closeSync(descriptor);
+      descriptor = undefined;
+      renameSync(temporaryPath, filePath);
+      const directory = openSync(path.dirname(filePath), 'r');
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
+      return true;
+    } catch (error) {
+      if (descriptor !== undefined) closeSync(descriptor);
+      this.recorder.logger.error(`Failed to durably persist playback cancellation fence for recording ${this.id}`, error);
+      return false;
+    }
+  }
+
+  private recordPostCancellationPacketAttempt(
+    generation: number,
+    identity: Readonly<{ recordingId: string; turnId: string; attemptId: string }>
+  ): boolean {
+    const writer = this.writer;
+    if (!writer || identity.recordingId !== this.id || generation !== this.conversationPlaybackGeneration)
+      throw new Error('Playback cancellation counter cannot be persisted outside the active recording generation');
+    const attemptKey = createHash('sha256').update(`${identity.turnId}\0${identity.attemptId}`).digest('hex').slice(0, 32);
+    const filePath = `${writer.fileBase}.playback-cancellation-fence.${attemptKey}.json`;
+    const fence = this.readConversationPlaybackFence(filePath, identity);
+    const attempted = fence.postCancellationAttemptedPacketCount;
+    if (!Number.isSafeInteger(attempted) || (attempted as number) < 0 || attempted === Number.MAX_SAFE_INTEGER)
+      throw new Error('Cancellation fence counter is invalid');
+    this.writeConversationPlaybackFence(filePath, { ...fence, postCancellationAttemptedPacketCount: (attempted as number) + 1 });
+    return true;
+  }
+
+  private isConversationPlaybackAttemptRevoked(
+    generation: number,
+    identity: Readonly<{ recordingId: string; turnId: string; attemptId: string }>
+  ): boolean {
+    const writer = this.writer;
+    if (!writer || identity.recordingId !== this.id || generation !== this.conversationPlaybackGeneration) return true;
+    const attemptKey = createHash('sha256').update(`${identity.turnId}\0${identity.attemptId}`).digest('hex').slice(0, 32);
+    const filePath = `${writer.fileBase}.playback-cancellation-fence.${attemptKey}.json`;
+    try {
+      this.readConversationPlaybackFence(filePath, identity);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+      // A file at the deterministic identity path is relevant. Corruption,
+      // token loss, or an identity mismatch therefore fails admission closed.
+      this.recorder.logger.error(`Failed to validate playback cancellation fence for recording ${this.id}`, error);
+      return true;
+    }
+  }
+
+  private readConversationPlaybackFence(
+    filePath: string,
+    identity: Readonly<{ recordingId: string; turnId: string; attemptId: string }>
+  ): Record<string, unknown> {
+    const fence = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+    if (fence.recordingId !== identity.recordingId || fence.turnId !== identity.turnId || fence.attemptId !== identity.attemptId)
+      throw new Error('Cancellation fence identity mismatch');
+    if (typeof fence.attemptGenerationToken !== 'string' || fence.attemptGenerationToken.length === 0)
+      throw new Error('Cancellation fence generation token is missing');
+    if (!Number.isSafeInteger(fence.postCancellationAcceptedPacketCount) || fence.postCancellationAcceptedPacketCount !== 0)
+      throw new Error('Cancellation fence accepted counter is invalid');
+    return fence;
+  }
+
+  private writeConversationPlaybackFence(filePath: string, fence: unknown): void {
+    const temporaryPath = `${filePath}.${process.pid}.${nanoid(8)}.tmp`;
+    const descriptor = openSync(temporaryPath, 'wx', 0o600);
+    try { writeFileSync(descriptor, `${JSON.stringify(fence)}\n`, 'utf8'); fsyncSync(descriptor); }
+    finally { closeSync(descriptor); }
+    renameSync(temporaryPath, filePath);
+    const directory = openSync(path.dirname(filePath), 'r');
+    try { fsyncSync(directory); } finally { closeSync(directory); }
   }
 
   /**
@@ -712,7 +882,11 @@ export default class Recording {
 
     const isPresent = member.voiceState.channelID === this.channel.id;
     const transition = this.meetingParticipants.observe(member.id, isPresent);
-    if (transition !== null) this.publishMeetingLifecycle(transition, { participantId: member.id });
+    if (transition === null) return;
+
+    const event = this.createMeetingParticipantLifecycleEvent(transition, authenticatedDiscordActor(member));
+    const outcome = this.publishMeetingLifecycleEvent(event);
+    if (outcome.status !== 'accepted') this.meetingParticipants.observe(member.id, !isPresent);
   }
 
   async onConnectionConnect() {
@@ -1041,45 +1215,93 @@ export default class Recording {
   }
 
   private publishMeetingLifecycle(
-    type: MeetingLifecycleEvent['type'],
-    details: Pick<MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+    type: 'meeting.ended' | 'meeting.aborted',
+    details: Pick<LegacyMeetingLifecycleEvent, 'reason'>
   ): MeetingLifecycleEvent {
-    const event = this.createMeetingLifecycleEvent(type, details);
+    const event = this.createMeetingTerminalLifecycleEvent(type, details.reason ?? null);
     this.publishMeetingLifecycleEvent(event);
     return event;
   }
 
-  private createMeetingLifecycleEvent(
-    type: MeetingLifecycleEvent['type'],
-    details: Pick<MeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+  private createMeetingStartedLifecycleEvent(participantIds: string[]): AnyMeetingStartedLifecycleEvent {
+    if (this.lifecycleV3 === undefined)
+      return this.createMeetingLifecycleEvent('meeting.started', { participantIds }) as MeetingStartedLifecycleEvent;
+    const actors = participantIds.map((participantId) => {
+      const member = this.channel.voiceMembers.get(participantId);
+      return member === undefined ? { id: participantId } : authenticatedDiscordActor(member);
+    });
+    return this.createLifecycleV3Event(() => this.lifecycleV3!.started(this.createMeetingLifecycleEnvelope(), actors));
+  }
+
+  private createMeetingParticipantLifecycleEvent(
+    type: 'participant.joined' | 'participant.left',
+    actor: AuthenticatedDiscordActor
   ): MeetingLifecycleEvent {
+    if (this.lifecycleV3 === undefined) return this.createMeetingLifecycleEvent(type, { participantId: actor.id });
+    return this.createLifecycleV3Event(() => this.lifecycleV3!.participant(this.createMeetingLifecycleEnvelope(), type, actor));
+  }
+
+  private createMeetingTerminalLifecycleEvent(type: 'meeting.ended' | 'meeting.aborted', reason: string | null): AnyMeetingTerminalLifecycleEvent {
+    if (this.lifecycleV3 === undefined) return this.createMeetingLifecycleEvent(type, { reason }) as MeetingTerminalLifecycleEvent;
+    return this.createLifecycleV3Event(() => this.lifecycleV3!.terminal(this.createMeetingLifecycleEnvelope(), type, reason));
+  }
+
+  private createMeetingLifecycleEnvelope() {
     return {
-      schemaVersion: 1,
       eventId: `${this.id}:${++this.lifecycleSequence}`,
       recordingId: this.id,
       guildId: this.channel.guild.id,
       channelId: this.channel.id,
-      occurredAt: new Date().toISOString(),
+      occurredAt: new Date().toISOString()
+    };
+  }
+
+  private createMeetingLifecycleEvent(
+    type: LegacyMeetingLifecycleEvent['type'],
+    details: Pick<LegacyMeetingLifecycleEvent, 'participantIds' | 'participantId' | 'reason'>
+  ): LegacyMeetingLifecycleEvent {
+    return {
+      schemaVersion: 1,
+      ...this.createMeetingLifecycleEnvelope(),
       type,
       ...details
     };
   }
 
-  private publishMeetingLifecycleEvent(event: MeetingLifecycleEvent): void {
-    const accepted = this.recorder.meetingIntegration.publishLifecycle(event);
-    if (!accepted) this.recorder.logger.error(`Meeting integration lifecycle queue is full for recording ${this.id} (${event.type})`);
+  private publishMeetingLifecycleEvent(event: MeetingLifecycleEvent): MeetingLifecyclePublishOutcome {
+    const outcome = this.recorder.meetingIntegration.publishLifecycle(
+      event,
+      this.lifecycleV3 === undefined || event.type !== 'meeting.started' ? undefined : this.lifecycleV3.durableAdmission()
+    );
+    if (event.schemaVersion === 3 && outcome.status !== 'accepted') this.lifecycleV3!.rollbackAdmission(event);
+    reportMeetingLifecyclePublishOutcome(this.recorder.logger, this.id, event.type, outcome);
+    return outcome;
+  }
+
+  private createLifecycleV3Event<T extends MeetingLifecycleEvent>(create: () => T): T {
+    return create();
   }
 
   private markConnectionLost(reason: string) {
     if (this.connectionLossOpen) return;
-    this.connectionLossOpen = true;
-    this.publishMeetingLifecycle('meeting.connection_lost', { reason });
+    const event =
+      this.lifecycleV3 === undefined
+        ? this.createMeetingLifecycleEvent('meeting.connection_lost', { reason })
+        : this.createLifecycleV3Event(() => this.lifecycleV3!.connection(this.createMeetingLifecycleEnvelope(), 'meeting.connection_lost', reason));
+    const outcome = this.publishMeetingLifecycleEvent(event);
+    if (outcome.status === 'accepted') this.connectionLossOpen = true;
   }
 
   private markConnectionRecovered() {
     if (!this.connectionLossOpen) return;
-    this.connectionLossOpen = false;
-    this.publishMeetingLifecycle('meeting.connection_recovered', { reason: null });
+    const event =
+      this.lifecycleV3 === undefined
+        ? this.createMeetingLifecycleEvent('meeting.connection_recovered', { reason: null })
+        : this.createLifecycleV3Event(() =>
+            this.lifecycleV3!.connection(this.createMeetingLifecycleEnvelope(), 'meeting.connection_recovered', null)
+          );
+    const outcome = this.publishMeetingLifecycleEvent(event);
+    if (outcome.status === 'accepted') this.connectionLossOpen = false;
   }
 
   // Message handling //
