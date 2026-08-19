@@ -30,7 +30,12 @@ import {
   parseMeetingPlatformConfiguration,
   reportMeetingLifecyclePublishOutcome
 } from './meetingIntegration';
-import { actorSemanticsVersion, createCraigLifecycleV3Producer, sealedActorRosterCapabilityId } from './meetingLifecycleV3';
+import {
+  actorSemanticsVersion,
+  craigActorClassificationPolicyForConfiguration,
+  createCraigLifecycleV3Producer,
+  sealedActorRosterCapabilityId
+} from './meetingLifecycleV3';
 
 const logger: MeetingIntegrationLogger = {
   debug: () => {},
@@ -57,6 +62,12 @@ const lifecycleV3Config = {
   actorSemanticsVersion,
   producerCapabilityId: sealedActorRosterCapabilityId,
   producerRevision: '0123456789abcdef0123456789abcdef01234567'
+};
+const lifecycleV3ActorClassificationPolicy = craigActorClassificationPolicyForConfiguration(lifecycleV3Config);
+const lifecycleV3E2eConfig = {
+  ...lifecycleV3Config,
+  e2eTestOnly: true as const,
+  e2eSyntheticHumanActorIds: ['1533227577286852649']
 };
 
 test('cancellation timestamp conversion accepts the four-digit year maximum and rejects expanded years', () => {
@@ -1223,6 +1234,29 @@ test('keeps lifecycle v1 compatibility by default and admits v3 only behind the 
     }
   );
   assert.deepEqual(sink.lifecycleProducerConfiguration, lifecycleV3Config);
+  const e2eLifecycle = createCraigLifecycleV3Producer(
+    {
+      ...lifecycleV3Config,
+      e2eTestOnly: true,
+      e2eSyntheticHumanActorIds: [event.participantIds[0]]
+    },
+    {
+      recordingId: 'recording-policy-mismatch',
+      guildId: event.guildId,
+      channelId: event.channelId
+    }
+  );
+  const e2eStarted = e2eLifecycle.started(
+    {
+      eventId: 'recording-policy-mismatch:v3:1',
+      recordingId: 'recording-policy-mismatch',
+      guildId: event.guildId,
+      channelId: event.channelId,
+      occurredAt: event.occurredAt
+    },
+    [{ id: event.participantIds[0], bot: true, system: false, webhook: false }]
+  );
+  assert.equal(sink.publishLifecycle(e2eStarted, e2eLifecycle.durableAdmission()).status, 'persistence-failed');
   const started = lifecycle.started(
     { eventId: 'recording-1:v3:1', recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: event.occurredAt },
     [{ id: event.participantIds[0], bot: false, system: false, webhook: false }]
@@ -1330,6 +1364,63 @@ test('persists lifecycle v3 context, producer, event order, and pending outbox a
   );
   await restored.restoreOriginalRecordingJobs();
   assert.equal(await restored.drain(0), false);
+});
+
+test('restart migrates legacy production policy but quarantines cross-policy lifecycle state before enqueue', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-policy-recovery-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const makeSnapshot = (config: typeof lifecycleV3Config | typeof lifecycleV3E2eConfig, recordingId: string, bot: boolean) => {
+    const lifecycle = createCraigLifecycleV3Producer(config, {
+      recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId
+    });
+    lifecycle.started(
+      { eventId: `${recordingId}:start`, recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: event.occurredAt },
+      [{ id: event.participantIds[0], bot, system: false, webhook: false }]
+    );
+    lifecycle.terminal(
+      { eventId: `${recordingId}:abort`, recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: terminalEvent.occurredAt },
+      'meeting.aborted',
+      'test recovery'
+    );
+    return JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
+  };
+  const restore = async (
+    name: string,
+    activeConfig: typeof lifecycleV3Config | typeof lifecycleV3E2eConfig,
+    snapshot: Record<string, unknown>
+  ) => {
+    const outboxRoot = path.join(root, name);
+    const pendingRoot = path.join(outboxRoot, 'lifecycle-v3', 'pending');
+    await mkdir(pendingRoot, { recursive: true });
+    await writeFile(path.join(pendingRoot, `${snapshot.recordingId}.json`), `${JSON.stringify(snapshot)}\n`);
+    const delivered: MeetingLifecycleEvent[] = [];
+    const sink = new BoundedMeetingIntegrationSink(
+      { post: async (_requestPath, body) => { delivered.push(body as MeetingLifecycleEvent); } },
+      logger,
+      4,
+      2,
+      1024,
+      { recordingRoot: path.join(root, 'recordings'), outboxRoot },
+      activeConfig
+    );
+    await sink.restoreOriginalRecordingJobs();
+    await sink.drain(1000);
+    const rejectedRoot = path.join(outboxRoot, 'lifecycle-v3', 'rejected');
+    return { delivered, rejected: await readdir(rejectedRoot) };
+  };
+
+  const legacyProduction = makeSnapshot(lifecycleV3Config, 'legacy-production-policy', false);
+  delete legacyProduction.actorClassificationPolicy;
+  const migrated = await restore('legacy-production', lifecycleV3Config, legacyProduction);
+  assert.deepEqual(migrated.delivered.map(({ type }) => type), ['meeting.started', 'meeting.aborted']);
+  assert.deepEqual(migrated.rejected, []);
+
+  const e2eSnapshot = makeSnapshot(lifecycleV3E2eConfig, 'e2e-policy-under-production', true);
+  const quarantined = await restore('cross-policy', lifecycleV3Config, e2eSnapshot);
+  assert.deepEqual(quarantined.delivered, []);
+  assert.deepEqual(quarantined.rejected, ['e2e-policy-under-production.json']);
 });
 
 test('replays the exact ordered lifecycle v3 outbox and sealed ready event after a crash', async (context) => {
@@ -2032,7 +2123,8 @@ test('lifecycle v3 COMPLETE and ACK hot paths have constant persistence for N=10
     const state = {
       snapshot: {
         schemaVersion: 3, recordingId, guildId: event.guildId, channelId: event.channelId,
-        producer: lifecycleV3Config, actorObservationState: 'consistent', actors: rosterMaterializationTrap,
+        producer: lifecycleV3Config, actorClassificationPolicy: lifecycleV3ActorClassificationPolicy,
+        actorObservationState: 'consistent', actors: rosterMaterializationTrap,
         sealedReady: null, emitted: [], pendingOutbox: []
       },
       actorIndex: new Map(actors.map((actor) => [actor.actorId, actor])),
@@ -2122,6 +2214,7 @@ test('lifecycle v3 maintenance ticks are K-bounded for N=128 and N=5000 and even
     const base = {
       schemaVersion: 2, generation: 0, baseSequence: 128, recordingId,
       guildId: event.guildId, channelId: event.channelId, producer: lifecycleV3Config,
+      actorClassificationPolicy: lifecycleV3ActorClassificationPolicy,
       actorObservationState: 'consistent', actors, sealedReady: null
     };
     (sink as any).publishLifecycleV3Generation(journalRoot, base, 128);
@@ -2186,6 +2279,7 @@ test('production lifecycle maintenance scheduler fairly compacts two interleaved
     const base = {
       schemaVersion: 2, generation: 0, baseSequence: 128, recordingId,
       guildId: event.guildId, channelId: event.channelId, producer: lifecycleV3Config,
+      actorClassificationPolicy: lifecycleV3ActorClassificationPolicy,
       actorObservationState: 'consistent', actors, sealedReady: null
     };
     (sink as any).publishLifecycleV3Generation(journalRoot, base, 128);
@@ -2271,6 +2365,7 @@ test('lifecycle v3 recovery rejects torn chunks and descriptors and falls back t
   const base = {
     schemaVersion: 2, generation: 0, baseSequence: 128, recordingId,
     guildId: event.guildId, channelId: event.channelId, producer: lifecycleV3Config,
+    actorClassificationPolicy: lifecycleV3ActorClassificationPolicy,
     actorObservationState: 'consistent', actors: [{ actorId: event.participantIds[0], kind: 'human' }], sealedReady: null
   };
   (sink as any).publishLifecycleV3Generation(journalRoot, base, 128);
@@ -2352,6 +2447,7 @@ test('lifecycle v3 table-driven crash matrix recovers every durable maintenance 
     const base = {
       schemaVersion: 2, generation: 0, baseSequence: 0, recordingId,
       guildId: event.guildId, channelId: event.channelId, producer: lifecycleV3Config,
+      actorClassificationPolicy: lifecycleV3ActorClassificationPolicy,
       actorObservationState: 'consistent', actors, sealedReady: null
     };
     (sink as any).publishLifecycleV3Generation(journalRoot, base, 0);
@@ -2424,6 +2520,7 @@ test('lifecycle v3 long-run append ACK compaction and restart keeps physical ind
       actorSemanticsVersion, producerCapabilityId: sealedActorRosterCapabilityId,
       producerRevision: lifecycleV3Config.producerRevision
     },
+    actorClassificationPolicy: lifecycleV3ActorClassificationPolicy,
     actorObservationState: 'consistent' as const, actors: [firstActor], sealedReady: null
   };
   const started = {

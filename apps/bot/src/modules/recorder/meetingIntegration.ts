@@ -26,11 +26,13 @@ import {
   createAuthoritativeCancellationPcmFenceLog
 } from './meetingCancellationPcmFenceV10';
 import {
-  type CraigLifecycleV3Event,
   type CraigLifecycleV3Admission,
+  type CraigLifecycleV3Event,
   type DurableCraigLifecycleV3Snapshot,
   type MeetingLifecycleProducerConfiguration,
+  craigActorClassificationPolicyForConfiguration,
   parseMeetingLifecycleProducerConfiguration,
+  restoreCraigLifecycleV3ProducerForConfiguration,
   restoreCraigLifecycleV3ProducerFromSnapshot
 } from './meetingLifecycleV3';
 
@@ -620,7 +622,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       const job = createOriginalRecordingJob(input, this.recordingRoot);
       await this.ensureOriginalOutboxDirectories();
       const filePath = path.join(this.pendingOriginalRoot, `${job.recordingId}.json`);
-      const existing = await readOriginalRecordingJob(filePath).catch((error: NodeJS.ErrnoException) => {
+      const existing = await readOriginalRecordingJob(filePath, this.lifecycleProducerConfiguration).catch((error: NodeJS.ErrnoException) => {
         if (error.code === 'ENOENT') return undefined;
         throw error;
       });
@@ -746,7 +748,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       for (const entry of entries) {
         const filePath = path.join(this.pendingOriginalRoot, entry);
         try {
-          const job = await readOriginalRecordingJob(filePath);
+          const job = await readOriginalRecordingJob(filePath, this.lifecycleProducerConfiguration);
+          this.assertLifecycleV3SnapshotMatchesActivePolicy(job.lifecycleV3Snapshot);
           this.enqueueOriginalJob({
             filePath,
             job
@@ -907,14 +910,24 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
         configured.producerRevision !== admission.producer.producerRevision
       )
         throw new Error('Lifecycle v3 durable admission does not match the active producer rollout');
+      if (canonicalJson(craigActorClassificationPolicyForConfiguration(configured)) !== canonicalJson(admission.actorClassificationPolicy))
+        throw new Error('Lifecycle v3 durable admission does not match the active actor classification policy');
     }
-    if (admission !== undefined && (admission.recordingId !== event.recordingId || admission.guildId !== event.guildId || admission.channelId !== event.channelId))
+    if (
+      admission !== undefined &&
+      (admission.recordingId !== event.recordingId || admission.guildId !== event.guildId || admission.channelId !== event.channelId)
+    )
       throw new Error('Lifecycle v3 durable admission context is inconsistent');
-    if (admission !== undefined && journal !== undefined &&
-        (canonicalJson(admission.producer) !== canonicalJson(journal.snapshot.producer) ||
-         admission.recordingId !== journal.snapshot.recordingId || admission.guildId !== journal.snapshot.guildId ||
-         admission.channelId !== journal.snapshot.channelId))
-      throw new Error('Lifecycle v3 durable admission changed its indexed producer identity');
+    if (
+      admission !== undefined &&
+      journal !== undefined &&
+      (canonicalJson(admission.producer) !== canonicalJson(journal.snapshot.producer) ||
+        canonicalJson(admission.actorClassificationPolicy) !== canonicalJson(journal.snapshot.actorClassificationPolicy) ||
+        admission.recordingId !== journal.snapshot.recordingId ||
+        admission.guildId !== journal.snapshot.guildId ||
+        admission.channelId !== journal.snapshot.channelId)
+    )
+      throw new Error('Lifecycle v3 durable admission changed its indexed producer identity or actor classification policy');
     this.appendLifecycleV3Event(admission, event, journal?.nextSequence ?? 0);
   }
 
@@ -930,11 +943,24 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       if (canonicalJson(durableEvent) !== canonicalJson(event))
         throw new Error('Lifecycle v3 immutable admission segment conflicts with its retry');
     } else this.writeDurableJson(segment, event);
-    if (previous === undefined) this.publishLifecycleV3Generation(root, {
-      schemaVersion: 2, generation: 0, recordingId: admission!.recordingId, guildId: admission!.guildId,
-      channelId: admission!.channelId, producer: admission!.producer, baseSequence: 0,
-      actorObservationState: admission!.actorObservationState, actors: admission!.actors, sealedReady: admission!.sealedReady
-    }, 0);
+    if (previous === undefined)
+      this.publishLifecycleV3Generation(
+        root,
+        {
+          schemaVersion: 2,
+          generation: 0,
+          recordingId: admission!.recordingId,
+          guildId: admission!.guildId,
+          channelId: admission!.channelId,
+          producer: admission!.producer,
+          baseSequence: 0,
+          actorClassificationPolicy: admission!.actorClassificationPolicy,
+          actorObservationState: admission!.actorObservationState,
+          actors: admission!.actors,
+          sealedReady: admission!.sealedReady
+        },
+        0
+      );
     const pendingEvents = previous?.pendingEvents ?? new Map<number, CraigLifecycleV3Event>();
     pendingEvents.set(sequence, event);
     const eventDigests = previous?.eventDigests ?? new Map<string, string>();
@@ -946,8 +972,15 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     this.lifecycleV3JournalIndex.set(event.recordingId, {
       snapshot: {
         schemaVersion: 3,
-        recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId,
-        producer: { actorSemanticsVersion: event.actorSemanticsVersion, producerCapabilityId: event.producerCapabilityId, producerRevision: event.producerRevision },
+        recordingId: event.recordingId,
+        guildId: event.guildId,
+        channelId: event.channelId,
+        producer: {
+          actorSemanticsVersion: event.actorSemanticsVersion,
+          producerCapabilityId: event.producerCapabilityId,
+          producerRevision: event.producerRevision
+        },
+        actorClassificationPolicy: priorSnapshot?.actorClassificationPolicy ?? admission!.actorClassificationPolicy,
         actorObservationState: event.actorObservationState, actors: priorSnapshot?.actors ?? admission!.actors,
         sealedReady: event.type === 'recording.authoritative_ready' ? event : priorSnapshot?.sealedReady ?? null,
         emitted: previous?.snapshot.emitted ?? [],
@@ -1174,9 +1207,11 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     }
     const actors = [...actorIndex.values()].sort((left, right) => left.actorId.localeCompare(right.actorId));
     const last = retained[retained.length - 1].event;
-    const snapshot = restoreCraigLifecycleV3ProducerFromSnapshot({
+    const snapshot = restoreCraigLifecycleV3ProducerForConfiguration(this.lifecycleProducerConfiguration, {
       schemaVersion: 3, recordingId: checkpoint.recordingId, guildId: checkpoint.guildId, channelId: checkpoint.channelId,
-      producer: checkpoint.producer, actorObservationState: last.actorObservationState ?? checkpoint.actorObservationState, actors,
+      producer: checkpoint.producer,
+      actorClassificationPolicy: checkpoint.actorClassificationPolicy,
+      actorObservationState: last.actorObservationState ?? checkpoint.actorObservationState, actors,
       emitted: events.map(({ eventId, occurredAt, type }) => ({ eventId, occurredAt, type })), pendingOutbox: events,
       sealedReady
     }).durableSnapshot();
@@ -1227,7 +1262,15 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     }
     const filePath = path.join(this.pendingLifecycleV3Root, `${recordingId}.json`);
     if (!existsSync(filePath)) return undefined;
-    return restoreCraigLifecycleV3ProducerFromSnapshot(JSON.parse(readFileSync(filePath, 'utf8')) as unknown).durableSnapshot();
+    return restoreCraigLifecycleV3ProducerForConfiguration(
+      this.lifecycleProducerConfiguration,
+      JSON.parse(readFileSync(filePath, 'utf8')) as unknown
+    ).durableSnapshot();
+  }
+
+  private assertLifecycleV3SnapshotMatchesActivePolicy(snapshot: DurableCraigLifecycleV3Snapshot | undefined): void {
+    if (snapshot === undefined) return;
+    restoreCraigLifecycleV3ProducerForConfiguration(this.lifecycleProducerConfiguration, snapshot);
   }
 
   private restoreLifecycleV3Admissions(): void {
@@ -1241,6 +1284,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       try {
         const recordingId = entry.endsWith('.journal') ? entry.slice(0, -'.journal'.length) : entry.slice(0, -'.json'.length);
         const snapshot = this.readLifecycleV3Snapshot(recordingId)!;
+        this.assertLifecycleV3SnapshotMatchesActivePolicy(snapshot);
         const journal = entry.endsWith('.journal') ? this.readLifecycleV3Journal(recordingId) : undefined;
         if (entry !== `${snapshot.recordingId}.json` && entry !== `${snapshot.recordingId}.journal`)
           throw new Error('Lifecycle v3 durable snapshot filename does not match its recording');
@@ -2400,7 +2444,10 @@ function syncDirectorySync(directoryPath: string): void {
   }
 }
 
-async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecordingOutboxJob> {
+async function readOriginalRecordingJob(
+  filePath: string,
+  lifecycleProducerConfiguration: MeetingLifecycleProducerConfiguration
+): Promise<OriginalRecordingOutboxJob> {
   const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
   if (!isRecord(parsed) || (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3))
     throw new Error('Original recording outbox job has an unsupported schema');
@@ -2450,7 +2497,10 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
   let terminalEvent: AnyMeetingTerminalLifecycleEvent;
   let lifecycleV3Snapshot: DurableCraigLifecycleV3Snapshot | undefined;
   if (parsed.schemaVersion === 3) {
-    lifecycleV3Snapshot = restoreCraigLifecycleV3ProducerFromSnapshot(rawLifecycleV3Snapshot).durableSnapshot();
+    lifecycleV3Snapshot = restoreCraigLifecycleV3ProducerForConfiguration(
+      lifecycleProducerConfiguration,
+      rawLifecycleV3Snapshot
+    ).durableSnapshot();
     const snapshotStarted = lifecycleV3Snapshot.pendingOutbox.find(
       (event) => event.type === 'meeting.started' && isRecord(rawStartedEvent) && event.eventId === rawStartedEvent.eventId
     );

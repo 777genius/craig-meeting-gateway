@@ -12,6 +12,7 @@ import {
   maximumCraigPendingLifecycleEvents,
   maximumE2eSyntheticHumanActors,
   parseMeetingLifecycleProducerConfiguration,
+  restoreCraigLifecycleV3ProducerForConfiguration,
   restoreCraigLifecycleV3ProducerFromSnapshot,
   sealedActorRosterCapabilityId,
   selectCraigKnowledgeEligibleActorIds
@@ -76,6 +77,8 @@ test('maps only explicitly allowlisted E2E bots to synthetic humans behind the t
     automation
   );
   assert.deepEqual(left.actor, { actorId: automation.id, kind: 'human' });
+  assert.throws(() => createCraigLifecycleV3Producer(config, context, lifecycle.durableSnapshot()), /another actor classification policy/);
+  assert.deepEqual(restoreCraigLifecycleV3ProducerFromSnapshot(lifecycle.durableSnapshot()).durableSnapshot(), lifecycle.durableSnapshot());
 });
 
 test('rejects malformed or unguarded E2E synthetic human actor configuration', () => {
@@ -194,6 +197,12 @@ test('snapshot binds producer, recording context, event order, and pending exact
   lifecycle.participant({ ...envelope, eventId: 'recording-1:2', occurredAt: '2026-08-13T00:00:01.000Z' }, 'participant.joined', automation);
   const snapshot = JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
   assert.deepEqual(restoreCraigLifecycleV3ProducerFromSnapshot(snapshot).durableSnapshot(), snapshot);
+  const missingClassificationPolicy = JSON.parse(JSON.stringify(snapshot));
+  delete missingClassificationPolicy.actorClassificationPolicy;
+  assert.throws(
+    () => restoreCraigLifecycleV3ProducerFromSnapshot(missingClassificationPolicy),
+    /classification policy is malformed/
+  );
   assert.deepEqual(
     snapshot.emitted,
     snapshot.pendingOutbox.map(({ eventId, occurredAt, type }: any) => ({ eventId, occurredAt, type }))
@@ -214,6 +223,38 @@ test('snapshot binds producer, recording context, event order, and pending exact
   assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(missingPinned), /omits pinned evidence/);
   snapshot.pendingOutbox[0].recordingId = 'other-recording';
   assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(snapshot), /another recording context/);
+});
+
+test('active policy recovery migrates only legacy production snapshots and rejects cross-policy replay', () => {
+  const lifecycle = createCraigLifecycleV3Producer(config, context);
+  lifecycle.started(envelope, [human]);
+  const snapshot = JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
+  const legacyProduction = JSON.parse(JSON.stringify(snapshot));
+  delete legacyProduction.actorClassificationPolicy;
+  assert.deepEqual(
+    restoreCraigLifecycleV3ProducerForConfiguration(config, legacyProduction).durableSnapshot(),
+    snapshot
+  );
+
+  const e2eConfig = {
+    ...config,
+    e2eTestOnly: true as const,
+    e2eSyntheticHumanActorIds: [automation.id]
+  };
+  assert.throws(
+    () => restoreCraigLifecycleV3ProducerForConfiguration(e2eConfig, legacyProduction),
+    /cannot be restored under E2E configuration/
+  );
+  const e2eLifecycle = createCraigLifecycleV3Producer(e2eConfig, context);
+  e2eLifecycle.started(envelope, [automation]);
+  assert.throws(
+    () => restoreCraigLifecycleV3ProducerForConfiguration(config, e2eLifecycle.durableSnapshot()),
+    /another actor classification policy/
+  );
+  assert.throws(
+    () => restoreCraigLifecycleV3ProducerForConfiguration(e2eConfig, snapshot),
+    /another actor classification policy/
+  );
 });
 
 test('rejects producer and envelope unknown keys exactly', () => {
