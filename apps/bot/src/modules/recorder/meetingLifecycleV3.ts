@@ -618,6 +618,34 @@ export function restoreCraigLifecycleV3ProducerFromSnapshot(value: unknown): Cra
   return CraigLifecycleV3Producer.restore(config, context, value);
 }
 
+/**
+ * Restores durable state against the active rollout instead of trusting the
+ * policy self-described by the snapshot. The only legacy migration supported
+ * here is a pre-policy v3 snapshot under the production policy: that state was
+ * emitted before the test-only classification mode existed. Missing policy
+ * evidence is never upgraded while an E2E policy is active.
+ */
+export function restoreCraigLifecycleV3ProducerForConfiguration(
+  config: MeetingLifecycleProducerConfiguration,
+  value: unknown
+): CraigLifecycleV3Producer {
+  const parsedConfig = parseMeetingLifecycleProducerConfiguration(config);
+  if (!isRecord(value)) throw new Error('Durable lifecycle snapshot is malformed');
+  // A v1 rollback has no synthetic-identity mode and therefore represents the
+  // same production Discord-authenticated policy for draining older v3 state.
+  const expectedPolicy = createActorClassificationPolicy(
+    new Set(parsedConfig.schemaVersion === 3 ? parsedConfig.e2eSyntheticHumanActorIds ?? [] : [])
+  );
+  const hasStoredPolicy = value.actorClassificationPolicy !== undefined;
+  if (!hasStoredPolicy && expectedPolicy.mode !== 'discord-authenticated')
+    throw new Error('Legacy lifecycle v3 snapshot without actor classification policy cannot be restored under E2E configuration');
+  const migrated = hasStoredPolicy ? value : { ...value, actorClassificationPolicy: expectedPolicy };
+  const lifecycle = restoreCraigLifecycleV3ProducerFromSnapshot(migrated);
+  if (canonicalJson(lifecycle.durableSnapshot().actorClassificationPolicy) !== canonicalJson(expectedPolicy))
+    throw new Error('Durable lifecycle snapshot belongs to another actor classification policy');
+  return lifecycle;
+}
+
 function createActorClassificationPolicy(e2eSyntheticHumanActorIds: ReadonlySet<string>): CraigActorClassificationPolicy {
   const actorIds = [...e2eSyntheticHumanActorIds].sort();
   return Object.freeze({

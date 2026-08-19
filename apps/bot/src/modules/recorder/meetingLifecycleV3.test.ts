@@ -12,6 +12,7 @@ import {
   maximumCraigPendingLifecycleEvents,
   maximumE2eSyntheticHumanActors,
   parseMeetingLifecycleProducerConfiguration,
+  restoreCraigLifecycleV3ProducerForConfiguration,
   restoreCraigLifecycleV3ProducerFromSnapshot,
   sealedActorRosterCapabilityId,
   selectCraigKnowledgeEligibleActorIds
@@ -222,6 +223,38 @@ test('snapshot binds producer, recording context, event order, and pending exact
   assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(missingPinned), /omits pinned evidence/);
   snapshot.pendingOutbox[0].recordingId = 'other-recording';
   assert.throws(() => restoreCraigLifecycleV3ProducerFromSnapshot(snapshot), /another recording context/);
+});
+
+test('active policy recovery migrates only legacy production snapshots and rejects cross-policy replay', () => {
+  const lifecycle = createCraigLifecycleV3Producer(config, context);
+  lifecycle.started(envelope, [human]);
+  const snapshot = JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
+  const legacyProduction = JSON.parse(JSON.stringify(snapshot));
+  delete legacyProduction.actorClassificationPolicy;
+  assert.deepEqual(
+    restoreCraigLifecycleV3ProducerForConfiguration(config, legacyProduction).durableSnapshot(),
+    snapshot
+  );
+
+  const e2eConfig = {
+    ...config,
+    e2eTestOnly: true as const,
+    e2eSyntheticHumanActorIds: [automation.id]
+  };
+  assert.throws(
+    () => restoreCraigLifecycleV3ProducerForConfiguration(e2eConfig, legacyProduction),
+    /cannot be restored under E2E configuration/
+  );
+  const e2eLifecycle = createCraigLifecycleV3Producer(e2eConfig, context);
+  e2eLifecycle.started(envelope, [automation]);
+  assert.throws(
+    () => restoreCraigLifecycleV3ProducerForConfiguration(config, e2eLifecycle.durableSnapshot()),
+    /another actor classification policy/
+  );
+  assert.throws(
+    () => restoreCraigLifecycleV3ProducerForConfiguration(e2eConfig, snapshot),
+    /another actor classification policy/
+  );
 });
 
 test('rejects producer and envelope unknown keys exactly', () => {

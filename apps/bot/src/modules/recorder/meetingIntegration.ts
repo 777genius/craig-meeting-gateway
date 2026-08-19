@@ -32,6 +32,7 @@ import {
   type MeetingLifecycleProducerConfiguration,
   craigActorClassificationPolicyForConfiguration,
   parseMeetingLifecycleProducerConfiguration,
+  restoreCraigLifecycleV3ProducerForConfiguration,
   restoreCraigLifecycleV3ProducerFromSnapshot
 } from './meetingLifecycleV3';
 
@@ -621,7 +622,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       const job = createOriginalRecordingJob(input, this.recordingRoot);
       await this.ensureOriginalOutboxDirectories();
       const filePath = path.join(this.pendingOriginalRoot, `${job.recordingId}.json`);
-      const existing = await readOriginalRecordingJob(filePath).catch((error: NodeJS.ErrnoException) => {
+      const existing = await readOriginalRecordingJob(filePath, this.lifecycleProducerConfiguration).catch((error: NodeJS.ErrnoException) => {
         if (error.code === 'ENOENT') return undefined;
         throw error;
       });
@@ -747,7 +748,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       for (const entry of entries) {
         const filePath = path.join(this.pendingOriginalRoot, entry);
         try {
-          const job = await readOriginalRecordingJob(filePath);
+          const job = await readOriginalRecordingJob(filePath, this.lifecycleProducerConfiguration);
+          this.assertLifecycleV3SnapshotMatchesActivePolicy(job.lifecycleV3Snapshot);
           this.enqueueOriginalJob({
             filePath,
             job
@@ -1205,7 +1207,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     }
     const actors = [...actorIndex.values()].sort((left, right) => left.actorId.localeCompare(right.actorId));
     const last = retained[retained.length - 1].event;
-    const snapshot = restoreCraigLifecycleV3ProducerFromSnapshot({
+    const snapshot = restoreCraigLifecycleV3ProducerForConfiguration(this.lifecycleProducerConfiguration, {
       schemaVersion: 3, recordingId: checkpoint.recordingId, guildId: checkpoint.guildId, channelId: checkpoint.channelId,
       producer: checkpoint.producer,
       actorClassificationPolicy: checkpoint.actorClassificationPolicy,
@@ -1260,7 +1262,15 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     }
     const filePath = path.join(this.pendingLifecycleV3Root, `${recordingId}.json`);
     if (!existsSync(filePath)) return undefined;
-    return restoreCraigLifecycleV3ProducerFromSnapshot(JSON.parse(readFileSync(filePath, 'utf8')) as unknown).durableSnapshot();
+    return restoreCraigLifecycleV3ProducerForConfiguration(
+      this.lifecycleProducerConfiguration,
+      JSON.parse(readFileSync(filePath, 'utf8')) as unknown
+    ).durableSnapshot();
+  }
+
+  private assertLifecycleV3SnapshotMatchesActivePolicy(snapshot: DurableCraigLifecycleV3Snapshot | undefined): void {
+    if (snapshot === undefined) return;
+    restoreCraigLifecycleV3ProducerForConfiguration(this.lifecycleProducerConfiguration, snapshot);
   }
 
   private restoreLifecycleV3Admissions(): void {
@@ -1274,6 +1284,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       try {
         const recordingId = entry.endsWith('.journal') ? entry.slice(0, -'.journal'.length) : entry.slice(0, -'.json'.length);
         const snapshot = this.readLifecycleV3Snapshot(recordingId)!;
+        this.assertLifecycleV3SnapshotMatchesActivePolicy(snapshot);
         const journal = entry.endsWith('.journal') ? this.readLifecycleV3Journal(recordingId) : undefined;
         if (entry !== `${snapshot.recordingId}.json` && entry !== `${snapshot.recordingId}.journal`)
           throw new Error('Lifecycle v3 durable snapshot filename does not match its recording');
@@ -2433,7 +2444,10 @@ function syncDirectorySync(directoryPath: string): void {
   }
 }
 
-async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecordingOutboxJob> {
+async function readOriginalRecordingJob(
+  filePath: string,
+  lifecycleProducerConfiguration: MeetingLifecycleProducerConfiguration
+): Promise<OriginalRecordingOutboxJob> {
   const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
   if (!isRecord(parsed) || (parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3))
     throw new Error('Original recording outbox job has an unsupported schema');
@@ -2483,7 +2497,10 @@ async function readOriginalRecordingJob(filePath: string): Promise<OriginalRecor
   let terminalEvent: AnyMeetingTerminalLifecycleEvent;
   let lifecycleV3Snapshot: DurableCraigLifecycleV3Snapshot | undefined;
   if (parsed.schemaVersion === 3) {
-    lifecycleV3Snapshot = restoreCraigLifecycleV3ProducerFromSnapshot(rawLifecycleV3Snapshot).durableSnapshot();
+    lifecycleV3Snapshot = restoreCraigLifecycleV3ProducerForConfiguration(
+      lifecycleProducerConfiguration,
+      rawLifecycleV3Snapshot
+    ).durableSnapshot();
     const snapshotStarted = lifecycleV3Snapshot.pendingOutbox.find(
       (event) => event.type === 'meeting.started' && isRecord(rawStartedEvent) && event.eventId === rawStartedEvent.eventId
     );

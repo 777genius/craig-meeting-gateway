@@ -64,6 +64,11 @@ const lifecycleV3Config = {
   producerRevision: '0123456789abcdef0123456789abcdef01234567'
 };
 const lifecycleV3ActorClassificationPolicy = craigActorClassificationPolicyForConfiguration(lifecycleV3Config);
+const lifecycleV3E2eConfig = {
+  ...lifecycleV3Config,
+  e2eTestOnly: true as const,
+  e2eSyntheticHumanActorIds: ['1533227577286852649']
+};
 
 test('cancellation timestamp conversion accepts the four-digit year maximum and rejects expanded years', () => {
   assert.equal(dateMillisecondsToIsoOrThrow(253_402_300_799_999, 'cancellationObservedAtMs'), '9999-12-31T23:59:59.999Z');
@@ -1359,6 +1364,63 @@ test('persists lifecycle v3 context, producer, event order, and pending outbox a
   );
   await restored.restoreOriginalRecordingJobs();
   assert.equal(await restored.drain(0), false);
+});
+
+test('restart migrates legacy production policy but quarantines cross-policy lifecycle state before enqueue', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-policy-recovery-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const makeSnapshot = (config: typeof lifecycleV3Config | typeof lifecycleV3E2eConfig, recordingId: string, bot: boolean) => {
+    const lifecycle = createCraigLifecycleV3Producer(config, {
+      recordingId,
+      guildId: event.guildId,
+      channelId: event.channelId
+    });
+    lifecycle.started(
+      { eventId: `${recordingId}:start`, recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: event.occurredAt },
+      [{ id: event.participantIds[0], bot, system: false, webhook: false }]
+    );
+    lifecycle.terminal(
+      { eventId: `${recordingId}:abort`, recordingId, guildId: event.guildId, channelId: event.channelId, occurredAt: terminalEvent.occurredAt },
+      'meeting.aborted',
+      'test recovery'
+    );
+    return JSON.parse(JSON.stringify(lifecycle.durableSnapshot()));
+  };
+  const restore = async (
+    name: string,
+    activeConfig: typeof lifecycleV3Config | typeof lifecycleV3E2eConfig,
+    snapshot: Record<string, unknown>
+  ) => {
+    const outboxRoot = path.join(root, name);
+    const pendingRoot = path.join(outboxRoot, 'lifecycle-v3', 'pending');
+    await mkdir(pendingRoot, { recursive: true });
+    await writeFile(path.join(pendingRoot, `${snapshot.recordingId}.json`), `${JSON.stringify(snapshot)}\n`);
+    const delivered: MeetingLifecycleEvent[] = [];
+    const sink = new BoundedMeetingIntegrationSink(
+      { post: async (_requestPath, body) => { delivered.push(body as MeetingLifecycleEvent); } },
+      logger,
+      4,
+      2,
+      1024,
+      { recordingRoot: path.join(root, 'recordings'), outboxRoot },
+      activeConfig
+    );
+    await sink.restoreOriginalRecordingJobs();
+    await sink.drain(1000);
+    const rejectedRoot = path.join(outboxRoot, 'lifecycle-v3', 'rejected');
+    return { delivered, rejected: await readdir(rejectedRoot) };
+  };
+
+  const legacyProduction = makeSnapshot(lifecycleV3Config, 'legacy-production-policy', false);
+  delete legacyProduction.actorClassificationPolicy;
+  const migrated = await restore('legacy-production', lifecycleV3Config, legacyProduction);
+  assert.deepEqual(migrated.delivered.map(({ type }) => type), ['meeting.started', 'meeting.aborted']);
+  assert.deepEqual(migrated.rejected, []);
+
+  const e2eSnapshot = makeSnapshot(lifecycleV3E2eConfig, 'e2e-policy-under-production', true);
+  const quarantined = await restore('cross-policy', lifecycleV3Config, e2eSnapshot);
+  assert.deepEqual(quarantined.delivered, []);
+  assert.deepEqual(quarantined.rejected, ['e2e-policy-under-production.json']);
 });
 
 test('replays the exact ordered lifecycle v3 outbox and sealed ready event after a crash', async (context) => {
