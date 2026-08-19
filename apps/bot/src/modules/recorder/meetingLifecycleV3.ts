@@ -2,6 +2,7 @@ export const sealedActorRosterCapabilityId = 'meeting.lifecycle.sealed-actor-ros
 export const actorSemanticsVersion = 1 as const;
 export const meetingLifecycleV3SchemaVersion = 3 as const;
 export const maximumCraigActorRosterSize = 1_000 as const;
+export const maximumE2eSyntheticHumanActors = 128 as const;
 /** Hard fail-closed bound for one recording's unacknowledged durable journal. */
 export const maximumCraigPendingLifecycleEvents = 1_024 as const;
 
@@ -26,7 +27,15 @@ export type CraigProducerIdentity = Readonly<{
 }>;
 
 export type CraigLifecycleContext = Readonly<{ recordingId: string; guildId: string; channelId: string }>;
-export type MeetingLifecycleProducerConfiguration = Readonly<{ schemaVersion: 1 }> | Readonly<{ schemaVersion: 3 } & CraigProducerIdentity>;
+export type MeetingLifecycleProducerConfiguration =
+  | Readonly<{ schemaVersion: 1 }>
+  | Readonly<
+      { schemaVersion: 3 } & CraigProducerIdentity &
+        Partial<{
+          e2eTestOnly: true;
+          e2eSyntheticHumanActorIds: readonly string[];
+        }>
+    >;
 export type CraigLifecycleEnvelope = CraigLifecycleContext & Readonly<{ eventId: string; occurredAt: string }>;
 
 interface CraigLifecycleV3Envelope extends CraigLifecycleEnvelope, CraigProducerIdentity {
@@ -83,16 +92,12 @@ export type CraigLifecycleV3Admission = Readonly<{
  * producer-sealed roster. Automation, incomplete identity evidence, and any
  * contradictory observation are never eligible.
  */
-export function selectCraigKnowledgeEligibleActorIds(
-  ready: CraigLifecycleV3Event,
-  authoritativeTrackActorIds: readonly string[]
-): string[] {
+export function selectCraigKnowledgeEligibleActorIds(ready: CraigLifecycleV3Event, authoritativeTrackActorIds: readonly string[]): string[] {
   const parsed = parseV3Event(ready);
   if (parsed.type !== 'recording.authoritative_ready') throw new Error('Knowledge eligibility requires a sealed authoritative-ready event');
   if (!Array.isArray(authoritativeTrackActorIds)) throw new Error('Authoritative track actor identities are invalid');
   const trackActorIds = authoritativeTrackActorIds.map((actorId) => {
-    if (typeof actorId !== 'string' || !discordSnowflake.test(actorId))
-      throw new Error('Authoritative track actor identities are invalid');
+    if (typeof actorId !== 'string' || !discordSnowflake.test(actorId)) throw new Error('Authoritative track actor identities are invalid');
     return actorId;
   });
   if (new Set(trackActorIds).size !== trackActorIds.length) throw new Error('Authoritative track actor identities are repeated');
@@ -101,17 +106,22 @@ export function selectCraigKnowledgeEligibleActorIds(
   return parsed.actors.filter(({ actorId, kind }) => kind === 'human' && tracked.has(actorId)).map(({ actorId }) => actorId);
 }
 
-export function deriveCraigActorFromDiscord(value: AuthenticatedDiscordActor): CraigActor {
+export function deriveCraigActorFromDiscord(
+  value: AuthenticatedDiscordActor,
+  e2eSyntheticHumanActorIds: ReadonlySet<string> = new Set()
+): CraigActor {
   if (!isRecord(value) || !hasOnlyKeys(value, ['id', 'bot', 'system', 'webhook']) || typeof value.id !== 'string' || !discordSnowflake.test(value.id))
     throw new Error('Authenticated Discord actor is invalid');
   for (const key of ['bot', 'system', 'webhook'] as const)
     if (value[key] !== undefined && typeof value[key] !== 'boolean') throw new Error('Authenticated Discord actor signals are invalid');
-  const kind: CraigActorKind =
-    value.bot || value.system || value.webhook
-      ? 'automation'
-      : value.bot === false && value.system === false && value.webhook === false
-      ? 'human'
-      : 'unknown';
+  const syntheticHuman = e2eSyntheticHumanActorIds.has(value.id) && value.bot === true && value.system === false && value.webhook === false;
+  const kind: CraigActorKind = syntheticHuman
+    ? 'human'
+    : value.bot || value.system || value.webhook
+    ? 'automation'
+    : value.bot === false && value.system === false && value.webhook === false
+    ? 'human'
+    : 'unknown';
   return Object.freeze({ actorId: value.id, kind });
 }
 
@@ -121,13 +131,13 @@ export class CraigActorObservationLedger {
   private conflicted = false;
   readonly producer: CraigProducerIdentity;
 
-  constructor(producer: CraigProducerIdentity) {
+  constructor(producer: CraigProducerIdentity, private readonly e2eSyntheticHumanActorIds: ReadonlySet<string> = new Set()) {
     this.producer = freezeProducerIdentity(producer);
   }
 
   observeBatch(authenticatedActors: readonly AuthenticatedDiscordActor[]): () => void {
     if (!Array.isArray(authenticatedActors)) throw new Error('Craig actor batch is invalid');
-    const actors = authenticatedActors.map(deriveCraigActorFromDiscord);
+    const actors = authenticatedActors.map((actor) => deriveCraigActorFromDiscord(actor, this.e2eSyntheticHumanActorIds));
     const additions = new Set(actors.filter(({ actorId }) => !this.kindsByActor.has(actorId)).map(({ actorId }) => actorId));
     if (this.kindsByActor.size + additions.size > maximumCraigActorRosterSize) throw new Error('Craig actor roster exceeds its bounded size');
 
@@ -149,6 +159,14 @@ export class CraigActorObservationLedger {
     return this.conflicted ? 'conflicted' : 'consistent';
   }
 
+  classify(actor: AuthenticatedDiscordActor): CraigActor {
+    return deriveCraigActorFromDiscord(actor, this.e2eSyntheticHumanActorIds);
+  }
+
+  classificationPolicy(): ReadonlySet<string> {
+    return new Set(this.e2eSyntheticHumanActorIds);
+  }
+
   actors(): CraigActor[] {
     return [...this.kindsByActor].sort(([left], [right]) => left.localeCompare(right)).map(([actorId, kind]) => Object.freeze({ actorId, kind }));
   }
@@ -168,9 +186,10 @@ export class CraigActorObservationLedger {
   static restoreActors(
     producer: CraigProducerIdentity,
     actors: readonly CraigActor[],
-    state: 'consistent' | 'conflicted'
+    state: 'consistent' | 'conflicted',
+    e2eSyntheticHumanActorIds: ReadonlySet<string> = new Set()
   ): CraigActorObservationLedger {
-    const ledger = new CraigActorObservationLedger(producer);
+    const ledger = new CraigActorObservationLedger(producer, e2eSyntheticHumanActorIds);
     if (!Array.isArray(actors) || actors.length > maximumCraigActorRosterSize) throw new Error('Durable lifecycle snapshot actors are invalid');
     const parsed = actors.map(parseStoredActor);
     if (new Set(parsed.map(({ actorId }) => actorId)).size !== parsed.length) throw new Error('Durable lifecycle snapshot repeats an actor');
@@ -219,7 +238,7 @@ export class CraigLifecycleV3Producer {
     this.assertMutable();
     this.assertCanEmit(envelope, 2);
     const rollback = this.ledger.observeBatch([actor]);
-    return this.emit({ ...this.envelope(envelope), type, actor: deriveCraigActorFromDiscord(actor) }, rollback);
+    return this.emit({ ...this.envelope(envelope), type, actor: this.ledger.classify(actor) }, rollback);
   }
 
   connection(
@@ -257,7 +276,12 @@ export class CraigLifecycleV3Producer {
     assertContext(envelope, this.context);
     assertAuthoritativeReady(input);
     if (this.sealedReady !== null) {
-      const retryLedger = CraigActorObservationLedger.restoreActors(this.ledger.producer, this.ledger.actors(), this.ledger.observationState());
+      const retryLedger = CraigActorObservationLedger.restoreActors(
+        this.ledger.producer,
+        this.ledger.actors(),
+        this.ledger.observationState(),
+        this.ledger.classificationPolicy()
+      );
       retryLedger.observeBatch(input.actors);
       const candidate = this.buildReadyCandidate(envelope, input, retryLedger.actors(), retryLedger.observationState());
       if (canonicalJson(candidate) !== canonicalJson(this.sealedReady)) throw new Error('Conflicting authoritative-ready retry after ledger seal');
@@ -314,7 +338,12 @@ export class CraigLifecycleV3Producer {
     const index = this.pendingOutbox.findIndex((event) => event.eventId === eventId);
     if (index < 0) return;
     const event = this.pendingOutbox[index];
-    if (event.type === 'meeting.started' || event.type === 'meeting.ended' || event.type === 'meeting.aborted' || event.type === 'recording.authoritative_ready')
+    if (
+      event.type === 'meeting.started' ||
+      event.type === 'meeting.ended' ||
+      event.type === 'meeting.aborted' ||
+      event.type === 'recording.authoritative_ready'
+    )
       return;
     this.pendingOutbox.splice(index, 1);
     this.admissionRollbacks.splice(index, 1);
@@ -347,8 +376,7 @@ export class CraigLifecycleV3Producer {
   }
 
   private emit<T extends CraigLifecycleV3Event>(event: T, rollback: () => void = () => undefined): T {
-    if (this.pendingOutbox.length >= maximumCraigPendingLifecycleEvents)
-      throw new Error('Craig lifecycle durable outbox capacity is exhausted');
+    if (this.pendingOutbox.length >= maximumCraigPendingLifecycleEvents) throw new Error('Craig lifecycle durable outbox capacity is exhausted');
     if (this.emittedIds.has(event.eventId)) throw new Error('Craig lifecycle eventId was already emitted');
     const last = this.emitted[this.emitted.length - 1];
     if (last !== undefined && Date.parse(event.occurredAt) < Date.parse(last.occurredAt))
@@ -386,7 +414,14 @@ export class CraigLifecycleV3Producer {
     expectedContext: CraigLifecycleContext,
     value: unknown
   ): CraigLifecycleV3Producer {
-    const producer = freezeProducerIdentity(config);
+    const parsedConfig = parseMeetingLifecycleProducerConfiguration(config);
+    if (parsedConfig.schemaVersion !== 3) throw new Error('Lifecycle v3 restore requires an explicit v3 producer configuration');
+    const producer = parseProducerIdentity({
+      actorSemanticsVersion: parsedConfig.actorSemanticsVersion,
+      producerCapabilityId: parsedConfig.producerCapabilityId,
+      producerRevision: parsedConfig.producerRevision
+    });
+    const e2eSyntheticHumanActorIds = new Set(parsedConfig.e2eSyntheticHumanActorIds ?? []);
     const context = freezeContext(expectedContext);
     if (
       !isRecord(value) ||
@@ -419,7 +454,12 @@ export class CraigLifecycleV3Producer {
     if (!sameProducer(restoredProducer, producer)) throw new Error('Durable lifecycle snapshot belongs to another producer revision');
     if (value.actorObservationState !== 'consistent' && value.actorObservationState !== 'conflicted')
       throw new Error('Durable lifecycle snapshot state is invalid');
-    const ledger = CraigActorObservationLedger.restoreActors(producer, value.actors as CraigActor[], value.actorObservationState);
+    const ledger = CraigActorObservationLedger.restoreActors(
+      producer,
+      value.actors as CraigActor[],
+      value.actorObservationState,
+      e2eSyntheticHumanActorIds
+    );
     const lifecycle = new CraigLifecycleV3Producer(context, ledger);
 
     const events = (value.pendingOutbox as unknown[]).map(parseV3Event);
@@ -431,7 +471,9 @@ export class CraigLifecycleV3Producer {
     if (events.some((event) => !sameContext(event, context))) throw new Error('Durable lifecycle outbox event belongs to another recording context');
     if (events.some((event) => !sameProducer(event, producer))) throw new Error('Durable lifecycle outbox event belongs to another producer');
     const emittedById = new Map(emitted.map((item) => [item.eventId, item]));
-    if (events.some((event) => emittedById.get(event.eventId)?.occurredAt !== event.occurredAt || emittedById.get(event.eventId)?.type !== event.type))
+    if (
+      events.some((event) => emittedById.get(event.eventId)?.occurredAt !== event.occurredAt || emittedById.get(event.eventId)?.type !== event.type)
+    )
       throw new Error('Durable lifecycle outbox is not bound to emitted event order');
     let previousEmittedIndex = -1;
     for (const event of events) {
@@ -482,15 +524,35 @@ export function parseMeetingLifecycleProducerConfiguration(value: unknown): Meet
     if (!hasExactlyKeys(value, ['schemaVersion'])) throw new Error('Legacy producer configuration cannot claim v3 capabilities');
     return Object.freeze({ schemaVersion: 1 });
   }
-  if (value.schemaVersion !== 3 || !hasExactlyKeys(value, ['schemaVersion', 'actorSemanticsVersion', 'producerCapabilityId', 'producerRevision']))
+  const productionKeys = ['schemaVersion', 'actorSemanticsVersion', 'producerCapabilityId', 'producerRevision'];
+  const e2eKeys = [...productionKeys, 'e2eTestOnly', 'e2eSyntheticHumanActorIds'];
+  const isProductionConfiguration = hasExactlyKeys(value, productionKeys);
+  const isE2eConfiguration = hasExactlyKeys(value, e2eKeys);
+  if (value.schemaVersion !== 3 || (!isProductionConfiguration && !isE2eConfiguration))
     throw new Error('Meeting lifecycle producer configuration has an unsupported version');
-  return Object.freeze({
+  const producer = {
     schemaVersion: 3,
     ...parseProducerIdentity({
       actorSemanticsVersion: value.actorSemanticsVersion,
       producerCapabilityId: value.producerCapabilityId,
       producerRevision: value.producerRevision
     })
+  } as const;
+  if (isProductionConfiguration) return Object.freeze(producer);
+  if (value.e2eTestOnly !== true || !Array.isArray(value.e2eSyntheticHumanActorIds))
+    throw new Error('E2E synthetic human actor configuration requires an explicit test-only guard');
+  const actorIds = value.e2eSyntheticHumanActorIds;
+  if (
+    actorIds.length < 1 ||
+    actorIds.length > maximumE2eSyntheticHumanActors ||
+    actorIds.some((actorId) => typeof actorId !== 'string' || !discordSnowflake.test(actorId)) ||
+    new Set(actorIds).size !== actorIds.length
+  )
+    throw new Error('E2E synthetic human actor identities are invalid');
+  return Object.freeze({
+    ...producer,
+    e2eTestOnly: true as const,
+    e2eSyntheticHumanActorIds: Object.freeze([...actorIds] as string[])
   });
 }
 
@@ -501,8 +563,14 @@ export function createCraigLifecycleV3Producer(
 ): CraigLifecycleV3Producer {
   const parsedConfig = parseMeetingLifecycleProducerConfiguration(config);
   if (parsedConfig.schemaVersion !== 3) throw new Error('Lifecycle v3 requires an explicit v3 producer configuration');
+  const producer = parseProducerIdentity({
+    actorSemanticsVersion: parsedConfig.actorSemanticsVersion,
+    producerCapabilityId: parsedConfig.producerCapabilityId,
+    producerRevision: parsedConfig.producerRevision
+  });
+  const e2eSyntheticHumanActorIds = new Set(parsedConfig.e2eSyntheticHumanActorIds ?? []);
   return snapshot === undefined
-    ? new CraigLifecycleV3Producer(freezeContext(context), new CraigActorObservationLedger(parsedConfig))
+    ? new CraigLifecycleV3Producer(freezeContext(context), new CraigActorObservationLedger(producer, e2eSyntheticHumanActorIds))
     : CraigLifecycleV3Producer.restore(parsedConfig, context, snapshot);
 }
 

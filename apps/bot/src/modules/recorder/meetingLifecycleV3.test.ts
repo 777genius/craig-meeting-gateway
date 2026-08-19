@@ -10,10 +10,11 @@ import {
   deriveCraigActorFromDiscord,
   maximumCraigActorRosterSize,
   maximumCraigPendingLifecycleEvents,
+  maximumE2eSyntheticHumanActors,
   parseMeetingLifecycleProducerConfiguration,
   restoreCraigLifecycleV3ProducerFromSnapshot,
-  selectCraigKnowledgeEligibleActorIds,
-  sealedActorRosterCapabilityId
+  sealedActorRosterCapabilityId,
+  selectCraigKnowledgeEligibleActorIds
 } from './meetingLifecycleV3';
 
 const producerRevision = '0123456789abcdef0123456789abcdef01234567';
@@ -43,6 +44,67 @@ test('derives actor kind only from authenticated Discord signals and fails close
     assert.equal(deriveCraigActorFromDiscord({ id: automation.id, ...signal }).kind, 'automation');
   assert.equal(deriveCraigActorFromDiscord({ id: human.id }).kind, 'unknown');
   assert.throws(() => deriveCraigActorFromDiscord({ id: human.id, kind: 'human' } as never), /invalid/);
+});
+
+test('maps only explicitly allowlisted E2E bots to synthetic humans behind the test-only guard', () => {
+  const e2eConfig = parseMeetingLifecycleProducerConfiguration({
+    ...config,
+    e2eTestOnly: true,
+    e2eSyntheticHumanActorIds: [automation.id]
+  });
+  assert.equal(e2eConfig.schemaVersion, 3);
+  if (e2eConfig.schemaVersion !== 3) throw new Error('Expected lifecycle v3');
+  const lifecycle = createCraigLifecycleV3Producer(e2eConfig, context);
+  const started = lifecycle.started(envelope, [automation, human]);
+  assert.deepEqual(started.actors, [
+    { actorId: human.id, kind: 'human' },
+    { actorId: automation.id, kind: 'human' }
+  ]);
+  assert.equal(deriveCraigActorFromDiscord({ ...automation, system: true }, new Set([automation.id])).kind, 'automation');
+  assert.equal(deriveCraigActorFromDiscord({ ...automation, webhook: true }, new Set([automation.id])).kind, 'automation');
+  assert.equal(deriveCraigActorFromDiscord({ ...automation, bot: false }, new Set([automation.id])).kind, 'human');
+  const joined = lifecycle.participant(
+    { ...envelope, eventId: 'recording-1:2', occurredAt: '2026-08-13T00:00:01.000Z' },
+    'participant.joined',
+    automation
+  );
+  assert.deepEqual(joined.actor, { actorId: automation.id, kind: 'human' });
+  const restored = createCraigLifecycleV3Producer(e2eConfig, context, lifecycle.durableSnapshot());
+  const left = restored.participant(
+    { ...envelope, eventId: 'recording-1:3', occurredAt: '2026-08-13T00:00:02.000Z' },
+    'participant.left',
+    automation
+  );
+  assert.deepEqual(left.actor, { actorId: automation.id, kind: 'human' });
+});
+
+test('rejects malformed or unguarded E2E synthetic human actor configuration', () => {
+  assert.equal(maximumE2eSyntheticHumanActors, 128);
+  assert.throws(() => parseMeetingLifecycleProducerConfiguration({ ...config, e2eSyntheticHumanActorIds: [automation.id] }), /unsupported version/);
+  assert.throws(
+    () =>
+      parseMeetingLifecycleProducerConfiguration({
+        ...config,
+        e2eTestOnly: false,
+        e2eSyntheticHumanActorIds: [automation.id]
+      }),
+    /test-only guard/
+  );
+  for (const actorIds of [
+    [],
+    ['invalid'],
+    [automation.id, automation.id],
+    Array.from({ length: maximumE2eSyntheticHumanActors + 1 }, (_, index) => String(10000000000000000n + BigInt(index)))
+  ])
+    assert.throws(
+      () =>
+        parseMeetingLifecycleProducerConfiguration({
+          ...config,
+          e2eTestOnly: true,
+          e2eSyntheticHumanActorIds: actorIds
+        }),
+      /identities are invalid/
+    );
 });
 
 test('generates real v3 envelopes, copies producer input, and seals a sorted roster', () => {
