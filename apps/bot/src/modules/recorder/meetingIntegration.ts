@@ -26,10 +26,11 @@ import {
   createAuthoritativeCancellationPcmFenceLog
 } from './meetingCancellationPcmFenceV10';
 import {
-  type CraigLifecycleV3Event,
   type CraigLifecycleV3Admission,
+  type CraigLifecycleV3Event,
   type DurableCraigLifecycleV3Snapshot,
   type MeetingLifecycleProducerConfiguration,
+  craigActorClassificationPolicyForConfiguration,
   parseMeetingLifecycleProducerConfiguration,
   restoreCraigLifecycleV3ProducerFromSnapshot
 } from './meetingLifecycleV3';
@@ -907,14 +908,24 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
         configured.producerRevision !== admission.producer.producerRevision
       )
         throw new Error('Lifecycle v3 durable admission does not match the active producer rollout');
+      if (canonicalJson(craigActorClassificationPolicyForConfiguration(configured)) !== canonicalJson(admission.actorClassificationPolicy))
+        throw new Error('Lifecycle v3 durable admission does not match the active actor classification policy');
     }
-    if (admission !== undefined && (admission.recordingId !== event.recordingId || admission.guildId !== event.guildId || admission.channelId !== event.channelId))
+    if (
+      admission !== undefined &&
+      (admission.recordingId !== event.recordingId || admission.guildId !== event.guildId || admission.channelId !== event.channelId)
+    )
       throw new Error('Lifecycle v3 durable admission context is inconsistent');
-    if (admission !== undefined && journal !== undefined &&
-        (canonicalJson(admission.producer) !== canonicalJson(journal.snapshot.producer) ||
-         admission.recordingId !== journal.snapshot.recordingId || admission.guildId !== journal.snapshot.guildId ||
-         admission.channelId !== journal.snapshot.channelId))
-      throw new Error('Lifecycle v3 durable admission changed its indexed producer identity');
+    if (
+      admission !== undefined &&
+      journal !== undefined &&
+      (canonicalJson(admission.producer) !== canonicalJson(journal.snapshot.producer) ||
+        canonicalJson(admission.actorClassificationPolicy) !== canonicalJson(journal.snapshot.actorClassificationPolicy) ||
+        admission.recordingId !== journal.snapshot.recordingId ||
+        admission.guildId !== journal.snapshot.guildId ||
+        admission.channelId !== journal.snapshot.channelId)
+    )
+      throw new Error('Lifecycle v3 durable admission changed its indexed producer identity or actor classification policy');
     this.appendLifecycleV3Event(admission, event, journal?.nextSequence ?? 0);
   }
 
@@ -930,11 +941,24 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       if (canonicalJson(durableEvent) !== canonicalJson(event))
         throw new Error('Lifecycle v3 immutable admission segment conflicts with its retry');
     } else this.writeDurableJson(segment, event);
-    if (previous === undefined) this.publishLifecycleV3Generation(root, {
-      schemaVersion: 2, generation: 0, recordingId: admission!.recordingId, guildId: admission!.guildId,
-      channelId: admission!.channelId, producer: admission!.producer, baseSequence: 0,
-      actorObservationState: admission!.actorObservationState, actors: admission!.actors, sealedReady: admission!.sealedReady
-    }, 0);
+    if (previous === undefined)
+      this.publishLifecycleV3Generation(
+        root,
+        {
+          schemaVersion: 2,
+          generation: 0,
+          recordingId: admission!.recordingId,
+          guildId: admission!.guildId,
+          channelId: admission!.channelId,
+          producer: admission!.producer,
+          baseSequence: 0,
+          actorClassificationPolicy: admission!.actorClassificationPolicy,
+          actorObservationState: admission!.actorObservationState,
+          actors: admission!.actors,
+          sealedReady: admission!.sealedReady
+        },
+        0
+      );
     const pendingEvents = previous?.pendingEvents ?? new Map<number, CraigLifecycleV3Event>();
     pendingEvents.set(sequence, event);
     const eventDigests = previous?.eventDigests ?? new Map<string, string>();
@@ -946,8 +970,15 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     this.lifecycleV3JournalIndex.set(event.recordingId, {
       snapshot: {
         schemaVersion: 3,
-        recordingId: event.recordingId, guildId: event.guildId, channelId: event.channelId,
-        producer: { actorSemanticsVersion: event.actorSemanticsVersion, producerCapabilityId: event.producerCapabilityId, producerRevision: event.producerRevision },
+        recordingId: event.recordingId,
+        guildId: event.guildId,
+        channelId: event.channelId,
+        producer: {
+          actorSemanticsVersion: event.actorSemanticsVersion,
+          producerCapabilityId: event.producerCapabilityId,
+          producerRevision: event.producerRevision
+        },
+        actorClassificationPolicy: priorSnapshot?.actorClassificationPolicy ?? admission!.actorClassificationPolicy,
         actorObservationState: event.actorObservationState, actors: priorSnapshot?.actors ?? admission!.actors,
         sealedReady: event.type === 'recording.authoritative_ready' ? event : priorSnapshot?.sealedReady ?? null,
         emitted: previous?.snapshot.emitted ?? [],
@@ -1176,7 +1207,9 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     const last = retained[retained.length - 1].event;
     const snapshot = restoreCraigLifecycleV3ProducerFromSnapshot({
       schemaVersion: 3, recordingId: checkpoint.recordingId, guildId: checkpoint.guildId, channelId: checkpoint.channelId,
-      producer: checkpoint.producer, actorObservationState: last.actorObservationState ?? checkpoint.actorObservationState, actors,
+      producer: checkpoint.producer,
+      actorClassificationPolicy: checkpoint.actorClassificationPolicy,
+      actorObservationState: last.actorObservationState ?? checkpoint.actorObservationState, actors,
       emitted: events.map(({ eventId, occurredAt, type }) => ({ eventId, occurredAt, type })), pendingOutbox: events,
       sealedReady
     }).durableSnapshot();

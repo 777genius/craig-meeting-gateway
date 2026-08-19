@@ -11,6 +11,11 @@ const immutableRevision = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 export type CraigActorKind = 'human' | 'automation' | 'unknown';
 export type CraigActor = Readonly<{ actorId: string; kind: CraigActorKind }>;
+export type CraigActorClassificationPolicy = Readonly<{
+  schemaVersion: 1;
+  mode: 'discord-authenticated' | 'e2e-synthetic-human';
+  e2eSyntheticHumanActorIds: readonly string[];
+}>;
 
 /** Signals populated by the authenticated Discord adapter, never by an application caller. */
 export type AuthenticatedDiscordActor = Readonly<{
@@ -69,6 +74,7 @@ export type DurableCraigLifecycleV3Snapshot = Readonly<{
   guildId: string;
   channelId: string;
   producer: CraigProducerIdentity;
+  actorClassificationPolicy: CraigActorClassificationPolicy;
   actorObservationState: 'consistent' | 'conflicted';
   actors: CraigActor[];
   emitted: Array<Readonly<{ eventId: string; occurredAt: string; type: CraigLifecycleV3Event['type'] }>>;
@@ -82,6 +88,7 @@ export type CraigLifecycleV3Admission = Readonly<{
   guildId: string;
   channelId: string;
   producer: CraigProducerIdentity;
+  actorClassificationPolicy: CraigActorClassificationPolicy;
   actorObservationState: 'consistent' | 'conflicted';
   actors: CraigActor[];
   sealedReady: CraigLifecycleV3Event | null;
@@ -300,6 +307,7 @@ export class CraigLifecycleV3Producer {
       schemaVersion: 3 as const,
       ...this.context,
       producer: { ...this.ledger.producer },
+      actorClassificationPolicy: createActorClassificationPolicy(this.ledger.classificationPolicy()),
       actorObservationState: this.ledger.observationState(),
       actors: this.ledger.actors(),
       emitted: this.emitted.map((item) => ({ ...item })),
@@ -312,6 +320,7 @@ export class CraigLifecycleV3Producer {
     return deepFreeze({
       ...this.context,
       producer: { ...this.ledger.producer },
+      actorClassificationPolicy: createActorClassificationPolicy(this.ledger.classificationPolicy()),
       actorObservationState: this.ledger.observationState(),
       actors: this.ledger.actors(),
       sealedReady: this.sealedReady === null ? null : cloneEvent(this.sealedReady)
@@ -431,6 +440,7 @@ export class CraigLifecycleV3Producer {
         'guildId',
         'channelId',
         'producer',
+        'actorClassificationPolicy',
         'actorObservationState',
         'actors',
         'emitted',
@@ -452,6 +462,10 @@ export class CraigLifecycleV3Producer {
     if (!sameContext(restoredContext, context)) throw new Error('Durable lifecycle snapshot belongs to another recording context');
     const restoredProducer = parseProducerIdentity(value.producer);
     if (!sameProducer(restoredProducer, producer)) throw new Error('Durable lifecycle snapshot belongs to another producer revision');
+    const expectedClassificationPolicy = createActorClassificationPolicy(e2eSyntheticHumanActorIds);
+    const restoredClassificationPolicy = parseActorClassificationPolicy(value.actorClassificationPolicy);
+    if (canonicalJson(restoredClassificationPolicy) !== canonicalJson(expectedClassificationPolicy))
+      throw new Error('Durable lifecycle snapshot belongs to another actor classification policy');
     if (value.actorObservationState !== 'consistent' && value.actorObservationState !== 'conflicted')
       throw new Error('Durable lifecycle snapshot state is invalid');
     const ledger = CraigActorObservationLedger.restoreActors(
@@ -552,8 +566,16 @@ export function parseMeetingLifecycleProducerConfiguration(value: unknown): Meet
   return Object.freeze({
     ...producer,
     e2eTestOnly: true as const,
-    e2eSyntheticHumanActorIds: Object.freeze([...actorIds] as string[])
+    e2eSyntheticHumanActorIds: Object.freeze([...actorIds].sort() as string[])
   });
+}
+
+export function craigActorClassificationPolicyForConfiguration(
+  config: Extract<MeetingLifecycleProducerConfiguration, { schemaVersion: 3 }>
+): CraigActorClassificationPolicy {
+  const parsed = parseMeetingLifecycleProducerConfiguration(config);
+  if (parsed.schemaVersion !== 3) throw new Error('Actor classification policy requires lifecycle v3');
+  return createActorClassificationPolicy(new Set(parsed.e2eSyntheticHumanActorIds ?? []));
 }
 
 export function createCraigLifecycleV3Producer(
@@ -577,13 +599,58 @@ export function createCraigLifecycleV3Producer(
 export function restoreCraigLifecycleV3ProducerFromSnapshot(value: unknown): CraigLifecycleV3Producer {
   if (!isRecord(value) || !isRecord(value.producer)) throw new Error('Durable lifecycle snapshot is malformed');
   const producer = parseProducerIdentity(value.producer);
-  const config = Object.freeze({ schemaVersion: 3 as const, ...producer });
+  const policy = parseActorClassificationPolicy(value.actorClassificationPolicy);
+  const config = Object.freeze({
+    schemaVersion: 3 as const,
+    ...producer,
+    ...(policy.mode === 'e2e-synthetic-human'
+      ? {
+          e2eTestOnly: true as const,
+          e2eSyntheticHumanActorIds: policy.e2eSyntheticHumanActorIds
+        }
+      : {})
+  });
   const context = freezeContext({
     recordingId: value.recordingId as string,
     guildId: value.guildId as string,
     channelId: value.channelId as string
   });
   return CraigLifecycleV3Producer.restore(config, context, value);
+}
+
+function createActorClassificationPolicy(e2eSyntheticHumanActorIds: ReadonlySet<string>): CraigActorClassificationPolicy {
+  const actorIds = [...e2eSyntheticHumanActorIds].sort();
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    mode: actorIds.length === 0 ? ('discord-authenticated' as const) : ('e2e-synthetic-human' as const),
+    e2eSyntheticHumanActorIds: Object.freeze(actorIds)
+  });
+}
+
+function parseActorClassificationPolicy(value: unknown): CraigActorClassificationPolicy {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, ['schemaVersion', 'mode', 'e2eSyntheticHumanActorIds']) ||
+    value.schemaVersion !== 1 ||
+    !Array.isArray(value.e2eSyntheticHumanActorIds)
+  )
+    throw new Error('Durable lifecycle snapshot actor classification policy is malformed');
+  const actorIds = value.e2eSyntheticHumanActorIds;
+  if (
+    actorIds.length > maximumE2eSyntheticHumanActors ||
+    actorIds.some((actorId) => typeof actorId !== 'string' || !discordSnowflake.test(actorId)) ||
+    new Set(actorIds).size !== actorIds.length ||
+    actorIds.some((actorId, index) => index > 0 && actorIds[index - 1] >= actorId) ||
+    (value.mode === 'discord-authenticated' && actorIds.length !== 0) ||
+    (value.mode === 'e2e-synthetic-human' && actorIds.length === 0) ||
+    (value.mode !== 'discord-authenticated' && value.mode !== 'e2e-synthetic-human')
+  )
+    throw new Error('Durable lifecycle snapshot actor classification policy is invalid');
+  return Object.freeze({
+    schemaVersion: 1,
+    mode: value.mode,
+    e2eSyntheticHumanActorIds: Object.freeze([...actorIds] as string[])
+  });
 }
 
 /** Contract tooling uses the same strict runtime parser as durable replay. */
