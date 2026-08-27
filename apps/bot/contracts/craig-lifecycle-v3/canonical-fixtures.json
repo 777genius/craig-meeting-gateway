@@ -86,7 +86,6 @@
           "producerRevision": "0123456789abcdef0123456789abcdef01234567",
           "actors": [
             { "actorId": "1533227577286852649", "kind": "human" },
-            { "actorId": "1533228054724346087", "kind": "automation" },
             { "actorId": "1533228590643155035", "kind": "human" }
           ],
           "rosterState": "sealed",
@@ -119,8 +118,7 @@
           "producerCapabilityId": "meeting.lifecycle.sealed-actor-roster.v1",
           "producerRevision": "0123456789abcdef0123456789abcdef01234567",
           "actors": [
-            { "actorId": "1533227577286852649", "kind": "human" },
-            { "actorId": "1533228054724346087", "kind": "automation" }
+            { "actorId": "1533227577286852649", "kind": "human" }
           ],
           "rosterState": "unsealed"
         },
@@ -166,7 +164,7 @@
           "producerRevision": "0123456789abcdef0123456789abcdef01234567",
           "actors": [
             { "actorId": "1533227577286852649", "kind": "human" },
-            { "actorId": "1533228054724346087", "kind": "automation" },
+            { "actorId": "1533228054724346087", "kind": "unknown" },
             { "actorId": "1533228590643155036", "kind": "unknown" }
           ],
           "rosterState": "sealed",
@@ -234,8 +232,7 @@
           "producerCapabilityId": "meeting.lifecycle.sealed-actor-roster.v1",
           "producerRevision": "0123456789abcdef0123456789abcdef01234567",
           "actors": [
-            { "actorId": "1533227577286852649", "kind": "human" },
-            { "actorId": "1533228054724346087", "kind": "automation" }
+            { "actorId": "1533227577286852649", "kind": "human" }
           ],
           "rosterState": "sealed",
           "endedAt": "2026-08-13T02:01:00.000Z",

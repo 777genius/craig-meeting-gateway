@@ -1,4 +1,11 @@
 import { OpusEncoder } from '@discordjs/opus';
+import { createHash } from 'node:crypto';
+
+import {
+  type PlaybackReliabilitySnapshot,
+  type PlaybackReliabilityStore,
+  type PlaybackReliabilityTerminal
+} from './conversationPlaybackReliability';
 
 export const CRAIG_PLAYBACK_SAMPLE_RATE_HZ = 48_000;
 export const CRAIG_PLAYBACK_MONO_CHANNELS = 1;
@@ -20,6 +27,7 @@ export interface PlaybackIdentity {
 
 interface PlaybackStartCommand extends PlaybackIdentity {
   type: 'playback-start';
+  notAfterUnixMs?: number;
 }
 
 interface PlaybackAudioChunkCommand extends PlaybackIdentity {
@@ -104,6 +112,8 @@ export interface CraigPlaybackControllerOptions {
   isAttemptRevoked(identity: Readonly<PlaybackIdentity>): boolean;
   /** Records a packet offered after the exact cancelled attempt was revoked. */
   onPostCancellationPacket(identity: Readonly<PlaybackIdentity>): boolean;
+  /** Durable at-most-once admission and receipt replay for protocol v3. */
+  reliabilityStore: PlaybackReliabilityStore;
   createOpusEncoder?: () => CraigPlaybackOpusEncoder;
   now?: () => number;
   timer?: CraigPlaybackTimer;
@@ -116,6 +126,10 @@ interface ActivePlayback extends PlaybackIdentity {
   started: boolean;
   state: 'receiving' | 'finishing';
   sender?: CraigOpusPacketSender;
+  notAfterUnixMs?: number;
+  replayOnly: boolean;
+  replayTerminal?: PlaybackReliabilityTerminal;
+  processedChunks: Map<number, string>;
 }
 
 /**
@@ -178,6 +192,7 @@ class CraigOpusPacketSender {
   private finishRequested = false;
   private closed = false;
   private speaking = false;
+  private firstPacketPrepared = false;
   private sending = false;
   private nextDispatchAtMs: number | undefined;
   private timerHandle: unknown;
@@ -189,6 +204,7 @@ class CraigOpusPacketSender {
     private readonly now: () => number,
     private readonly timer: CraigPlaybackTimer,
     private readonly onPacketDispatched: (packet: Buffer) => void,
+    private readonly onBeforeFirstPacket: () => boolean,
     private readonly onDrained: () => void,
     private readonly onFailure: (code: CraigPlaybackFailureCode, safeMessage: string, retryable: boolean) => void
   ) {}
@@ -261,6 +277,14 @@ class CraigOpusPacketSender {
       return;
     }
 
+    if (!this.firstPacketPrepared) {
+      if (!this.onBeforeFirstPacket()) {
+        this.fail('playback-error', 'Playback suppressed at its absolute not-after deadline.', false);
+        return;
+      }
+      this.firstPacketPrepared = true;
+    }
+
     this.sending = true;
     try {
       if (!this.speaking) {
@@ -280,11 +304,7 @@ class CraigOpusPacketSender {
 
     this.sending = false;
     this.nextDispatchAtMs = currentTimestamp(this.now) + 20;
-    try {
-      this.onPacketDispatched(packet);
-    } catch {
-      // The authoritative recorder must never be able to interrupt playback.
-    }
+    this.onPacketDispatched(packet);
     if (!this.closed) this.schedule();
   }
 
@@ -357,8 +377,8 @@ export class CraigPlaybackController {
 
   constructor(private readonly options: CraigPlaybackControllerOptions) {
     if (typeof options.onCancellation !== 'function' || typeof options.isAttemptRevoked !== 'function' ||
-        typeof options.onPostCancellationPacket !== 'function')
-      throw new Error('Durable playback cancellation, restart lookup, and post-fence attempt handlers are required');
+        typeof options.onPostCancellationPacket !== 'function' || options.reliabilityStore === undefined)
+      throw new Error('Durable playback cancellation, restart lookup, post-fence, and reliability handlers are required');
     this.createOpusEncoder = options.createOpusEncoder ?? (() => new OpusEncoder(CRAIG_PLAYBACK_SAMPLE_RATE_HZ, 2));
     this.now = options.now ?? (() => Date.now());
     this.timer = options.timer ?? {
@@ -421,12 +441,39 @@ export class CraigPlaybackController {
   private handleStart(command: PlaybackStartCommand): boolean {
     if (this.isRevoked(command)) return true;
     if (this.active) {
-      if (this.matchesActive(command)) return true;
+      if (this.matchesActive(command)) {
+        if (this.active.notAfterUnixMs === command.notAfterUnixMs) {
+          if (this.active.started) {
+            const snapshot = this.options.reliabilityStore.inspect(command);
+            if (snapshot.status === 'started') this.emitStarted(command, snapshot.startedAtMs);
+            else if (snapshot.status === 'terminal' && snapshot.startedAtMs !== undefined)
+              this.emitStarted(command, snapshot.startedAtMs);
+          }
+          return true;
+        }
+        this.fail('invalid-audio', 'A duplicate playback start conflicted with its original deadline.', false);
+        return true;
+      }
       this.fail('playback-error', 'A previous playback turn is still active.', true);
       return true;
     }
 
-    if (this.matchesLastTerminal(command)) return true;
+    const nowMs = currentTimestamp(this.now);
+    if (command.notAfterUnixMs !== undefined && nowMs >= command.notAfterUnixMs) {
+      const terminal: PlaybackReliabilityTerminal = {
+        type: 'playback-failed',
+        code: 'playback-error',
+        safeMessage: 'Playback suppressed at its absolute not-after deadline.',
+        retryable: false
+      };
+      const snapshot = this.options.reliabilityStore.markTerminal(command, terminal);
+      this.rememberTerminal(command);
+      this.emitTerminal(command, snapshot.status === 'terminal' ? snapshot.terminal : terminal);
+      return true;
+    }
+
+    const reservation = this.options.reliabilityStore.reserve(command, command.notAfterUnixMs, nowMs);
+    if (!reservation.created) return this.replayPersisted(command, reservation.snapshot);
 
     this.active = {
       ...command,
@@ -434,7 +481,9 @@ export class CraigPlaybackController {
       lastSequence: undefined,
       remainder: Buffer.alloc(0),
       started: false,
-      state: 'receiving'
+      state: 'receiving',
+      replayOnly: false,
+      processedChunks: new Map()
     };
     return true;
   }
@@ -454,6 +503,14 @@ export class CraigPlaybackController {
     if (!active) return this.matchesLastTerminal(command);
     if (!this.matches(active, command)) return true;
     if (active.state !== 'receiving') return true;
+    if (active.replayOnly) return true;
+
+    if (active.lastSequence !== undefined && command.sequence <= active.lastSequence) {
+      const accepted = active.processedChunks.get(command.sequence);
+      if (accepted === pcmDigest(command.pcm)) return true;
+      this.fail('invalid-audio', 'A duplicate playback chunk conflicted with its original payload.', false);
+      return true;
+    }
 
     if (
       (active.lastSequence === undefined && command.sequence !== 0) ||
@@ -470,6 +527,7 @@ export class CraigPlaybackController {
     }
 
     active.lastSequence = command.sequence;
+    active.processedChunks.set(command.sequence, pcmDigest(command.pcm));
     const joined = active.remainder.byteLength === 0 ? command.pcm : Buffer.concat([active.remainder, command.pcm]);
     let offset = 0;
     while (offset + CRAIG_PLAYBACK_MONO_FRAME_BYTES <= joined.byteLength) {
@@ -488,6 +546,12 @@ export class CraigPlaybackController {
     if (active.state === 'finishing') return true;
 
     active.state = 'finishing';
+    if (active.replayOnly && active.replayTerminal !== undefined) {
+      this.active = undefined;
+      this.rememberTerminal(active);
+      this.emitTerminal(active, active.replayTerminal);
+      return true;
+    }
     // Do not pad: an incomplete tail has no complete 20 ms timeline to play.
     active.remainder = Buffer.alloc(0);
     if (active.sender) active.sender.complete();
@@ -527,6 +591,7 @@ export class CraigPlaybackController {
         this.now,
         this.timer,
         (packet) => this.markPacketDispatched(active, packet),
+        () => this.options.reliabilityStore.authorizeFirstPacket(active, currentTimestamp(this.now)),
         () => this.complete(active),
         (code, safeMessage, retryable) => this.fail(code, safeMessage, retryable)
       );
@@ -539,73 +604,120 @@ export class CraigPlaybackController {
 
   private markPacketDispatched(active: ActivePlayback, opusPacket: Buffer): void {
     if (this.active !== active) return;
+    if (!active.started) {
+      const startedAtMs = this.options.reliabilityStore.markStarted(active, currentTimestamp(this.now));
+      active.started = true;
+      try {
+        this.options.onPacketDispatched?.(opusPacket);
+      } catch {
+        // The authoritative recorder must never be able to interrupt playback.
+      }
+      this.emitStarted(active, startedAtMs);
+      return;
+    }
     try {
       this.options.onPacketDispatched?.(opusPacket);
     } catch {
       // The authoritative recorder must never be able to interrupt playback.
     }
-    if (this.active !== active || active.started) return;
-    active.started = true;
-    this.emit({
-      schemaVersion: 1,
-      type: 'playback-started',
-      recordingId: active.recordingId,
-      turnId: active.turnId,
-      attemptId: active.attemptId,
-      startedAtMs: currentTimestamp(this.now)
-    });
   }
 
   private complete(active: ActivePlayback): void {
     if (this.active !== active) return;
 
+    const snapshot = this.options.reliabilityStore.markTerminal(active, {
+      type: 'playback-finished',
+      finishedAtMs: currentTimestamp(this.now)
+    });
     this.active = undefined;
     this.rememberTerminal(active);
     this.options.arbiter.finishConversation(this);
-    this.emit({
-      schemaVersion: 1,
-      type: 'playback-finished',
-      recordingId: active.recordingId,
-      turnId: active.turnId,
-      attemptId: active.attemptId,
-      finishedAtMs: currentTimestamp(this.now)
-    });
+    if (snapshot.status === 'terminal') this.emitTerminal(active, snapshot.terminal);
   }
 
   private cancel(active: ActivePlayback): void {
     if (this.active !== active) return;
 
+    const snapshot = this.options.reliabilityStore.markTerminal(active, {
+      type: 'playback-finished',
+      finishedAtMs: currentTimestamp(this.now)
+    });
     this.active = undefined;
     this.rememberTerminal(active);
     active.sender?.cancel();
     this.options.arbiter.cancelConversation(this);
-    this.emit({
-      schemaVersion: 1,
-      type: 'playback-finished',
-      recordingId: active.recordingId,
-      turnId: active.turnId,
-      attemptId: active.attemptId,
-      finishedAtMs: currentTimestamp(this.now)
-    });
+    if (snapshot.status === 'terminal') this.emitTerminal(active, snapshot.terminal);
   }
 
   private fail(code: CraigPlaybackFailureCode, safeMessage: string, retryable: boolean): void {
     const active = this.active;
     if (!active) return;
 
+    const snapshot = this.options.reliabilityStore.markTerminal(active, {
+      type: 'playback-failed',
+      code,
+      safeMessage,
+      retryable
+    });
     this.active = undefined;
     this.rememberTerminal(active);
     active.sender?.cancel();
     this.options.arbiter.cancelConversation(this);
+    if (snapshot.status === 'terminal') this.emitTerminal(active, snapshot.terminal);
+  }
+
+  private replayPersisted(command: PlaybackStartCommand, snapshot: PlaybackReliabilitySnapshot): boolean {
+    if (snapshot.status === 'fresh') throw new Error('Playback reliability reservation unexpectedly remained fresh');
+    if (snapshot.status === 'dispatching') {
+      this.rememberTerminal(command);
+      this.emitTerminal(command, {
+        type: 'playback-failed',
+        code: 'playback-error',
+        safeMessage: 'Playback retry suppressed because the prior delivery outcome is ambiguous.',
+        retryable: false
+      });
+      return true;
+    }
+    if (snapshot.status === 'terminal' && snapshot.startedAtMs === undefined) {
+      this.rememberTerminal(command);
+      this.emitTerminal(command, snapshot.terminal);
+      return true;
+    }
+
+    const startedAtMs = snapshot.startedAtMs!;
+    this.active = {
+      ...command,
+      encoder: this.createOpusEncoder(),
+      lastSequence: undefined,
+      remainder: Buffer.alloc(0),
+      started: true,
+      state: 'receiving',
+      replayOnly: true,
+      processedChunks: new Map(),
+      ...(snapshot.status === 'terminal' ? { replayTerminal: snapshot.terminal } : {})
+    };
+    this.emitStarted(command, startedAtMs);
+    return true;
+  }
+
+  private emitStarted(identity: PlaybackIdentity, startedAtMs: number): void {
     this.emit({
       schemaVersion: 1,
-      type: 'playback-failed',
-      recordingId: active.recordingId,
-      turnId: active.turnId,
-      attemptId: active.attemptId,
-      code,
-      safeMessage,
-      retryable
+      type: 'playback-started',
+      recordingId: identity.recordingId,
+      turnId: identity.turnId,
+      attemptId: identity.attemptId,
+      startedAtMs
+    });
+  }
+
+  private emitTerminal(identity: PlaybackIdentity, terminal: PlaybackReliabilityTerminal): void {
+    this.emit({
+      schemaVersion: 1,
+      recordingId: identity.recordingId,
+      turnId: identity.turnId,
+      attemptId: identity.attemptId,
+      ...terminal
     });
   }
 
@@ -642,6 +754,10 @@ function currentTimestamp(now: () => number): number {
   return Math.max(0, Math.trunc(now()));
 }
 
+function pcmDigest(pcm: Buffer): string {
+  return createHash('sha256').update(pcm).digest('base64');
+}
+
 function parseCraigPlaybackCommand(value: unknown): CraigPlaybackCommand {
   if (!isRecord(value)) throw new Error('Playback command must be an object');
   const type = value.type;
@@ -649,10 +765,20 @@ function parseCraigPlaybackCommand(value: unknown): CraigPlaybackCommand {
 
   switch (type) {
     case 'playback-start': {
-      const identity = parseEnvelope(value, ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'format', 'sampleRateHz', 'channels']);
+      const startKeys = value.notAfterUnixMs === undefined
+        ? ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'format', 'sampleRateHz', 'channels']
+        : ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'format', 'sampleRateHz', 'channels', 'notAfterUnixMs'];
+      const identity = parseEnvelope(value, startKeys);
       if (value.format !== 'pcm_s16le' || value.sampleRateHz !== CRAIG_PLAYBACK_SAMPLE_RATE_HZ || value.channels !== CRAIG_PLAYBACK_MONO_CHANNELS)
         throw new Error('Playback start format is unsupported');
-      return { ...identity, type };
+      if (value.notAfterUnixMs !== undefined &&
+          (!Number.isSafeInteger(value.notAfterUnixMs) || (value.notAfterUnixMs as number) < 0))
+        throw new Error('Playback start not-after deadline is invalid');
+      return {
+        ...identity,
+        type,
+        ...(value.notAfterUnixMs === undefined ? {} : { notAfterUnixMs: value.notAfterUnixMs as number })
+      };
     }
     case 'audio-chunk': {
       const identity = parseEnvelope(value, ['schemaVersion', 'recordingId', 'turnId', 'attemptId', 'type', 'sequence', 'pcmBase64']);

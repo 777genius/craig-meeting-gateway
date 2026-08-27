@@ -967,7 +967,10 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     eventDigests.set(event.eventId, createHash('sha256').update(canonicalJson(event)).digest('hex'));
     const priorSnapshot = previous?.snapshot;
     const actorIndex = previous?.actorIndex ?? new Map(admission!.actors.map((actor) => [actor.actorId, actor]));
-    if (event.type === 'participant.joined' || event.type === 'participant.left')
+    if (event.type === 'meeting.started') {
+      actorIndex.clear();
+      for (const actor of event.actors) actorIndex.set(actor.actorId, actor);
+    } else if (event.type === 'participant.joined' || event.type === 'participant.left')
       observeLifecycleV3Actor(actorIndex, event.actor);
     this.lifecycleV3JournalIndex.set(event.recordingId, {
       snapshot: {
@@ -981,7 +984,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
           producerRevision: event.producerRevision
         },
         actorClassificationPolicy: priorSnapshot?.actorClassificationPolicy ?? admission!.actorClassificationPolicy,
-        actorObservationState: event.actorObservationState, actors: priorSnapshot?.actors ?? admission!.actors,
+        actorObservationState: event.actorObservationState,
+        actors: [...actorIndex.values()].sort((left, right) => left.actorId.localeCompare(right.actorId)),
         sealedReady: event.type === 'recording.authoritative_ready' ? event : priorSnapshot?.sealedReady ?? null,
         emitted: previous?.snapshot.emitted ?? [],
         pendingOutbox: previous?.snapshot.pendingOutbox ?? []
@@ -1065,20 +1069,22 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
           throw new Error('Lifecycle v3 immutable generation chunk is invalid');
         rollingChecksum = createHash('sha256').update(`${rollingChecksum}:${checksum}`).digest('hex');
         for (const record of chunk.records) {
-          if (record.kind === 'base') { payload = record.value; pendingEvent = undefined; }
+          if (record.kind === 'base') {
+            payload = record.value;
+            pendingEvent = undefined;
+          }
           else if (record.kind === 'actor') {
             actorIndex.set(record.value.actorId, record.value);
-            if (payload.sealedReady?.actors !== undefined) payload.sealedReady.actors.push(record.value);
           }
           else if (record.kind === 'event') {
             pendingEvent = record.value;
             payload.actorObservationState = pendingEvent.actorObservationState;
-            if (pendingEvent.type === 'meeting.started' || pendingEvent.type === 'recording.authoritative_ready') actorIndex.clear();
+            if (pendingEvent.type === 'meeting.started') actorIndex.clear();
             if (pendingEvent.type === 'recording.authoritative_ready') payload.sealedReady = pendingEvent;
           } else if (record.kind === 'event-actor') {
             if (pendingEvent?.type === 'participant.joined' || pendingEvent?.type === 'participant.left')
               observeLifecycleV3Actor(actorIndex, record.value);
-            else actorIndex.set(record.value.actorId, record.value);
+            else if (pendingEvent?.type === 'meeting.started') actorIndex.set(record.value.actorId, record.value);
             if (pendingEvent?.type === 'recording.authoritative_ready') payload.sealedReady.actors.push(record.value);
           }
         }
@@ -1193,13 +1199,16 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       if (!retainedSequences.has(sequence)) throw new Error('Lifecycle v3 journal lost an unacknowledged segment');
     const pendingEvents = new Map(retained.filter(({ sequence }) => sequence > ackedSequence).map(({ sequence, event }) => [sequence, event]));
     const pendingValues = [...pendingEvents.values()];
-    const events = [retained[0].event, ...pendingValues.filter(({ eventId }) => eventId !== retained[0].event.eventId)];
-    const sealedReady = events.find(({ type }) => type === 'recording.authoritative_ready') ?? checkpoint.sealedReady ?? null;
+    const replayEvents = [retained[0].event, ...pendingValues.filter(({ eventId }) => eventId !== retained[0].event.eventId)];
+    const checkpointReady = checkpoint.sealedReady ?? null;
+    const events = checkpointReady !== null && replayEvents.every(({ type }) => type !== 'recording.authoritative_ready')
+      ? [...replayEvents, checkpointReady] : replayEvents;
+    const sealedReady = events.find(({ type }) => type === 'recording.authoritative_ready') ?? null;
     const baseSequence = Number.isSafeInteger(checkpoint.baseSequence) ? checkpoint.baseSequence : 0;
     const actorIndex = new Map<string, DurableCraigLifecycleV3Snapshot['actors'][number]>();
     for (const actor of checkpoint.actors ?? []) actorIndex.set(actor.actorId, actor);
     for (const { sequence, event } of retained) if (sequence > baseSequence) {
-      if (event.type === 'meeting.started' || event.type === 'recording.authoritative_ready') {
+      if (event.type === 'meeting.started') {
         actorIndex.clear();
         for (const actor of event.actors) actorIndex.set(actor.actorId, actor);
       } else if (event.type === 'participant.joined' || event.type === 'participant.left')
@@ -1251,9 +1260,11 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       const pendingEvents = [...journal.pendingEvents.values()];
       const pinnedStart = pendingEvents.find(({ type }) => type === 'meeting.started') ??
         journal.snapshot.pendingOutbox.find(({ type }) => type === 'meeting.started');
-      const events = pinnedStart === undefined
+      const replayEvents = pinnedStart === undefined
         ? pendingEvents
         : [pinnedStart, ...pendingEvents.filter(({ eventId }) => eventId !== pinnedStart.eventId)];
+      const events = journal.snapshot.sealedReady !== null && replayEvents.every(({ type }) => type !== 'recording.authoritative_ready')
+        ? [...replayEvents, journal.snapshot.sealedReady] : replayEvents;
       return restoreCraigLifecycleV3ProducerFromSnapshot({
         ...journal.snapshot,
         emitted: events.map(({ eventId, occurredAt, type }) => ({ eventId, occurredAt, type })),
@@ -1418,7 +1429,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
         ? manifest.current : manifest.previous!);
       const actors = (base.actors ?? []) as unknown[];
       const records: unknown[] = [];
-      if (state.baseActorCursor === 0) records.push({ kind: 'base', value: { ...base, actors: [], sealedReady: base.sealedReady === null ? null : { ...base.sealedReady, actors: [] } } });
+      if (state.baseActorCursor === 0) records.push({ kind: 'base', value: { ...base, actors: [] } });
       while (records.length < lifecycleV3MaintenanceRecordsPerStep && state.baseActorCursor < actors.length)
         records.push({ kind: 'actor', value: actors[state.baseActorCursor++] });
       if (records.length > 0) this.writeLifecycleV3MaintenanceChunk(root, state, records);
@@ -1796,6 +1807,17 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
     if (job.terminalEvent.type === 'meeting.aborted') return;
 
     if (job.authoritativeTracks === undefined) throw new PermanentOriginalRecordingError('Original recording track metadata was not prepared');
+    let sealedReady: Extract<CraigLifecycleV3Event, { type: 'recording.authoritative_ready' }> | null = null;
+    if (job.lifecycleV3Snapshot !== undefined) {
+      const ready = restoreCraigLifecycleV3ProducerFromSnapshot(job.lifecycleV3Snapshot).durableSnapshot().sealedReady;
+      if (
+        ready?.type !== 'recording.authoritative_ready' ||
+        ready.trackCount !== job.authoritativeTracks.length ||
+        !sealedReadyActorsMatchAuthoritativeTracks(ready.actors, job.authoritativeTracks)
+      )
+        throw new PermanentOriginalRecordingError('Lifecycle v3 outbox seal does not match its authoritative track roster');
+      sealedReady = ready;
+    }
     for (const track of job.authoritativeTracks) {
       const cooked = await this.originalCooker!.cook(job.recordingId, track.trackNumber);
       try {
@@ -1827,11 +1849,8 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       }
     }
 
-    if (job.lifecycleV3Snapshot !== undefined) {
-      const ready = restoreCraigLifecycleV3ProducerFromSnapshot(job.lifecycleV3Snapshot).durableSnapshot().sealedReady;
-      if (ready === null || ready.type !== 'recording.authoritative_ready')
-        throw new PermanentOriginalRecordingError('Lifecycle v3 outbox was not sealed before authoritative publication');
-      await this.transport.postAuthoritativeReady!(ready);
+    if (sealedReady !== null) {
+      await this.transport.postAuthoritativeReady!(sealedReady);
     } else
       await this.transport.postAuthoritativeReady!({
         schemaVersion: 1,
@@ -2565,6 +2584,7 @@ async function readOriginalRecordingJob(
       ready.type !== 'recording.authoritative_ready' ||
       authoritativeTracks === undefined ||
       ready.trackCount !== authoritativeTracks.length ||
+      !sealedReadyActorsMatchAuthoritativeTracks(ready.actors, authoritativeTracks) ||
       ready.endedAt !== terminalEvent.occurredAt ||
       ready.occurredAt !== terminalEvent.occurredAt ||
       ready.sourceFilesChecksumSha256 !== sourceFilesChecksum(normalizedSources)
@@ -2586,6 +2606,16 @@ async function readOriginalRecordingJob(
     ...(authoritativeTracks === undefined ? {} : { authoritativeTracks }),
     ...(rawAuthoritativeTimelineBasis === undefined ? {} : { authoritativeTimelineBasis })
   };
+}
+
+function sealedReadyActorsMatchAuthoritativeTracks(
+  readyActors: readonly { actorId: string }[],
+  authoritativeTracks: readonly Pick<PreparedAuthoritativeTrack, 'speakerId'>[]
+): boolean {
+  const readyActorIds = readyActors.map(({ actorId }) => actorId);
+  const authoritativeActorIds = [...new Set(authoritativeTracks.map(({ speakerId }) => speakerId))].sort();
+  return readyActorIds.length === authoritativeActorIds.length &&
+    readyActorIds.every((actorId, index) => actorId === authoritativeActorIds[index]);
 }
 
 function parsePreparedAuthoritativeTracks(value: unknown): PreparedAuthoritativeTrack[] | undefined {

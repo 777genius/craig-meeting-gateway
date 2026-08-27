@@ -5,6 +5,7 @@ import test from 'node:test';
 import type { MeetingLifecycleEvent, MeetingLifecyclePublishOutcome } from './meetingIntegration';
 import {
   type CraigLifecycleV3Admission,
+  type CraigLifecycleV3Event,
   actorSemanticsVersion,
   createCraigLifecycleV3Producer,
   sealedActorRosterCapabilityId
@@ -41,6 +42,7 @@ const channelId = '1533230920645308427';
 interface RecordingLifecycleInternals {
   markConnectionLost(reason: string): void;
   markConnectionRecovered(): void;
+  createMeetingStartedLifecycleEvent(participantIds: string[]): MeetingLifecycleEvent;
 }
 
 async function createRecordingHarness(...outcomes: MeetingLifecyclePublishOutcome[]) {
@@ -58,10 +60,11 @@ async function createRecordingHarness(...outcomes: MeetingLifecyclePublishOutcom
     connectionLossOpen: false,
     channel: {
       id: channelId,
-      guild: { id: '1533232836297011436' }
+      guild: { id: '1533232836297011436' },
+      voiceMembers: new Map([[participantId, { id: participantId, bot: false, system: false, webhookID: null }]])
     },
     recorder: {
-      client: { bot: { user: { id: botId } } },
+      client: { bot: { user: { id: botId, bot: true, system: false } } },
       logger: {
         debug() {},
         error() {},
@@ -88,6 +91,135 @@ function participantMember(isPresent: boolean): Parameters<RecordingType['onVoic
 }
 
 const oldVoiceState = {} as Parameters<RecordingType['onVoiceStateUpdate']>[1];
+
+function installLifecycleV3(recording: RecordingType, e2eSyntheticHumanActorIds?: readonly string[]) {
+  const lifecycle = createCraigLifecycleV3Producer(
+    {
+      schemaVersion: 3,
+      actorSemanticsVersion,
+      producerCapabilityId: sealedActorRosterCapabilityId,
+      producerRevision: '0123456789abcdef0123456789abcdef01234567',
+      ...(e2eSyntheticHumanActorIds === undefined
+        ? {}
+        : { e2eTestOnly: true as const, e2eSyntheticHumanActorIds })
+    },
+    { recordingId: 'recording-1', guildId: '1533232836297011436', channelId }
+  );
+  Object.assign(recording, { lifecycleV3: lifecycle });
+  return lifecycle;
+}
+
+test('v3 meeting.started deduplicates the authenticated recorder as automation and retains it for the authoritative bot track', async () => {
+  const { recording } = await createRecordingHarness();
+  const lifecycle = installLifecycleV3(recording);
+  const internals = recording as unknown as RecordingLifecycleInternals;
+
+  const started = internals.createMeetingStartedLifecycleEvent([participantId, botId, participantId]);
+  assert.equal(started.schemaVersion, 3);
+  assert.deepEqual((started as CraigLifecycleV3Event & { type: 'meeting.started' }).actors, [
+    { actorId: botId, kind: 'automation' },
+    { actorId: participantId, kind: 'human' }
+  ]);
+
+  await recording.onVoiceStateUpdate(
+    { id: botId, bot: true, voiceState: { channelID: channelId, deaf: false } } as Parameters<RecordingType['onVoiceStateUpdate']>[0],
+    { deaf: false } as Parameters<RecordingType['onVoiceStateUpdate']>[1]
+  );
+  assert.equal(lifecycle.durableSnapshot().pendingOutbox.length, 1, 'the recorder self update must not emit a participant delta');
+
+  const endedAt = new Date(Date.parse(started.occurredAt) + 1_000).toISOString();
+  lifecycle.terminal(
+    {
+      eventId: 'recording-1:ended',
+      recordingId: 'recording-1',
+      guildId: '1533232836297011436',
+      channelId,
+      occurredAt: endedAt
+    },
+    'meeting.ended',
+    null
+  );
+  const ready = lifecycle.authoritativeReady(
+    {
+      eventId: 'recording-1:ready',
+      recordingId: 'recording-1',
+      guildId: '1533232836297011436',
+      channelId,
+      occurredAt: endedAt
+    },
+    {
+      actors: [{ id: participantId }, { id: botId }],
+      endedAt,
+      trackCount: 2,
+      sourceFilesChecksumSha256: 'a'.repeat(64)
+    }
+  );
+  assert.deepEqual(ready.actors, (started as CraigLifecycleV3Event & { type: 'meeting.started' }).actors);
+});
+
+test('v3 meeting.started fails closed when the authenticated recorder identity is unavailable', async () => {
+  const { recording } = await createRecordingHarness();
+  installLifecycleV3(recording);
+  recording.recorder.client.bot.user.id = '';
+
+  assert.throws(
+    () => (recording as unknown as RecordingLifecycleInternals).createMeetingStartedLifecycleEvent([participantId]),
+    /Authenticated Discord actor is invalid/
+  );
+});
+
+test('v3 meeting.started requires authenticated bot=true evidence for recorder self', async () => {
+  for (const bot of [false, undefined]) {
+    const { recording } = await createRecordingHarness();
+    installLifecycleV3(recording);
+    (recording.recorder.client.bot.user as { bot?: boolean }).bot = bot;
+
+    assert.throws(
+      () => (recording as unknown as RecordingLifecycleInternals).createMeetingStartedLifecycleEvent([participantId]),
+      /recorder self must have bot=true/
+    );
+  }
+});
+
+test('v3 recorder self remains automation when allowlisted as synthetic human', async () => {
+  const { recording } = await createRecordingHarness();
+  installLifecycleV3(recording, [botId]);
+
+  const started = (recording as unknown as RecordingLifecycleInternals).createMeetingStartedLifecycleEvent([botId, participantId]);
+  assert.deepEqual((started as CraigLifecycleV3Event & { type: 'meeting.started' }).actors, [
+    { actorId: botId, kind: 'automation' },
+    { actorId: participantId, kind: 'human' }
+  ]);
+});
+
+test('v3 meeting.started keeps deterministic ordering when recorder self sorts last', async () => {
+  const higherBotId = '9999999999999999999';
+  const { recording } = await createRecordingHarness();
+  recording.recorder.client.bot.user.id = higherBotId;
+  installLifecycleV3(recording);
+
+  const started = (recording as unknown as RecordingLifecycleInternals).createMeetingStartedLifecycleEvent([participantId]);
+  assert.deepEqual((started as CraigLifecycleV3Event & { type: 'meeting.started' }).actors, [
+    { actorId: participantId, kind: 'human' },
+    { actorId: higherBotId, kind: 'automation' }
+  ]);
+});
+
+test('meeting.started v1 continues to contain only human participant ids', async () => {
+  const { recording } = await createRecordingHarness();
+  const started = (recording as unknown as RecordingLifecycleInternals).createMeetingStartedLifecycleEvent([participantId]);
+
+  assert.deepEqual(started, {
+    schemaVersion: 1,
+    eventId: 'recording-1:1',
+    recordingId: 'recording-1',
+    guildId: '1533232836297011436',
+    channelId,
+    occurredAt: started.occurredAt,
+    type: 'meeting.started',
+    participantIds: [participantId]
+  });
+});
 
 test('does not emit participant.left after capacity rejects participant.joined', async () => {
   const { recording, events } = await createRecordingHarness({ status: 'capacity-exhausted' }, { status: 'accepted' }, { status: 'accepted' });

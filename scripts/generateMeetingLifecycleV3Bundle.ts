@@ -91,7 +91,7 @@ function assertFixtureBuiltByRuntime(fixture: CanonicalFixture, producerRevision
         actual = lifecycle.terminal(eventEnvelope(expected), expected.type, expected.reason);
       else
         actual = lifecycle.authoritativeReady(eventEnvelope(expected), {
-          actors: expected.actors.map(authenticatedActor),
+          actors: fixture.authoritativeTrackActorIds.map((id) => ({ id })),
           endedAt: expected.endedAt,
           trackCount: expected.trackCount,
           sourceFilesChecksumSha256: expected.sourceFilesChecksumSha256

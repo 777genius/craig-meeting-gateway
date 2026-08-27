@@ -9,6 +9,10 @@ import {
   CraigPlaybackController,
   CraigPlaybackEvent
 } from './conversationPlayback';
+import {
+  CRAIG_PLAYBACK_DEDUPLICATION_RETENTION_SECONDS,
+  type PlaybackReliabilityStore
+} from './conversationPlaybackReliability';
 
 export const CRAIG_PLAYBACK_MAX_MESSAGE_BYTES = CRAIG_PLAYBACK_MAX_PCM_CHUNK_BYTES * 2;
 
@@ -54,6 +58,7 @@ export interface ConversationPlaybackSessionOptions {
   onCancellation: ConstructorParameters<typeof CraigPlaybackController>[0]['onCancellation'];
   isAttemptRevoked: ConstructorParameters<typeof CraigPlaybackController>[0]['isAttemptRevoked'];
   onPostCancellationPacket: ConstructorParameters<typeof CraigPlaybackController>[0]['onPostCancellationPacket'];
+  reliabilityStore: PlaybackReliabilityStore;
   onReady?: () => void;
   onClosed?: (reason: ConversationPlaybackCloseReason) => void;
 }
@@ -192,20 +197,27 @@ export class CraigConversationPlaybackSession {
 }
 
 interface PlaybackSessionReadyEvent {
-  schemaVersion: 1;
+  schemaVersion: 3;
   type: 'session-ready';
   recordingId: string;
   guildId: string;
   channelId: string;
   gatewaySessionId: string;
+  playbackCapabilities: {
+    attestsDiscordVoiceSend: true;
+    deduplicatesCommandIds: true;
+    deduplicationRetentionSeconds: number;
+    replaysOriginalStartedAtMs: true;
+    suppressesPlaybackAtOrAfterNotAfter: true;
+  };
 }
 
 export async function createConversationPlaybackSession(
   options: ConversationPlaybackSessionOptions
 ): Promise<CraigConversationPlaybackSession | undefined> {
   if (typeof options.onCancellation !== 'function' || typeof options.isAttemptRevoked !== 'function' ||
-      typeof options.onPostCancellationPacket !== 'function')
-    throw new Error('Durable playback cancellation, restart lookup, and post-fence attempt handlers are required');
+      typeof options.onPostCancellationPacket !== 'function' || options.reliabilityStore === undefined)
+    throw new Error('Durable playback cancellation, restart lookup, post-fence, and reliability handlers are required');
   const config = options.config;
   if (!config?.enabled) return undefined;
 
@@ -235,6 +247,7 @@ export async function createConversationPlaybackSession(
     onCancellation: options.onCancellation,
     isAttemptRevoked: options.isAttemptRevoked,
     onPostCancellationPacket: options.onPostCancellationPacket,
+    reliabilityStore: options.reliabilityStore,
     onEvent: (event) => sendEvent(event)
   });
   const gatewaySessionId = options.createGatewaySessionId?.() ?? randomUUID();
@@ -244,12 +257,19 @@ export async function createConversationPlaybackSession(
     socket,
     controller,
     {
-      schemaVersion: 1,
+      schemaVersion: 3,
       type: 'session-ready',
       recordingId: options.recordingId,
       guildId: options.guildId,
       channelId: options.channelId,
-      gatewaySessionId
+      gatewaySessionId,
+      playbackCapabilities: {
+        attestsDiscordVoiceSend: true,
+        deduplicatesCommandIds: true,
+        deduplicationRetentionSeconds: CRAIG_PLAYBACK_DEDUPLICATION_RETENTION_SECONDS,
+        replaysOriginalStartedAtMs: true,
+        suppressesPlaybackAtOrAfterNotAfter: true
+      }
     },
     options.logger,
     options.onReady,

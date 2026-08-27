@@ -145,6 +145,38 @@ export class CraigActorObservationLedger {
   observeBatch(authenticatedActors: readonly AuthenticatedDiscordActor[]): () => void {
     if (!Array.isArray(authenticatedActors)) throw new Error('Craig actor batch is invalid');
     const actors = authenticatedActors.map((actor) => deriveCraigActorFromDiscord(actor, this.e2eSyntheticHumanActorIds));
+    return this.observeDerivedBatch(actors);
+  }
+
+  observeStartedBatch(
+    authenticatedActors: readonly AuthenticatedDiscordActor[],
+    authenticatedRecorderSelf: AuthenticatedDiscordActor
+  ): () => void {
+    if (!Array.isArray(authenticatedActors)) throw new Error('Craig actor batch is invalid');
+    const recorder = deriveCraigActorFromDiscord(authenticatedRecorderSelf);
+    if (authenticatedRecorderSelf.bot !== true || recorder.kind !== 'automation')
+      throw new Error('Authenticated Discord recorder self must have bot=true');
+    const actors = [
+      recorder,
+      ...authenticatedActors
+        .filter((actor) => actor?.id !== recorder.actorId)
+        .map((actor) => deriveCraigActorFromDiscord(actor, this.e2eSyntheticHumanActorIds))
+    ];
+    return this.observeDerivedBatch(actors);
+  }
+
+  projectAuthoritativeActors(authenticatedActors: readonly AuthenticatedDiscordActor[]): CraigActor[] {
+    if (!Array.isArray(authenticatedActors)) throw new Error('Authoritative track actor identities are invalid');
+    const actorIds = new Set(
+      authenticatedActors.map((actor) => deriveCraigActorFromDiscord(actor).actorId)
+    );
+    const actors = [...actorIds]
+      .sort((left, right) => left.localeCompare(right))
+      .map((actorId) => Object.freeze({ actorId, kind: this.kindsByActor.get(actorId) ?? ('unknown' as const) }));
+    return actors;
+  }
+
+  private observeDerivedBatch(actors: readonly CraigActor[]): () => void {
     const additions = new Set(actors.filter(({ actorId }) => !this.kindsByActor.has(actorId)).map(({ actorId }) => actorId));
     if (this.kindsByActor.size + additions.size > maximumCraigActorRosterSize) throw new Error('Craig actor roster exceeds its bounded size');
 
@@ -223,11 +255,15 @@ export class CraigLifecycleV3Producer {
 
   started(
     envelope: CraigLifecycleEnvelope,
-    actors: readonly AuthenticatedDiscordActor[]
+    actors: readonly AuthenticatedDiscordActor[],
+    authenticatedRecorderSelf?: AuthenticatedDiscordActor
   ): Extract<CraigLifecycleV3Event, { type: 'meeting.started' }> {
     this.assertMutable();
     this.assertCanEmit(envelope, 2);
-    const rollback = this.ledger.observeBatch(actors);
+    const rollback =
+      authenticatedRecorderSelf === undefined
+        ? this.ledger.observeBatch(actors)
+        : this.ledger.observeStartedBatch(actors, authenticatedRecorderSelf);
     return this.emit({ ...this.envelope(envelope), type: 'meeting.started', actors: this.ledger.actors(), rosterState: 'unsealed' }, rollback);
   }
 
@@ -283,22 +319,24 @@ export class CraigLifecycleV3Producer {
     assertContext(envelope, this.context);
     assertAuthoritativeReady(input);
     if (this.sealedReady !== null) {
-      const retryLedger = CraigActorObservationLedger.restoreActors(
-        this.ledger.producer,
-        this.ledger.actors(),
-        this.ledger.observationState(),
-        this.ledger.classificationPolicy()
+      const candidate = this.buildReadyCandidate(
+        envelope,
+        input,
+        this.ledger.projectAuthoritativeActors(input.actors),
+        this.ledger.observationState()
       );
-      retryLedger.observeBatch(input.actors);
-      const candidate = this.buildReadyCandidate(envelope, input, retryLedger.actors(), retryLedger.observationState());
       if (canonicalJson(candidate) !== canonicalJson(this.sealedReady)) throw new Error('Conflicting authoritative-ready retry after ledger seal');
       return deepFreeze(cloneEvent(this.sealedReady));
     }
 
     this.assertCanEmit(envelope);
-    const rollback = this.ledger.observeBatch(input.actors);
-    const ready = this.buildReadyCandidate(envelope, input, this.ledger.actors(), this.ledger.observationState());
-    this.sealedReady = this.emit(ready, rollback);
+    const ready = this.buildReadyCandidate(
+      envelope,
+      input,
+      this.ledger.projectAuthoritativeActors(input.actors),
+      this.ledger.observationState()
+    );
+    this.sealedReady = this.emit(ready);
     return deepFreeze(cloneEvent(this.sealedReady));
   }
 
@@ -521,7 +559,8 @@ export class CraigLifecycleV3Producer {
       if (
         !sameProducer(ready, producer) ||
         ready.actorObservationState !== ledger.observationState() ||
-        canonicalJson(ready.actors) !== canonicalJson(ledger.actors())
+        canonicalJson(ready.actors) !==
+          canonicalJson(ledger.projectAuthoritativeActors(ready.actors.map(({ actorId }) => ({ id: actorId }))))
       )
         throw new Error('Durable lifecycle snapshot seal does not bind its final actor evidence');
       lifecycle.sealedReady = deepFreeze(ready);

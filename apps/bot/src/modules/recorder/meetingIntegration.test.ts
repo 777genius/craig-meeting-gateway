@@ -1459,30 +1459,59 @@ test('replays the exact ordered lifecycle v3 outbox and sealed ready event after
   }));
   const sourceFilesChecksumSha256 = createHash('sha256').update(JSON.stringify(sourceFiles), 'utf8').digest('hex');
   const ready = lifecycle.authoritativeReady(envelope('recording-1:authoritative-ready:v3', terminalEvent.occurredAt), {
-    actors: [
-      { id: event.participantIds[0], bot: false, system: false, webhook: false },
-      { id: '1533228054724346087', bot: true, system: false, webhook: false }
-    ],
+    actors: [{ id: event.participantIds[0] }],
     endedAt: terminalEvent.occurredAt,
     trackCount: 1,
     sourceFilesChecksumSha256
   });
+  const persistedJob = {
+    schemaVersion: 3,
+    publicationId: `authoritative-recording:v3:${event.recordingId}`,
+    recordingId: event.recordingId,
+    guildId: event.guildId,
+    channelId: event.channelId,
+    startedEvent: started,
+    terminalEvent: ended,
+    sourceFiles,
+    authoritativeTracks: [{ speakerId: event.participantIds[0], trackNumber: 1, timelineOffsetMs: 0 }],
+    authoritativeTimelineBasis: 'craig-cook-shared-origin-v1',
+    lifecycleV3Snapshot: lifecycle.durableSnapshot()
+  };
   await writeFile(
     path.join(pendingRoot, `${event.recordingId}.json`),
-    `${JSON.stringify({
-      schemaVersion: 3,
-      publicationId: `authoritative-recording:v3:${event.recordingId}`,
-      recordingId: event.recordingId,
-      guildId: event.guildId,
-      channelId: event.channelId,
-      startedEvent: started,
-      terminalEvent: ended,
-      sourceFiles,
-      authoritativeTracks: [{ speakerId: event.participantIds[0], trackNumber: 1, timelineOffsetMs: 0 }],
-      authoritativeTimelineBasis: 'craig-cook-shared-origin-v1',
-      lifecycleV3Snapshot: lifecycle.durableSnapshot()
-    })}\n`
+    `${JSON.stringify(persistedJob)}\n`
   );
+
+  const mismatchedReady = { ...ready, actors: [{ actorId: '1533228054724346087', kind: 'automation' as const }] };
+  const mismatchedJob = {
+    ...persistedJob,
+    lifecycleV3Snapshot: {
+      ...persistedJob.lifecycleV3Snapshot,
+      sealedReady: mismatchedReady,
+      pendingOutbox: persistedJob.lifecycleV3Snapshot.pendingOutbox.map((pending) =>
+        pending.eventId === ready.eventId ? mismatchedReady : pending)
+    }
+  };
+  const rejectedOutboxRoot = path.join(root, 'mismatched-outbox');
+  await mkdir(path.join(rejectedOutboxRoot, 'pending'), { recursive: true });
+  await writeFile(path.join(rejectedOutboxRoot, 'pending', `${event.recordingId}.json`), `${JSON.stringify(mismatchedJob)}\n`);
+  const recoveryVerifier = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined }, logger, 4, 2, 1024,
+    { recordingRoot, outboxRoot: rejectedOutboxRoot }, lifecycleV3Config
+  );
+  await recoveryVerifier.restoreOriginalRecordingJobs();
+  assert.deepEqual(await readdir(path.join(rejectedOutboxRoot, 'rejected')), [`${event.recordingId}.json`],
+    'restart recovery rejects a same-count seal for the wrong speaker roster');
+
+  let cookedMismatchedRoster = false;
+  const finalVerifier = new BoundedMeetingIntegrationSink(
+    { post: async () => undefined }, logger, 4, 2, 1024,
+    { recordingRoot, outboxRoot: path.join(root, 'final-verifier'), cooker: {
+      async cook() { cookedMismatchedRoster = true; throw new Error('must not cook mismatched roster'); }
+    } }, lifecycleV3Config
+  );
+  await assert.rejects((finalVerifier as any).deliverOriginalJob(mismatchedJob), /track roster/);
+  assert.equal(cookedMismatchedRoster, false, 'final publication rejects the mismatched seal before track upload work');
 
   const syntheticTrack = Buffer.from('OggS-synthetic');
   await writeFile(path.join(root, 'synthetic.ogg'), syntheticTrack);
@@ -2309,7 +2338,7 @@ test('production lifecycle maintenance scheduler fairly compacts two interleaved
     assert.equal((sink as any).lifecycleV3JournalIndex.get(recordingId).generation, 1);
 });
 
-test('lifecycle v3 restart and compaction preserve left-only actors and first trusted conflict kind', async (context) => {
+test('lifecycle v3 restart and compaction keep lifetime evidence separate from the exact sealed track roster', async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), 'craig-v3-actor-reducer-test-'));
   context.after(async () => rm(root, { recursive: true, force: true }));
   const recordingId = 'actor-reducer-recording';
@@ -2335,6 +2364,18 @@ test('lifecycle v3 restart and compaction preserve left-only actors and first tr
     { id: leftOnlyActorId, bot: true, system: false, webhook: false });
   assert.equal(sink.publishLifecycle(conflict, producer.durableSnapshot()).status, 'accepted');
   assert.equal(await sink.drain(2000), true);
+  const terminal = producer.terminal(envelope('actor:end', '2026-08-18T00:00:03.000Z'), 'meeting.ended', null);
+  const unknownTrackActorId = '1533228054724346100';
+  const ready = producer.authoritativeReady(envelope('actor:ready', '2026-08-18T00:00:03.000Z'), {
+    actors: [{ id: leftOnlyActorId }, { id: unknownTrackActorId }],
+    endedAt: '2026-08-18T00:00:03.000Z',
+    trackCount: 2,
+    sourceFilesChecksumSha256: 'a'.repeat(64)
+  });
+  (sink as any).appendLifecycleV3Event(undefined, terminal, 3);
+  (sink as any).acknowledgeLifecycleV3Event(terminal);
+  (sink as any).appendLifecycleV3Event(undefined, ready, 4);
+  (sink as any).acknowledgeLifecycleV3Event(ready);
   const state = (sink as any).lifecycleV3JournalIndex.get(recordingId);
   state.maintenanceNeeded = true;
   (sink as any).lifecycleV3MaintenanceQueue.add(recordingId);
@@ -2349,6 +2390,10 @@ test('lifecycle v3 restart and compaction preserve left-only actors and first tr
     { actorId: event.participantIds[0], kind: 'human' },
     { actorId: leftOnlyActorId, kind: 'human' }
   ]);
+  assert.deepEqual(snapshot.sealedReady?.actors, [
+    { actorId: leftOnlyActorId, kind: 'human' },
+    { actorId: unknownTrackActorId, kind: 'unknown' }
+  ], 'authoritative ready contains only the sorted deduplicated track speaker roster');
   assert.equal(snapshot.actorObservationState, 'conflicted');
 });
 

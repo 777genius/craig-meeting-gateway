@@ -14,10 +14,68 @@ import {
   CraigPlaybackVoiceConnection,
   duplicateMonoPcmFrameToStereo
 } from './conversationPlayback';
+import {
+  type PlaybackReliabilityIdentity,
+  type PlaybackReliabilitySnapshot,
+  type PlaybackReliabilityStore,
+  type PlaybackReliabilityTerminal
+} from './conversationPlaybackReliability';
 
 const recordingId = 'recording-1';
 const turnId = 'turn-1';
 const attemptId = 'attempt-1';
+
+class MemoryPlaybackReliabilityStore implements PlaybackReliabilityStore {
+  private readonly snapshots = new Map<string, Exclude<PlaybackReliabilitySnapshot, { status: 'fresh' }>>();
+
+  inspect(identity: Readonly<PlaybackReliabilityIdentity>): PlaybackReliabilitySnapshot {
+    return this.snapshots.get(this.key(identity)) ?? { status: 'fresh' };
+  }
+
+  reserve(identity: Readonly<PlaybackReliabilityIdentity>, notAfterUnixMs: number | undefined, reservedAtMs: number) {
+    const existing = this.inspect(identity);
+    if (existing.status !== 'fresh') return { created: false, snapshot: existing };
+    const snapshot = {
+      status: 'dispatching' as const,
+      reservedAtMs,
+      ...(notAfterUnixMs === undefined ? {} : { notAfterUnixMs })
+    };
+    this.snapshots.set(this.key(identity), snapshot);
+    return { created: true, snapshot };
+  }
+
+  authorizeFirstPacket(identity: Readonly<PlaybackReliabilityIdentity>, nowMs: number): boolean {
+    const snapshot = this.inspect(identity);
+    return snapshot.status === 'dispatching' && (snapshot.notAfterUnixMs === undefined || nowMs < snapshot.notAfterUnixMs);
+  }
+
+  markStarted(identity: Readonly<PlaybackReliabilityIdentity>, startedAtMs: number): number {
+    const current = this.inspect(identity);
+    if (current.status === 'started') return current.startedAtMs;
+    if (current.status === 'terminal' && current.startedAtMs !== undefined) return current.startedAtMs;
+    if (current.status !== 'dispatching') throw new Error('not reserved');
+    this.snapshots.set(this.key(identity), { ...current, status: 'started', startedAtMs });
+    return startedAtMs;
+  }
+
+  markTerminal(identity: Readonly<PlaybackReliabilityIdentity>, terminal: Readonly<PlaybackReliabilityTerminal>): PlaybackReliabilitySnapshot {
+    const current = this.inspect(identity);
+    if (current.status === 'terminal') return current;
+    const snapshot = {
+      status: 'terminal' as const,
+      reservedAtMs: current.status === 'fresh' ? 0 : current.reservedAtMs,
+      ...(current.status === 'fresh' || current.notAfterUnixMs === undefined ? {} : { notAfterUnixMs: current.notAfterUnixMs }),
+      ...(current.status === 'started' ? { startedAtMs: current.startedAtMs } : {}),
+      terminal: { ...terminal }
+    };
+    this.snapshots.set(this.key(identity), snapshot);
+    return snapshot;
+  }
+
+  private key(identity: Readonly<PlaybackReliabilityIdentity>): string {
+    return `${identity.recordingId}/${identity.turnId}/${identity.attemptId}`;
+  }
+}
 
 class FakeEncoder implements CraigPlaybackOpusEncoder {
   readonly frames: Buffer[] = [];
@@ -104,6 +162,7 @@ function createFixture(
         }>): boolean;
         isAttemptRevoked?(identity: Readonly<{ turnId: string; attemptId: string }>): boolean;
         onPostCancellationPacket?(identity: Readonly<{ turnId: string; attemptId: string }>): boolean;
+        reliabilityStore?: PlaybackReliabilityStore;
       }
 ) {
   const connection = new FakeVoiceConnection();
@@ -126,6 +185,7 @@ function createFixture(
     onCancellation: typeof hooks === 'object' ? hooks.onCancellation : () => true,
     isAttemptRevoked: typeof hooks === 'object' ? hooks.isAttemptRevoked ?? (() => false) : () => false,
     onPostCancellationPacket: typeof hooks === 'object' ? hooks.onPostCancellationPacket ?? (() => true) : () => true,
+    reliabilityStore: typeof hooks === 'object' ? hooks.reliabilityStore ?? new MemoryPlaybackReliabilityStore() : new MemoryPlaybackReliabilityStore(),
     onEvent: (event) => {
       events.push(event);
       connection.order.push(event.type);
@@ -192,7 +252,7 @@ test('requires every durable cancellation port at construction', () => {
       arbiter: new CraigPlaybackArbiter(() => new FakeVoiceConnection()),
       onEvent() {}
     }),
-    /restart lookup, and post-fence attempt handlers are required/
+    /restart lookup, post-fence, and reliability handlers are required/
   );
 });
 
@@ -248,6 +308,81 @@ test('dispatches and records only after the direct Discord send accepts each pac
   timer.advance(1);
   assert.deepEqual(connection.packets, [Buffer.from([1]), Buffer.from([2])]);
   assert.deepEqual(dispatchedPackets, [Buffer.from([1]), Buffer.from([2])]);
+});
+
+test('suppresses playback when its absolute deadline passes before the first Discord packet', () => {
+  const fixture = createFixture();
+  assert.equal(fixture.controller.handleCommand(start({ notAfterUnixMs: 4_010 })), true);
+  fixture.timer.now = 4_010;
+  assert.equal(fixture.controller.handleCommand(audio(0, frame(1))), true);
+
+  assert.deepEqual(fixture.connection.packets, []);
+  assert.deepEqual(fixture.dispatchedPackets, []);
+  assert.deepEqual(fixture.events, [{
+    schemaVersion: 1,
+    type: 'playback-failed',
+    recordingId,
+    turnId,
+    attemptId,
+    code: 'playback-error',
+    safeMessage: 'Playback suppressed at its absolute not-after deadline.',
+    retryable: false
+  }]);
+});
+
+test('replays the original started receipt after reconnect without replaying Discord audio', () => {
+  const reliabilityStore = new MemoryPlaybackReliabilityStore();
+  const original = createFixture({
+    onCancellation: () => true,
+    reliabilityStore
+  });
+  original.controller.handleCommand(start());
+  original.controller.handleCommand(audio(0, frame(1)));
+  original.controller.transportDisconnected();
+
+  const recovered = createFixture({
+    onCancellation: () => true,
+    reliabilityStore
+  });
+  recovered.timer.now = 9_000;
+  assert.equal(recovered.controller.handleCommand(start()), true);
+  assert.equal(recovered.controller.handleCommand(audio(0, frame(1))), true);
+  assert.equal(recovered.controller.handleCommand(finish()), true);
+
+  assert.deepEqual(recovered.connection.packets, []);
+  assert.equal((recovered.events[0] as Extract<CraigPlaybackEvent, { type: 'playback-started' }>).startedAtMs, 4_000);
+  assert.deepEqual(recovered.events.map(({ type }) => type), ['playback-started', 'playback-finished']);
+});
+
+test('fails a crash-ambiguous reserved attempt closed without sending audio', () => {
+  const reliabilityStore = new MemoryPlaybackReliabilityStore();
+  reliabilityStore.reserve({ recordingId, turnId, attemptId }, undefined, 3_900);
+  const recovered = createFixture({
+    onCancellation: () => true,
+    reliabilityStore
+  });
+
+  assert.equal(recovered.controller.handleCommand(start()), true);
+  assert.equal(recovered.controller.handleCommand(audio(0, frame(1))), true);
+  assert.deepEqual(recovered.connection.packets, []);
+  assert.deepEqual(recovered.events.map(({ type }) => type), ['playback-failed']);
+  assert.equal((recovered.events[0] as Extract<CraigPlaybackEvent, { type: 'playback-failed' }>).retryable, false);
+});
+
+test('deduplicates identical audio commands and rejects a conflicting command id', () => {
+  const fixture = createFixture();
+  fixture.controller.handleCommand(start());
+  fixture.controller.handleCommand(audio(0, frame(1)));
+  fixture.timer.now = 8_000;
+  fixture.controller.handleCommand(start());
+  fixture.controller.handleCommand(audio(0, frame(1)));
+  assert.deepEqual(fixture.connection.packets, [Buffer.from([1])]);
+  assert.equal((fixture.events[1] as Extract<CraigPlaybackEvent, { type: 'playback-started' }>).startedAtMs, 4_000);
+
+  fixture.controller.handleCommand(audio(0, frame(2)));
+  assert.deepEqual(fixture.connection.packets, [Buffer.from([1])]);
+  assert.deepEqual(fixture.events.map(({ type }) => type), ['playback-started', 'playback-started', 'playback-failed']);
+  assert.equal((fixture.events[2] as Extract<CraigPlaybackEvent, { type: 'playback-failed' }>).retryable, false);
 });
 
 test('encodes full frames in sequence and drops a finish-time partial tail', () => {
@@ -624,6 +759,7 @@ test('the production native encoder produces a decodable Discord Opus packet', (
     onCancellation: () => true,
     isAttemptRevoked: () => false,
     onPostCancellationPacket: () => true,
+    reliabilityStore: new MemoryPlaybackReliabilityStore(),
     onEvent: (event) => events.push(event)
   });
   const monoFrame = Buffer.alloc(CRAIG_PLAYBACK_MONO_FRAME_BYTES);
