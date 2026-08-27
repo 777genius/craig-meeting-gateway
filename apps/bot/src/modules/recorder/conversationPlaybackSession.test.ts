@@ -11,6 +11,7 @@ import {
   CraigPlaybackOpusEncoder,
   CraigPlaybackVoiceConnection
 } from './conversationPlayback';
+import { FilePlaybackReliabilityStore } from './conversationPlaybackReliability';
 import { ConversationPlaybackSocket, ConversationPlaybackSocketOptions, createConversationPlaybackSession } from './conversationPlaybackSession';
 
 const recordingId = 'recording-1';
@@ -63,6 +64,39 @@ class FakeEncoder implements CraigPlaybackOpusEncoder {
 
 const logger = { debug: () => {}, warn: () => {} };
 
+test('persists dispatch, original start time, and terminal receipts across store reopen', async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'craig-playback-reliability-test-'));
+  context.after(async () => rm(root, { recursive: true, force: true }));
+  const fileBase = path.join(root, 'recording');
+  const identity = { recordingId, turnId: 'turn-1', attemptId: 'attempt-1' };
+
+  const first = new FilePlaybackReliabilityStore(fileBase);
+  assert.equal(first.reserve(identity, 5_000, 4_000).created, true);
+  assert.equal(new FilePlaybackReliabilityStore(fileBase).authorizeFirstPacket(identity, 4_999), true);
+  assert.equal(new FilePlaybackReliabilityStore(fileBase).authorizeFirstPacket(identity, 5_000), false);
+  assert.equal(first.markStarted(identity, 4_500), 4_500);
+
+  const reopened = new FilePlaybackReliabilityStore(fileBase);
+  assert.deepEqual(reopened.inspect(identity), {
+    schemaVersion: 1,
+    identity,
+    status: 'started',
+    reservedAtMs: 4_000,
+    notAfterUnixMs: 5_000,
+    startedAtMs: 4_500
+  });
+  reopened.markTerminal(identity, { type: 'playback-finished', finishedAtMs: 4_900 });
+  assert.deepEqual(new FilePlaybackReliabilityStore(fileBase).inspect(identity), {
+    schemaVersion: 1,
+    identity,
+    status: 'terminal',
+    reservedAtMs: 4_000,
+    notAfterUnixMs: 5_000,
+    startedAtMs: 4_500,
+    terminal: { type: 'playback-finished', finishedAtMs: 4_900 }
+  });
+});
+
 test('requires durable restart lookup and post-fence recording at the session composition boundary', async () => {
   await assert.rejects(
     // @ts-expect-error all durable cancellation ports are mandatory even when playback is disabled
@@ -75,7 +109,7 @@ test('requires durable restart lookup and post-fence recording at the session co
       logger,
       onCancellation: () => true
     }),
-    /restart lookup, and post-fence attempt handlers are required/
+    /restart lookup, post-fence, and reliability handlers are required/
   );
 });
 
@@ -153,6 +187,7 @@ test('opens an authenticated recording-scoped outbound session and emits playbac
     onCancellation: () => true,
     isAttemptRevoked: () => false,
     onPostCancellationPacket: () => true,
+    reliabilityStore: new FilePlaybackReliabilityStore(path.join(root, 'recording')),
     onPacketDispatched: (packet) => dispatchedPackets.push(Buffer.from(packet)),
     socketFactory: (url, options) => {
       socketUrl = url;
@@ -182,12 +217,19 @@ test('opens an authenticated recording-scoped outbound session and emits playbac
     ['session-ready', 'playback-started']
   );
   assert.deepEqual(JSON.parse(socket.sent[0]!), {
-    schemaVersion: 1,
+    schemaVersion: 3,
     type: 'session-ready',
     recordingId,
     guildId,
     channelId,
-    gatewaySessionId: 'gateway-session-1'
+    gatewaySessionId: 'gateway-session-1',
+    playbackCapabilities: {
+      attestsDiscordVoiceSend: true,
+      deduplicatesCommandIds: true,
+      deduplicationRetentionSeconds: 300,
+      replaysOriginalStartedAtMs: true,
+      suppressesPlaybackAtOrAfterNotAfter: true
+    }
   });
 
   session.close('connection-unavailable');
@@ -220,6 +262,7 @@ test('closes the outbound transport for a cross-recording command', async (conte
     onCancellation: () => true,
     isAttemptRevoked: () => false,
     onPostCancellationPacket: () => true,
+    reliabilityStore: new FilePlaybackReliabilityStore(path.join(root, 'recording')),
     onClosed: (reason) => {
       closeReason = reason;
     },
@@ -264,6 +307,7 @@ test('closes fail-closed without leaking a durable late-counter exception from t
     onPostCancellationPacket: () => {
       throw new Error('fsync failed');
     },
+    reliabilityStore: new FilePlaybackReliabilityStore(path.join(root, 'recording')),
     onClosed: (reason) => {
       closeReason = reason;
     },
@@ -308,6 +352,7 @@ test('enforces the four-digit cancellation timestamp boundary before durable adm
     },
     isAttemptRevoked: () => false,
     onPostCancellationPacket: () => true,
+    reliabilityStore: new FilePlaybackReliabilityStore(path.join(root, 'recording')),
     socketFactory: () => socket as unknown as ConversationPlaybackSocket
   });
   assert.ok(session);

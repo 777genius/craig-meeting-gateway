@@ -26,6 +26,7 @@ import {
 } from './authoritativePlaybackTrack';
 import { CRAIG_PLAYBACK_MAX_CANONICAL_TIMESTAMP_MS, CraigPlaybackArbiter } from './conversationPlayback';
 import { ConversationPlaybackReconnect } from './conversationPlaybackReconnect';
+import { FilePlaybackReliabilityStore } from './conversationPlaybackReliability';
 import { CraigConversationPlaybackSession, createConversationPlaybackSession } from './conversationPlaybackSession';
 import {
   type AnyMeetingStartedLifecycleEvent,
@@ -631,6 +632,8 @@ export default class Recording {
 
   private openConversationPlayback(): void {
     if (this.conversationPlayback || !this.active || !this.connection) return;
+    const writer = this.writer;
+    if (!writer) return;
     if (this.conversationPlaybackOpening) {
       this.conversationPlaybackReopenRequested = true;
       return;
@@ -652,6 +655,7 @@ export default class Recording {
       onCancellation: (cancellation) => this.persistConversationPlaybackFence(generation, cancellation),
       isAttemptRevoked: (identity) => this.isConversationPlaybackAttemptRevoked(generation, identity),
       onPostCancellationPacket: (identity) => this.recordPostCancellationPacketAttempt(generation, identity),
+      reliabilityStore: new FilePlaybackReliabilityStore(writer.fileBase),
       onReady: () => this.conversationPlaybackReconnect.connected(),
       onClosed: (reason) => {
         if (this.conversationPlayback?.isClosed) this.conversationPlayback = undefined;
