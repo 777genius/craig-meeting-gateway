@@ -1234,7 +1234,10 @@ export default class Recording {
       const member = this.channel.voiceMembers.get(participantId);
       return member === undefined ? { id: participantId } : authenticatedDiscordActor(member);
     });
-    return this.createLifecycleV3Event(() => this.lifecycleV3!.started(this.createMeetingLifecycleEnvelope(), actors));
+    const self = this.recorder.client.bot.user;
+    return this.createLifecycleV3Event(() =>
+      this.lifecycleV3!.started(this.createMeetingLifecycleEnvelope(), actors, { id: self.id, bot: self.bot })
+    );
   }
 
   private createMeetingParticipantLifecycleEvent(

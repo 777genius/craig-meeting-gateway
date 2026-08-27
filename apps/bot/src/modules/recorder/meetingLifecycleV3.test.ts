@@ -158,7 +158,7 @@ test('validates actor batches transactionally before any ledger mutation', () =>
   assert.deepEqual(lifecycle.durableSnapshot(), before);
 });
 
-test('marks contradictory authenticated identity evidence conflicted and filters it closed', () => {
+test('retains contradictory lifetime identity evidence and seals it fail-closed', () => {
   const lifecycle = createCraigLifecycleV3Producer(config, context);
   lifecycle.started(envelope, [human]);
   lifecycle.participant({ ...envelope, eventId: 'recording-1:2', occurredAt: '2026-08-13T00:00:01.000Z' }, 'participant.joined', {
@@ -172,23 +172,60 @@ test('marks contradictory authenticated identity evidence conflicted and filters
     { ...envelope, eventId: 'recording-1:ready', occurredAt: '2026-08-13T00:00:02.000Z' },
     { actors: [human], endedAt: '2026-08-13T00:00:02.000Z', sourceFilesChecksumSha256: 'a'.repeat(64), trackCount: 1 }
   );
+  assert.equal(ready.actorObservationState, 'conflicted');
+  assert.deepEqual(ready.actors, [{ actorId: human.id, kind: 'human' }]);
   assert.deepEqual(selectCraigKnowledgeEligibleActorIds(ready, [human.id]), []);
 });
 
-test('filters automation, unknown, and untracked identities from a consistent sealed roster', () => {
+test('authoritative-ready is exactly deduplicated track identities projected through the lifetime ledger', () => {
   const unknown = { id: '1533228590643155035' } as const;
   const lifecycle = createCraigLifecycleV3Producer(config, context);
   lifecycle.started(envelope, [human, automation, unknown]);
   const ready = lifecycle.authoritativeReady(
     { ...envelope, eventId: 'recording-1:ready', occurredAt: '2026-08-13T00:00:02.000Z' },
     {
-      actors: [human, automation, unknown],
+      actors: [{ id: automation.id }, { id: human.id }, { id: automation.id }],
       endedAt: '2026-08-13T00:00:02.000Z',
       sourceFilesChecksumSha256: 'a'.repeat(64),
       trackCount: 3
     }
   );
-  assert.deepEqual(selectCraigKnowledgeEligibleActorIds(ready, [automation.id, unknown.id, human.id]), [human.id]);
+  assert.deepEqual(ready.actors, [
+    { actorId: human.id, kind: 'human' },
+    { actorId: automation.id, kind: 'automation' }
+  ]);
+  assert.deepEqual(lifecycle.durableSnapshot().actors, [
+    { actorId: human.id, kind: 'human' },
+    { actorId: automation.id, kind: 'automation' },
+    { actorId: unknown.id, kind: 'unknown' }
+  ]);
+  assert.deepEqual(selectCraigKnowledgeEligibleActorIds(ready, [automation.id, human.id]), [human.id]);
+});
+
+test('authoritative-ready omits a silent start participant without an authoritative track', () => {
+  const silentHuman = { id: '1533228590643155036', bot: false, system: false, webhook: false } as const;
+  const lifecycle = createCraigLifecycleV3Producer(config, context);
+  lifecycle.started(envelope, [human, silentHuman]);
+  const ready = lifecycle.authoritativeReady(
+    { ...envelope, eventId: 'recording-1:ready', occurredAt: '2026-08-13T00:00:02.000Z' },
+    { actors: [{ id: human.id }], endedAt: '2026-08-13T00:00:02.000Z', sourceFilesChecksumSha256: 'a'.repeat(64), trackCount: 1 }
+  );
+  assert.deepEqual(ready.actors, [{ actorId: human.id, kind: 'human' }]);
+  assert.deepEqual(lifecycle.durableSnapshot().actors, [
+    { actorId: human.id, kind: 'human' },
+    { actorId: silentHuman.id, kind: 'human' }
+  ]);
+});
+
+test('authoritative-ready marks a track without a trusted lifetime classification unknown', () => {
+  const lifecycle = createCraigLifecycleV3Producer(config, context);
+  lifecycle.started(envelope, [human]);
+  const ready = lifecycle.authoritativeReady(
+    { ...envelope, eventId: 'recording-1:ready', occurredAt: '2026-08-13T00:00:02.000Z' },
+    { actors: [{ id: automation.id }], endedAt: '2026-08-13T00:00:02.000Z', sourceFilesChecksumSha256: 'a'.repeat(64), trackCount: 1 }
+  );
+  assert.deepEqual(ready.actors, [{ actorId: automation.id, kind: 'unknown' }]);
+  assert.deepEqual(selectCraigKnowledgeEligibleActorIds(ready, [automation.id]), []);
 });
 
 test('snapshot binds producer, recording context, event order, and pending exact replay', () => {
@@ -345,8 +382,8 @@ test('producer-owned canonical bundle has the exact bytes pinned by the Meeting 
   ]);
   const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
   assert.equal(digest(schema), 'aab972f39dde6e5336b8301c2da8204ad5c99e881a9432bec87db41020230f8d');
-  assert.equal(digest(fixtures), 'b8d5b86ee248dcf2823fdfcc7a610d0197a4bdfbdd0963c17ddb7b4d2c4d3f9e');
-  assert.equal(digest(sums), '43b58c2661b22039fa432199227318b0d91fbbe1faa669bc0e62a68ddff8f940');
-  assert.equal(digest(bundle), '9ecdba8ebe3dd7e5ca4d67be0d540a66d07c3a66e0536dcd9c929099249f72a9');
+  assert.equal(digest(fixtures), '16adba2a84af35ca80adc65cfa44c52b9d520790a618825f65c9936c35bb956a');
+  assert.equal(digest(sums), 'ccf1c4eef0842566f4ef59694f9bc9a14173faf5374e0398fa8904e19ff012a1');
+  assert.equal(digest(bundle), 'eea1368481bbcdd33f052380c4c8e2d454e55aaed46cbfc8c2d2231261322e2f');
   assert.equal(bundle.toString('utf8'), `${digest(sums)}  SHA256SUMS\n`);
 });
