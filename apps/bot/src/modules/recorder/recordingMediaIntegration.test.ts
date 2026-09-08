@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import Module from 'node:module';
+import Module, { createRequire } from 'node:module';
 import { EventEmitter } from 'node:events';
 import { createCipheriv } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
@@ -24,7 +24,7 @@ function loadRecording(): typeof RecordingType {
     return original(request, parent, main);
   };
   try {
-    return require('./recording').default;
+    return (createRequire(__filename)('./recording') as typeof import('./recording')).default;
   } finally {
     loader._load = original;
   }
@@ -95,7 +95,7 @@ function loadOfflineReceiver(): any {
     return original(request, parent, main);
   };
   try {
-    const VoiceConnection = require(receiverPath);
+    const VoiceConnection = createRequire(__filename)(receiverPath);
     return new VoiceConnection('guild', { shared: true, opusOnly: true, daveEncryption: false });
   } finally {
     loader._load = original;
@@ -129,7 +129,7 @@ test('real pinned UDP receiver carries replacement SSRC through production onDat
   // Execute the exact bounded receiver setup from Recording, so dropping the
   // fifth argument or socket binding in production makes this test fail.
   const source = readFileSync(resolve(__dirname, 'recording.ts'), 'utf8');
-  const setup = source.match(/if \(!alreadyConnected \|\| !this.connection \|\| !this.receiver\) \{([\s\S]*?)\n    \}/)![1];
+  const setup = source.match(/if \(!alreadyConnected \|\| !this.connection \|\| !this.receiver\) \{([\s\S]*?)\n {4}\}/)![1];
   new Function('connection', setup).call(recording, connection);
   const receiver = recording.receiver;
   let socket = connection.udpSocket;

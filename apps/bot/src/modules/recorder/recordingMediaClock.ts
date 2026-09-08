@@ -22,19 +22,21 @@ export class RecordingMediaClock {
     // without touching the packet, receiver listeners or decryption pipeline.
     // Select the general emit signature; Socket's last overload is message-only.
     const emit: (this: Socket, event: string | symbol, ...args: unknown[]) => boolean = socket.emit;
-    const clock = this;
-    const scopedEmit: Socket['emit'] = function (this: Socket, event: string | symbol, ...args: unknown[]): boolean {
-      if (event !== 'message') return emit.call(this, event, ...args);
-      const previous = clock.packet;
+    const forwardEmit = (receiver: Socket, event: string | symbol, ...args: unknown[]): boolean => {
+      if (event !== 'message') return emit.call(receiver, event, ...args);
+      const previous = this.packet;
       const msg = args[0];
-      clock.packet = Buffer.isBuffer(msg) && msg.length >= 12 && msg[0] >>> 6 === 2 && msg[1] === 0x78
+      this.packet = Buffer.isBuffer(msg) && msg.length >= 12 && msg[0] >>> 6 === 2 && msg[1] === 0x78
         ? { source: `${generation}:${msg.readUInt32BE(8)}`, timestamp: msg.readUInt32BE(4), sequence: msg.readUInt16BE(2) }
         : undefined;
       try {
-        return emit.call(this, event, ...args);
+        return emit.call(receiver, event, ...args);
       } finally {
-        clock.packet = previous;
+        this.packet = previous;
       }
+    };
+    const scopedEmit: Socket['emit'] = function (this: Socket, event: string | symbol, ...args: unknown[]): boolean {
+      return forwardEmit(this, event, ...args);
     };
     socket.emit = scopedEmit;
     this.detach = () => {

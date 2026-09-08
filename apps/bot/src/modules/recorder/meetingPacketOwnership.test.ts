@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import Module from 'node:module';
+import Module, { createRequire } from 'node:module';
 import {
   BoundedMeetingIntegrationSink,
   MeetingIntegrationDeliveryError,
@@ -82,7 +82,7 @@ test('HTTP transport serializes only owned entries across a deferred 400 respons
     : original(request, parent, main);
   let sink: BoundedMeetingIntegrationSink;
   try {
-    const local = require('./meetingIntegration') as typeof import('./meetingIntegration');
+    const local = createRequire(__filename)('./meetingIntegration') as typeof import('./meetingIntegration');
     sink = new local.BoundedMeetingIntegrationSink(new local.HttpMeetingIntegrationTransport(
       new URL('http://craig-local.invalid'), 'local-test-token', 2000
     ), { debug() {}, error() {}, warn() {} }, 4, 4);
