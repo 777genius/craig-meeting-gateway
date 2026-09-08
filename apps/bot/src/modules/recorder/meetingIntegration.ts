@@ -510,6 +510,7 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
   private readonly openRecordings = new Set<string>();
   private readonly closedRecordings = new Map<string, true>();
   private processing = false;
+  private submittedVoiceBatch: WireVoicePacket[] | null = null;
   private retryTimer: NodeJS.Timeout | null = null;
   private processingOriginal = false;
   private originalRetryTimer: NodeJS.Timeout | null = null;
@@ -1618,18 +1619,22 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
         if (first.event.schemaVersion === 3) this.acknowledgeLifecycleV3Event(first.event);
         this.advanceQueue(1);
       } else {
-        const batch: WireVoicePacket[] = [];
-        for (let index = this.queueHead; index < this.queue.length; index++) {
+        const batch: WireVoicePacket[] = this.submittedVoiceBatch ?? [];
+        for (let index = this.queueHead; this.submittedVoiceBatch === null && index < this.queue.length; index++) {
           const item = this.queue[index];
           if (item.type !== 'voice' || batch.length >= this.batchSize) break;
           batch.push(item.packet);
         }
+        // process() is the sole dequeue owner. Retain this exact prefix across
+        // awaits and retries; later admissions belong to a different request.
+        this.submittedVoiceBatch = batch;
         await this.transport.post('/v1/craig/voice-packets', {
           schemaVersion: 1,
           packets: batch
         });
         this.advanceQueue(batch.length);
         this.queuedPackets -= batch.length;
+        this.submittedVoiceBatch = null;
       }
       this.consecutiveFailures = 0;
     } catch (error) {
@@ -1645,14 +1650,10 @@ export class BoundedMeetingIntegrationSink implements MeetingIntegrationSink {
       const first = this.queue[this.queueHead];
       if (first.type === 'lifecycle') this.advanceQueue(1);
       else {
-        let discardedPackets = 0;
-        for (let index = this.queueHead; index < this.queue.length; index++) {
-          const item = this.queue[index];
-          if (item.type !== 'voice' || discardedPackets >= this.batchSize) break;
-          discardedPackets++;
-        }
+        const discardedPackets = this.submittedVoiceBatch!.length;
         this.advanceQueue(discardedPackets);
         this.queuedPackets -= discardedPackets;
+        this.submittedVoiceBatch = null;
       }
       this.consecutiveFailures = 0;
       this.logger.error('Meeting integration delivery was permanently rejected; discarding it so FIFO can continue', error);

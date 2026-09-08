@@ -43,6 +43,7 @@ import {
   type CraigLifecycleV3Producer,
   createCraigLifecycleV3Producer
 } from './meetingLifecycleV3';
+import { RecordingMediaClock } from './recordingMediaClock';
 import { MeetingParticipantLifecycle } from './meetingParticipantLifecycle';
 import { UserExtraType, WebappOpCloseReason } from './protocol';
 import { WebappClient } from './webapp';
@@ -154,6 +155,7 @@ export default class Recording {
   messageChannelID: string | null = null;
   messageID: string | null = null;
   startTime: [number, number] | null = null;
+  private readonly liveMediaClock = new RecordingMediaClock();
   startedAt: Date | null = null;
   createdAt = new Date();
   logs: string[] = [];
@@ -575,6 +577,7 @@ export default class Recording {
     }
 
     if (!alreadyConnected || !this.connection || !this.receiver) {
+      this.liveMediaClock.beginEpoch();
       const receiver = connection.receive('opus');
       receiver.on('data', this.onData.bind(this));
       this.receiver = receiver;
@@ -908,6 +911,8 @@ export default class Recording {
 
   async onConnectionReady() {
     if (!this.active) return;
+    // A fresh voice handshake starts a new RTP epoch; WS resume does not.
+    this.liveMediaClock.beginEpoch();
     this.writeToLog(
       `Voice connection ready (state=${this.connection?.ws?.readyState}, mode=${this.connection?.mode}, dave=${this.connection?.daveProtocolVersion})`,
       'connection'
@@ -1177,7 +1182,7 @@ export default class Recording {
           rtpTimestamp: timestamp >>> 0,
           rtpSequence: rtpSequence & 0xffff,
           receivedAtMs: Date.now(),
-          relativeTimeMs: Math.max(0, Math.trunc(time / 48))
+          relativeTimeMs: this.liveMediaClock.map(userID, timestamp, time)
         },
         data
       );
