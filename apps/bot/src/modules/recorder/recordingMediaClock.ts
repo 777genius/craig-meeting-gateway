@@ -20,9 +20,10 @@ export class RecordingMediaClock {
     // message dispatch, but omits SSRC from its four data-event arguments.
     // Scope the actual RTP header to that dispatch (including nested dispatch),
     // without touching the packet, receiver listeners or decryption pipeline.
-    const emit = socket.emit;
+    // Select the general emit signature; Socket's last overload is message-only.
+    const emit: (this: Socket, event: string | symbol, ...args: unknown[]) => boolean = socket.emit;
     const clock = this;
-    const scopedEmit: Socket['emit'] = function (this: Socket, event: string | symbol, ...args: any[]): boolean {
+    const scopedEmit: Socket['emit'] = function (this: Socket, event: string | symbol, ...args: unknown[]): boolean {
       if (event !== 'message') return emit.call(this, event, ...args);
       const previous = clock.packet;
       const msg = args[0];

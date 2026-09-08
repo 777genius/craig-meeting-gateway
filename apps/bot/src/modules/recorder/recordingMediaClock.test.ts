@@ -89,3 +89,45 @@ test('packet scope is synchronous and restored on nesting, errors and receiver g
   clock.beginEpoch();
   assert.equal(replacement.emit, originalEmit);
 });
+
+test('scoped emit forwards every argument, dynamic this and the original boolean result', () => {
+  const clock = new RecordingMediaClock();
+  const socket = new EventEmitter() as Socket;
+  const receiver = new EventEmitter() as Socket;
+  const calls: { receiver: Socket; args: unknown[] }[] = [];
+  let result = false;
+  socket.emit = function (this: Socket, event: string | symbol, ...args: unknown[]): boolean {
+    calls.push({ receiver: this, args: [event, ...args] });
+    assert.equal(clock.packetSource(1234, 56), event === 'message' ? '1:11' : undefined);
+    return result;
+  };
+  const originalEmit = socket.emit;
+  clock.beginEpoch(socket);
+  const emit: (this: Socket, event: string | symbol, ...args: unknown[]) => boolean = socket.emit;
+  const packet = Buffer.alloc(12);
+  packet[0] = 0x80; packet[1] = 0x78;
+  packet.writeUInt32BE(11, 8);
+  packet.writeUInt32BE(1234, 4);
+  packet.writeUInt16BE(56, 2);
+  const rinfo = { address: '127.0.0.1', family: 'IPv4', port: 12345, size: packet.length };
+  const extra = {};
+  for (const returned of [false, true]) {
+    result = returned;
+    const events: [string | symbol, ...unknown[]][] = [
+      ['close'],
+      ['custom', extra, undefined, packet],
+      [Symbol('custom'), packet, rinfo, extra],
+      ['message', packet, rinfo, extra, undefined]
+    ];
+    for (const args of events) {
+      assert.equal(emit.call(receiver, ...args), returned);
+      const call = calls[calls.length - 1];
+      assert.equal(call.receiver, receiver);
+      assert.equal(call.args.length, args.length);
+      args.forEach((arg, index) => assert.equal(call.args[index], arg));
+      assert.equal(clock.packetSource(1234, 56), undefined);
+    }
+  }
+  clock.beginEpoch();
+  assert.equal(socket.emit, originalEmit);
+});
