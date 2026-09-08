@@ -577,9 +577,10 @@ export default class Recording {
     }
 
     if (!alreadyConnected || !this.connection || !this.receiver) {
-      this.liveMediaClock.beginEpoch();
+      this.liveMediaClock.beginEpoch(connection.udpSocket);
       const receiver = connection.receive('opus');
-      receiver.on('data', this.onData.bind(this));
+      receiver.on('data', (data, userID, timestamp, sequence) =>
+        this.onData(data, userID, timestamp, sequence, this.liveMediaClock.packetSource(timestamp, sequence)));
       this.receiver = receiver;
       this.connection = connection;
     }
@@ -912,7 +913,7 @@ export default class Recording {
   async onConnectionReady() {
     if (!this.active) return;
     // A fresh voice handshake starts a new RTP epoch; WS resume does not.
-    this.liveMediaClock.beginEpoch();
+    this.liveMediaClock.beginEpoch(this.connection?.udpSocket);
     this.writeToLog(
       `Voice connection ready (state=${this.connection?.ws?.readyState}, mode=${this.connection?.mode}, dave=${this.connection?.daveProtocolVersion})`,
       'connection'
@@ -1148,7 +1149,7 @@ export default class Recording {
     return recordingUser;
   }
 
-  async onData(data: Buffer, userID: string, timestamp: number, rtpSequence: number) {
+  async onData(data: Buffer, userID: string, timestamp: number, rtpSequence: number, source: string | undefined) {
     if (!this.active) return;
     if (!userID) return;
     // Never loop Craig's own outbound Botik playback into an inbound live tee.
@@ -1171,7 +1172,7 @@ export default class Recording {
 
     const chunkTime = process.hrtime(this.startTime!);
     const time = chunkTime[0] * 48000 + ~~(chunkTime[1] / 20833.333);
-    if (Number.isInteger(rtpSequence)) {
+    if (Number.isInteger(rtpSequence) && source !== undefined) {
       const accepted = this.recorder.meetingIntegration.publishPacket(
         {
           schemaVersion: 1,
@@ -1182,7 +1183,7 @@ export default class Recording {
           rtpTimestamp: timestamp >>> 0,
           rtpSequence: rtpSequence & 0xffff,
           receivedAtMs: Date.now(),
-          relativeTimeMs: this.liveMediaClock.map(userID, timestamp, time)
+          relativeTimeMs: this.liveMediaClock.map(userID, timestamp, time, source)
         },
         data
       );
